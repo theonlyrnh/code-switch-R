@@ -66,6 +66,7 @@ type ProviderRelayService struct {
 var errClientAbort = errors.New("client aborted, skip failure count")
 var errCodexEmptyStream = errors.New("codex upstream stream closed before useful content")
 var errProviderEmptyShell = errors.New("provider returned 200 but all token counts are zero")
+var errActiveRequestRetryRequested = errors.New("active request retry requested")
 
 const codexEmptyStreamRetryDelay = time.Second
 const relayTrustedProxiesEnv = "CODE_SWITCH_TRUSTED_PROXIES"
@@ -1028,6 +1029,11 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 				startTime := time.Now()
 				ok, err := prs.forwardRequest(c, kind, provider, effectiveEndpoint, query, clientHeaders, currentBodyBytes, isStream, effectiveModel)
 				duration := time.Since(startTime)
+				for errors.Is(err, errActiveRequestRetryRequested) {
+					fmt.Printf("[INFO] 用户触发重试，重新发送请求: Provider=%s | Model=%s\n", provider.Name, effectiveModel)
+					ok, err = prs.forwardRequest(c, kind, provider, effectiveEndpoint, query, clientHeaders, currentBodyBytes, isStream, effectiveModel)
+					duration = time.Since(startTime)
+				}
 				failedFromEmptyStreamRetry := false
 				if !ok && errors.Is(err, errCodexEmptyStream) {
 					var retryAttempts int
@@ -1180,6 +1186,7 @@ func (prs *ProviderRelayService) forwardRequest(
 		headers["Accept-Encoding"] = "identity"
 	}
 
+	requestCtx, requestCancel := context.WithCancel(c.Request.Context())
 	requestLog := &ReqeustLog{
 		Platform:   kind,
 		Provider:   provider.Name,
@@ -1193,7 +1200,9 @@ func (prs *ProviderRelayService) forwardRequest(
 	requestLog.startedAt = start
 	activeRequestID := defaultActiveRequestTracker.Start(requestLog, start)
 	requestLog.ActiveRequestID = activeRequestID
+	defaultActiveRequestTracker.RegisterCancel(activeRequestID, requestCancel)
 	defer func() {
+		requestCancel()
 		requestLog.DurationSec = time.Since(start).Seconds()
 		defaultActiveRequestTracker.Finish(activeRequestID)
 
@@ -1244,7 +1253,11 @@ func (prs *ProviderRelayService) forwardRequest(
 	}()
 	defaultActiveRequestTracker.Update(requestLog.ActiveRequestID, requestLog)
 
-	resp, err := prs.doProviderRequest(c.Request.Context(), targetURL, headers, query, bodyBytes)
+	resp, err := prs.doProviderRequest(requestCtx, targetURL, headers, query, bodyBytes)
+	if err != nil && defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
+		requestLog.markRetryRequested()
+		return false, errActiveRequestRetryRequested
+	}
 	requestLog.markUpstreamHeaders()
 	defaultActiveRequestTracker.Update(requestLog.ActiveRequestID, requestLog)
 
@@ -1314,6 +1327,7 @@ func (prs *ProviderRelayService) forwardRequest(
 		} else if kind == "openai-chat" {
 			copyErr = writeOpenAIChatJSONResponse(c.Writer, resp, requestLog)
 		} else {
+			defaultActiveRequestTracker.MarkResponseStarted(requestLog.ActiveRequestID)
 			_, copyErr = resp.ToHttpResponseWriter(c.Writer, ReqeustLogHook(c, kind, requestLog))
 		}
 		if copyErr != nil {
@@ -1333,6 +1347,10 @@ func (prs *ProviderRelayService) forwardRequest(
 		if !isStream && !isStreamResponse(resp, isStream) {
 			bodyData, readErr := readResponseBody(resp)
 			if readErr != nil {
+				if defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
+					requestLog.markRetryRequested()
+					return false, errActiveRequestRetryRequested
+				}
 				return false, fmt.Errorf("failed to read response body: %w", readErr)
 			}
 
@@ -1370,6 +1388,11 @@ func (prs *ProviderRelayService) forwardRequest(
 				c.Writer.Header().Set("Content-Type", contentType)
 			}
 			c.Writer.Header().Del("Content-Length")
+			if defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
+				requestLog.markRetryRequested()
+				return false, errActiveRequestRetryRequested
+			}
+			defaultActiveRequestTracker.MarkResponseStarted(requestLog.ActiveRequestID)
 			c.Writer.WriteHeader(status)
 			if _, writeErr := c.Writer.Write(finalBody); writeErr != nil {
 				fmt.Printf("[WARN] 复制响应到客户端失败: %v\n", writeErr)
@@ -1391,6 +1414,7 @@ func (prs *ProviderRelayService) forwardRequest(
 		} else if kind == "openai-chat" {
 			copyErr = writeOpenAIChatJSONResponse(c.Writer, resp, requestLog)
 		} else {
+			defaultActiveRequestTracker.MarkResponseStarted(requestLog.ActiveRequestID)
 			_, copyErr = resp.ToHttpResponseWriter(c.Writer, ReqeustLogHook(c, kind, requestLog))
 		}
 		if copyErr != nil {
@@ -1706,6 +1730,9 @@ func writeStreamingResponse(w http.ResponseWriter, resp *xrequest.Response, requ
 	if status == 0 {
 		status = http.StatusOK
 	}
+	if requestLog != nil {
+		defaultActiveRequestTracker.MarkResponseStarted(requestLog.ActiveRequestID)
+	}
 	w.WriteHeader(status)
 
 	if flusher, ok := w.(http.Flusher); ok {
@@ -1836,6 +1863,9 @@ func writeCodexGuardedStreamingResponse(w http.ResponseWriter, resp *xrequest.Re
 		status := resp.StatusCode()
 		if status == 0 {
 			status = http.StatusOK
+		}
+		if requestLog != nil {
+			defaultActiveRequestTracker.MarkResponseStarted(requestLog.ActiveRequestID)
 		}
 		w.WriteHeader(status)
 		clientStarted = true
@@ -2084,6 +2114,9 @@ func writeOpenAIChatJSONResponse(w http.ResponseWriter, resp *xrequest.Response,
 	status := resp.StatusCode()
 	if status == 0 {
 		status = http.StatusOK
+	}
+	if requestLog != nil {
+		defaultActiveRequestTracker.MarkResponseStarted(requestLog.ActiveRequestID)
 	}
 	w.WriteHeader(status)
 
@@ -2376,6 +2409,7 @@ type ReqeustLog struct {
 	ErrorMessage                string  `json:"error_message"`
 	CreatedAt                   string  `json:"created_at"`
 	Status                      string  `json:"status,omitempty"`
+	RetryRequested              bool    `json:"retry_requested,omitempty"`
 	ActiveRequestID             int64   `json:"-"`
 	startedAt                   time.Time
 	inputTokensIncludeCacheRead bool
@@ -2392,6 +2426,25 @@ func (r *ReqeustLog) markUpstreamHeaders() {
 	if r != nil && r.UpstreamHeaderSec == 0 {
 		r.UpstreamHeaderSec = r.elapsedSinceStart()
 	}
+}
+
+func (r *ReqeustLog) markRetryRequested() {
+	if r == nil {
+		return
+	}
+	r.RetryRequested = true
+	r.Status = requestLogStatusRetrying
+	r.HttpCode = 499
+	r.ErrorMessage = "重试"
+	r.InputTokens = 0
+	r.OutputTokens = 0
+	r.CacheCreateTokens = 0
+	r.CacheReadTokens = 0
+	r.ReasoningTokens = 0
+	r.FirstTokenDurationSec = 0
+	r.FirstEventSec = 0
+	r.FirstTextSec = 0
+	r.syncActiveRequest()
 }
 
 // isEmptyShell returns true if the response is an empty shell: all token counts are zero.

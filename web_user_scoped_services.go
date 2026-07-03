@@ -152,6 +152,14 @@ func (s *userScopedLogService) ListRequestLogs(ctx context.Context, platform str
 	return s.base.ListRequestLogsForUser(user.ID, platform, provider, limit)
 }
 
+func (s *userScopedLogService) RetryActiveRequest(ctx context.Context, id int64) (services.ActiveRequestRetryResult, error) {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return services.ActiveRequestRetryResult{}, err
+	}
+	return s.base.RetryActiveRequestForUser(user.ID, id), nil
+}
+
 func (s *userScopedLogService) ListProviders(ctx context.Context, platform string) ([]string, error) {
 	user, err := authenticatedUserFromContext(ctx)
 	if err != nil {

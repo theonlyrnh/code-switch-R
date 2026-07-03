@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -102,6 +103,55 @@ func TestActiveRequestTrackerListFiltersAndFinishes(t *testing.T) {
 	tracker.Finish(newID)
 	if remaining := tracker.List("", "", ""); len(remaining) != 0 {
 		t.Fatalf("remaining active logs = %d, want 0", len(remaining))
+	}
+}
+
+func TestActiveRequestTrackerRetryCancelsAndMarksLog(t *testing.T) {
+	tracker := newActiveRequestTracker()
+	ctx, cancel := context.WithCancel(context.Background())
+	activeID := tracker.Start(&ReqeustLog{
+		UserID:   "user-a",
+		Platform: "claude",
+		Provider: "provider-a",
+		Model:    "claude-sonnet",
+	}, time.Now())
+	tracker.RegisterCancel(activeID, cancel)
+
+	result := tracker.Retry(-activeID, "user-a")
+	if result.Status != activeRequestRetryTriggered {
+		t.Fatalf("retry status = %q, want %q", result.Status, activeRequestRetryTriggered)
+	}
+	if ctx.Err() == nil {
+		t.Fatalf("retry did not cancel request context")
+	}
+	if !tracker.IsRetryRequested(activeID) {
+		t.Fatalf("retry requested flag = false, want true")
+	}
+	logs := tracker.List("", "", "user-a")
+	if len(logs) != 1 || logs[0].Status != requestLogStatusRetrying || !logs[0].RetryRequested {
+		t.Fatalf("retry log = %#v, want retrying active log", logs)
+	}
+}
+
+func TestActiveRequestTrackerRetryIgnoresFinishedStartedAndWrongUser(t *testing.T) {
+	tracker := newActiveRequestTracker()
+
+	if result := tracker.Retry(-123, ""); result.Status != activeRequestRetryIgnoredFinished {
+		t.Fatalf("missing retry status = %q, want finished", result.Status)
+	}
+
+	wrongUserID := tracker.Start(&ReqeustLog{UserID: "user-a"}, time.Now())
+	if result := tracker.Retry(-wrongUserID, "user-b"); result.Status != activeRequestRetryIgnoredUnauthorized {
+		t.Fatalf("wrong user retry status = %q, want unauthorized", result.Status)
+	}
+
+	startedID := tracker.Start(&ReqeustLog{UserID: "user-a"}, time.Now())
+	tracker.MarkResponseStarted(startedID)
+	if result := tracker.Retry(-startedID, "user-a"); result.Status != activeRequestRetryIgnoredResponseStarted {
+		t.Fatalf("started retry status = %q, want response started", result.Status)
+	}
+	if tracker.IsRetryRequested(startedID) {
+		t.Fatalf("started request should not be marked retrying")
 	}
 }
 

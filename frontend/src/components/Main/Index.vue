@@ -4,6 +4,31 @@
       <p class="global-eyebrow">{{ t('components.main.hero.eyebrow') }}</p>
       <button
         class="ghost-icon"
+        :data-tooltip="t('components.main.docs.tooltip')"
+        :aria-label="t('components.main.docs.tooltip')"
+        @click="openDocsModal"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path
+            d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8z"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+          <path
+            d="M14 3v5h5M9 13h6M9 17h6M9 9h1"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
+      <button
+        class="ghost-icon"
         :data-tooltip="t('components.main.controls.theme')"
         @click="toggleTheme"
       >
@@ -300,6 +325,63 @@
         @saved="onConfigFileSaved"
       />
       </section>
+
+      <BaseModal
+        :open="docsModalOpen"
+        :title="t('components.main.docs.title')"
+        size="wide"
+        @close="closeDocsModal"
+      >
+        <div class="docs-modal">
+          <nav class="docs-toc" :aria-label="t('components.main.docs.tocTitle')">
+            <p class="docs-toc-title">{{ t('components.main.docs.tocTitle') }}</p>
+            <button
+              v-for="section in docSections"
+              :key="section.id"
+              class="docs-toc-link"
+              type="button"
+              @click="scrollToDocSection(section.id)"
+            >
+              {{ section.title }}
+            </button>
+          </nav>
+          <div class="docs-content">
+            <section
+              v-for="section in docSections"
+              :id="section.id"
+              :key="section.id"
+              class="docs-section"
+            >
+              <h3>{{ section.title }}</h3>
+              <p>{{ section.body }}</p>
+              <ul>
+                <li v-for="item in section.items" :key="item">
+                  {{ item }}
+                </li>
+              </ul>
+              <div v-if="section.codeBlocks.length" class="docs-code-list">
+                <figure
+                  v-for="block in section.codeBlocks"
+                  :key="block.label"
+                  class="docs-code-block"
+                >
+                  <div class="docs-code-header">
+                    <figcaption>{{ block.label }}</figcaption>
+                    <button
+                      class="docs-code-copy"
+                      type="button"
+                      @click="copyDocCode(block.code)"
+                    >
+                      {{ t('components.main.docs.copy') }}
+                    </button>
+                  </div>
+                  <pre><code>{{ block.code }}</code></pre>
+                </figure>
+              </div>
+            </section>
+          </div>
+        </div>
+      </BaseModal>
 
       <BaseModal
       :open="modalState.open"
@@ -777,6 +859,7 @@ import {
 const { t } = useI18n()
 const router = useRouter()
 const themeMode = ref<ThemeMode>(getCurrentTheme())
+const docsModalOpen = ref(false)
 const resolvedTheme = computed(() => {
   if (themeMode.value === 'systemdefault') {
     return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
@@ -784,6 +867,84 @@ const resolvedTheme = computed(() => {
   return themeMode.value
 })
 const themeIcon = computed(() => (resolvedTheme.value === 'dark' ? 'moon' : 'sun'))
+const docSectionKeys = [
+  'quickStart',
+  'overview',
+  'providers',
+  'pools',
+  'keys',
+  'binding',
+  'logs',
+  'console',
+  'codex',
+  'customCli',
+  'settings',
+] as const
+const docSectionItemCounts: Record<(typeof docSectionKeys)[number], number> = {
+  quickStart: 5,
+  overview: 3,
+  providers: 3,
+  pools: 3,
+  keys: 3,
+  binding: 3,
+  logs: 3,
+  console: 3,
+  codex: 3,
+  customCli: 3,
+  settings: 3,
+}
+const docSectionCodeBlockCounts: Partial<Record<(typeof docSectionKeys)[number], number>> = {
+  codex: 2,
+}
+const docSections = computed(() =>
+  docSectionKeys.map((key) => ({
+    id: `docs-${key}`,
+    title: t(`components.main.docs.sections.${key}.title`),
+    body: t(`components.main.docs.sections.${key}.body`),
+    items: Array.from({ length: docSectionItemCounts[key] }, (_, index) =>
+      t(`components.main.docs.sections.${key}.items.${index}`),
+    ),
+    codeBlocks: Array.from({ length: docSectionCodeBlockCounts[key] ?? 0 }, (_, index) => ({
+      label: t(`components.main.docs.sections.${key}.codeBlocks.${index}.label`),
+      code: t(`components.main.docs.sections.${key}.codeBlocks.${index}.code`),
+    })),
+  })),
+)
+
+const openDocsModal = () => {
+  docsModalOpen.value = true
+}
+
+const closeDocsModal = () => {
+  docsModalOpen.value = false
+}
+
+const scrollToDocSection = (sectionId: string) => {
+  document.getElementById(sectionId)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+const copyDocCode = async (code: string) => {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(code)
+    } else {
+      const textArea = document.createElement('textarea')
+      textArea.value = code
+      textArea.style.position = 'fixed'
+      textArea.style.opacity = '0'
+      document.body.appendChild(textArea)
+      textArea.focus()
+      textArea.select()
+      const copied = document.execCommand('copy')
+      document.body.removeChild(textArea)
+      if (!copied) throw new Error('copy failed')
+    }
+    showToast(t('components.main.docs.copied'), 'success')
+  } catch (error) {
+    console.error('Failed to copy docs code block', error)
+    showToast(t('components.main.docs.copyFailed'), 'error')
+  }
+}
 
 const proxyStates = reactive<Record<ProviderTab, boolean>>({
   claude: false,
@@ -2907,6 +3068,156 @@ const confirmDeleteCliTool = async () => {
   animation: import-spin 0.9s linear infinite;
 }
 
+.docs-modal {
+  display: grid;
+  grid-template-columns: 168px minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+  user-select: text;
+}
+
+.docs-toc {
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px;
+  border: 1px solid var(--mac-border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--mac-surface-strong) 76%, transparent);
+}
+
+.docs-toc-title {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--mac-text-secondary);
+}
+
+.docs-toc-link {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--mac-text);
+  font-size: 13px;
+  line-height: 1.35;
+  font-family: inherit;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.docs-toc-link:hover,
+.docs-toc-link:focus-visible {
+  color: var(--mac-accent);
+  background: color-mix(in srgb, var(--mac-accent) 10%, transparent);
+  outline: none;
+}
+
+.docs-content {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+
+.docs-section {
+  scroll-margin-top: 16px;
+}
+
+.docs-section h3 {
+  margin: 0 0 8px;
+  color: var(--mac-text);
+  font-size: 20px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.docs-section p {
+  margin: 0 0 10px;
+  color: var(--mac-text-secondary);
+  line-height: 1.7;
+  font-size: 14px;
+}
+
+.docs-section ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--mac-text);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.docs-section li + li {
+  margin-top: 6px;
+}
+
+.docs-code-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.docs-code-block {
+  margin: 0;
+}
+
+.docs-code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.docs-code-header figcaption {
+  color: var(--mac-text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.docs-code-copy {
+  flex: 0 0 auto;
+  border: 1px solid var(--mac-border);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--mac-surface) 70%, transparent);
+  color: var(--mac-text-secondary);
+  padding: 5px 9px;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.docs-code-copy:hover,
+.docs-code-copy:focus-visible {
+  color: var(--mac-accent);
+  border-color: color-mix(in srgb, var(--mac-accent) 42%, var(--mac-border));
+  outline: none;
+}
+
+.docs-code-block pre {
+  margin: 0;
+  padding: 14px;
+  overflow-x: auto;
+  border: 1px solid var(--mac-border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--mac-surface-strong) 72%, #111827);
+  color: var(--mac-text);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.docs-code-block code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  white-space: pre;
+}
+
 @keyframes import-spin {
   from {
     transform: rotate(0deg);
@@ -2914,6 +3225,29 @@ const confirmDeleteCliTool = async () => {
 
   to {
     transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 760px) {
+  .docs-modal {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+
+  .docs-toc {
+    position: static;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    padding: 10px;
+  }
+
+  .docs-toc-title {
+    grid-column: 1 / -1;
+  }
+
+  .docs-toc-link {
+    padding: 7px 8px;
   }
 }
 

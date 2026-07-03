@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"sync"
@@ -10,9 +11,17 @@ import (
 const (
 	requestLogStatusCompleted  = "completed"
 	requestLogStatusProcessing = "processing"
+	requestLogStatusRetrying   = "retrying"
 )
 
 var defaultActiveRequestTracker = newActiveRequestTracker()
+
+const (
+	activeRequestRetryTriggered              = "retried"
+	activeRequestRetryIgnoredFinished        = "ignored_finished"
+	activeRequestRetryIgnoredResponseStarted = "ignored_response_started"
+	activeRequestRetryIgnoredUnauthorized    = "ignored_unauthorized"
+)
 
 type activeRequestTracker struct {
 	mu       sync.RWMutex
@@ -21,8 +30,15 @@ type activeRequestTracker struct {
 }
 
 type activeRequestSnapshot struct {
-	startedAt time.Time
-	log       ReqeustLog
+	startedAt       time.Time
+	log             ReqeustLog
+	cancel          context.CancelFunc
+	retryRequested  bool
+	responseStarted bool
+}
+
+type ActiveRequestRetryResult struct {
+	Status string `json:"status"`
 }
 
 func newActiveRequestTracker() *activeRequestTracker {
@@ -60,7 +76,15 @@ func (t *activeRequestTracker) Update(id int64, logEntry *ReqeustLog) {
 	if !ok {
 		return
 	}
-	t.requests[id] = snapshotActiveRequest(id, logEntry, existing.startedAt)
+	next := snapshotActiveRequest(id, logEntry, existing.startedAt)
+	next.cancel = existing.cancel
+	next.retryRequested = existing.retryRequested
+	next.responseStarted = existing.responseStarted
+	if next.retryRequested {
+		next.log.RetryRequested = true
+		next.log.Status = requestLogStatusRetrying
+	}
+	t.requests[id] = next
 }
 
 func (t *activeRequestTracker) Finish(id int64) {
@@ -71,6 +95,86 @@ func (t *activeRequestTracker) Finish(id int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.requests, id)
+}
+
+func (t *activeRequestTracker) RegisterCancel(id int64, cancel context.CancelFunc) {
+	if t == nil || id == 0 {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	existing, ok := t.requests[id]
+	if !ok {
+		return
+	}
+	existing.cancel = cancel
+	t.requests[id] = existing
+}
+
+func (t *activeRequestTracker) MarkResponseStarted(id int64) {
+	if t == nil || id == 0 {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	existing, ok := t.requests[id]
+	if !ok {
+		return
+	}
+	existing.responseStarted = true
+	t.requests[id] = existing
+}
+
+func (t *activeRequestTracker) IsRetryRequested(id int64) bool {
+	if t == nil || id == 0 {
+		return false
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	existing, ok := t.requests[id]
+	return ok && existing.retryRequested
+}
+
+func (t *activeRequestTracker) Retry(id int64, userID string) ActiveRequestRetryResult {
+	if t == nil || id == 0 {
+		return ActiveRequestRetryResult{Status: activeRequestRetryIgnoredFinished}
+	}
+	if id < 0 {
+		id = -id
+	}
+
+	t.mu.Lock()
+	existing, ok := t.requests[id]
+	if !ok {
+		t.mu.Unlock()
+		return ActiveRequestRetryResult{Status: activeRequestRetryIgnoredFinished}
+	}
+	userID = strings.TrimSpace(userID)
+	if userID != "" && strings.TrimSpace(existing.log.UserID) != userID {
+		t.mu.Unlock()
+		return ActiveRequestRetryResult{Status: activeRequestRetryIgnoredUnauthorized}
+	}
+	if existing.responseStarted {
+		t.mu.Unlock()
+		return ActiveRequestRetryResult{Status: activeRequestRetryIgnoredResponseStarted}
+	}
+	existing.retryRequested = true
+	existing.log.RetryRequested = true
+	existing.log.Status = requestLogStatusRetrying
+	cancel := existing.cancel
+	t.requests[id] = existing
+	t.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	return ActiveRequestRetryResult{Status: activeRequestRetryTriggered}
 }
 
 func (t *activeRequestTracker) List(platform, provider, userID string) []ReqeustLog {
@@ -109,6 +213,10 @@ func (t *activeRequestTracker) List(platform, provider, userID string) []Reqeust
 		logEntry.DurationSec = now.Sub(snapshot.startedAt).Seconds()
 		if logEntry.DurationSec < 0 {
 			logEntry.DurationSec = 0
+		}
+		if snapshot.retryRequested {
+			logEntry.RetryRequested = true
+			logEntry.Status = requestLogStatusRetrying
 		}
 		logs = append(logs, logEntry)
 	}

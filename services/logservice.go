@@ -28,6 +28,14 @@ func (ls *LogService) ListRequestLogs(platform string, provider string, limit in
 	return ls.ListRequestLogsForUser("", platform, provider, limit)
 }
 
+func (ls *LogService) RetryActiveRequest(id int64) ActiveRequestRetryResult {
+	return ls.RetryActiveRequestForUser("", id)
+}
+
+func (ls *LogService) RetryActiveRequestForUser(userID string, id int64) ActiveRequestRetryResult {
+	return defaultActiveRequestTracker.Retry(id, userID)
+}
+
 func (ls *LogService) ListRequestLogsForUser(userID string, platform string, provider string, limit int) ([]ReqeustLog, error) {
 	if limit <= 0 {
 		limit = 100
@@ -71,6 +79,8 @@ func (ls *LogService) ListRequestLogsForUser(userID string, platform string, pro
 		if firstTokenSec == 0 {
 			firstTokenSec = record.GetFloat64("first_event_sec")
 		}
+		errorMessage := record.GetString("error_message")
+		retryRequested := errorMessage == "重试" && record.GetInt("http_code") == 499
 		logEntry := ReqeustLog{
 			ID:                    record.GetInt64("id"),
 			UserID:                record.GetString("user_id"),
@@ -80,7 +90,7 @@ func (ls *LogService) ListRequestLogsForUser(userID string, platform string, pro
 			RelayKeyID:            relayKeyID,
 			RelayKeyName:          relayKeyDisplayName(relayKeyID, keyNames),
 			HttpCode:              record.GetInt("http_code"),
-			ErrorMessage:          record.GetString("error_message"),
+			ErrorMessage:          errorMessage,
 			InputTokens:           record.GetInt("input_tokens"),
 			OutputTokens:          record.GetInt("output_tokens"),
 			CacheCreateTokens:     record.GetInt("cache_create_tokens"),
@@ -95,6 +105,7 @@ func (ls *LogService) ListRequestLogsForUser(userID string, platform string, pro
 			FirstEventSec:         record.GetFloat64("first_event_sec"),
 			FirstTextSec:          firstTextSec,
 			Status:                requestLogStatusCompleted,
+			RetryRequested:        retryRequested,
 		}
 		logs = append(logs, logEntry)
 	}

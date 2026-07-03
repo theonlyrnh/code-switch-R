@@ -849,11 +849,47 @@ body.is-log-column-resizing {
   text-overflow: clip;
 }
 
-.token-cell div {
+.token-breakdown > div {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
+}
+
+.retry-token-button {
+  min-width: 72px;
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid rgba(220, 38, 38, 0.28);
+  border-radius: 6px;
+  background: rgba(254, 226, 226, 0.92);
+  color: #b91c1c;
+  font-size: 0.78rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.retry-token-button:hover {
+  background: rgba(254, 202, 202, 0.96);
+  border-color: rgba(220, 38, 38, 0.42);
+}
+
+.retry-token-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+  background: rgba(226, 232, 240, 0.8);
+  border-color: rgba(148, 163, 184, 0.32);
+  color: #64748b;
+}
+
+.retry-token-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  color: #dc2626;
+  font-size: 0.84rem;
+  font-weight: 800;
 }
 
 .token-label {
@@ -1337,6 +1373,10 @@ html.dark .ghost-icon:hover {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.modal-wide {
+  width: min(1040px, 95vw);
 }
 
 .modal-header {
@@ -2054,7 +2094,7 @@ html.dark .secondary-btn:active:not(:disabled) {
     content: none;
   }
 
-  .token-cell div {
+  .token-breakdown > div {
     justify-content: space-between;
     gap: 10px;
   }
@@ -2069,7 +2109,7 @@ html.dark .secondary-btn:active:not(:disabled) {
 }
 
 /* 全局按钮样式修复 - 防止 Tailwind Preflight 导致的布局问题 */
-button:where(:not(.ghost-icon):not(.mac-switch):not(.nav-item):not(.platform-tab):not(.tab-pill):not(.collapse-btn):not(.toggle-switch):not(.action-btn):not(.remove-btn):not(.icon-select-button):not(.level-select-button)) {
+button:where(:not(.ghost-icon):not(.mac-switch):not(.nav-item):not(.platform-tab):not(.tab-pill):not(.collapse-btn):not(.toggle-switch):not(.action-btn):not(.remove-btn):not(.icon-select-button):not(.level-select-button):not(.docs-toc-link):not(.docs-code-copy)) {
   display: inline-flex !important;
   flex-direction: row !important;
   align-items: center !important;

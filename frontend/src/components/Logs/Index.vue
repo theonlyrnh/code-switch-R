@@ -103,25 +103,39 @@
             <td :data-label="t('components.logs.table.firstToken')"><span :class="['duration-tag', durationColorForLog(item, item.first_token_duration_sec)]">{{ formatFirstTokenDuration(item) }}</span></td>
             <td :data-label="t('components.logs.table.duration')"><span :class="['duration-tag', durationColor(item.duration_sec)]">{{ formatDuration(item.duration_sec) }}</span></td>
             <td :data-label="t('components.logs.table.tokens')" class="token-cell">
-              <div>
-                <span class="token-label">{{ t('components.logs.tokenLabels.input') }}</span>
-                <span class="token-value">{{ formatLogTokenNumber(item, item.input_tokens) }}</span>
-              </div>
-              <div>
-                <span class="token-label">{{ t('components.logs.tokenLabels.output') }}</span>
-                <span class="token-value">{{ formatLogTokenNumber(item, item.output_tokens) }}</span>
-              </div>
-              <div>
-                <span class="token-label">{{ t('components.logs.tokenLabels.cacheCreate') }}</span>
-                <span class="token-value">{{ formatLogTokenNumber(item, item.cache_create_tokens) }}</span>
-              </div>
-              <div>
-                <span class="token-label">{{ t('components.logs.tokenLabels.cacheRead') }}</span>
-                <span class="token-value">{{ formatLogTokenNumber(item, item.cache_read_tokens) }}</span>
-              </div>
-              <div>
-                <span class="token-label">{{ t('components.logs.tokenLabels.reasoning') }}</span>
-                <span class="token-value">{{ formatLogTokenNumber(item, item.reasoning_tokens) }}</span>
+              <button
+                v-if="showRetryButton(item)"
+                type="button"
+                class="retry-token-button"
+                :disabled="isRetryDisabled(item)"
+                @click="handleRetryLog(item)"
+              >
+                {{ t('components.logs.retry.action') }}
+              </button>
+              <span v-else-if="isRetryLog(item)" class="retry-token-label">
+                {{ t('components.logs.retry.label') }}
+              </span>
+              <div v-else class="token-breakdown">
+                <div>
+                  <span class="token-label">{{ t('components.logs.tokenLabels.input') }}</span>
+                  <span class="token-value">{{ formatLogTokenNumber(item, item.input_tokens) }}</span>
+                </div>
+                <div>
+                  <span class="token-label">{{ t('components.logs.tokenLabels.output') }}</span>
+                  <span class="token-value">{{ formatLogTokenNumber(item, item.output_tokens) }}</span>
+                </div>
+                <div>
+                  <span class="token-label">{{ t('components.logs.tokenLabels.cacheCreate') }}</span>
+                  <span class="token-value">{{ formatLogTokenNumber(item, item.cache_create_tokens) }}</span>
+                </div>
+                <div>
+                  <span class="token-label">{{ t('components.logs.tokenLabels.cacheRead') }}</span>
+                  <span class="token-value">{{ formatLogTokenNumber(item, item.cache_read_tokens) }}</span>
+                </div>
+                <div>
+                  <span class="token-label">{{ t('components.logs.tokenLabels.reasoning') }}</span>
+                  <span class="token-value">{{ formatLogTokenNumber(item, item.reasoning_tokens) }}</span>
+                </div>
               </div>
             </td>
           </tr>
@@ -189,6 +203,7 @@ import {
   fetchRequestLogs,
   fetchLogProviders,
   fetchLogStats,
+  retryActiveRequest,
   type RequestLog,
   type LogStats,
   type LogStatsSeries,
@@ -214,6 +229,7 @@ const router = useRouter()
 const logs = ref<RequestLog[]>([])
 const stats = ref<LogStats | null>(null)
 const loading = ref(false)
+const retryingLogIds = ref<Set<number>>(new Set())
 const filters = reactive<{ platform: LogPlatform | ''; provider: string }>({ platform: '', provider: '' })
 const page = ref(1)
 const PAGE_SIZE = 15
@@ -565,6 +581,8 @@ const logSignature = (item: RequestLog) => [
   item.cache_read_tokens ?? '',
   item.reasoning_tokens ?? '',
   item.error_message ?? '',
+  item.retry_requested ? 'retry' : '',
+  retryingLogIds.value.has(item.id) ? 'retrying' : '',
 ].join('|')
 
 const logsSignature = (items: RequestLog[]) => items.map(logSignature).join('\n')
@@ -692,7 +710,51 @@ const formatDuration = (value?: number) => {
   return `${value.toFixed(2)}s`
 }
 
-const isProcessingLog = (item: RequestLog) => item.status === 'processing'
+const isProcessingLog = (item: RequestLog) => item.status === 'processing' || item.status === 'retrying'
+
+const isRetryLog = (item: RequestLog) => {
+  return item.retry_requested === true || item.status === 'retrying' || item.error_message === '重试' || retryingLogIds.value.has(item.id)
+}
+
+const hasFirstToken = (item: RequestLog) => {
+  const value = item.first_token_duration_sec
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+}
+
+const showRetryButton = (item: RequestLog) => {
+  return isProcessingLog(item) && !isRetryLog(item)
+}
+
+const isRetryDisabled = (item: RequestLog) => {
+  return hasFirstToken(item)
+}
+
+const canRetryLog = (item: RequestLog) => {
+  return showRetryButton(item) && !isRetryDisabled(item)
+}
+
+const markRetryingLog = (id: number) => {
+  retryingLogIds.value = new Set([...retryingLogIds.value, id])
+}
+
+const handleRetryLog = async (item: RequestLog) => {
+  if (!canRetryLog(item)) return
+  markRetryingLog(item.id)
+  try {
+    const result = await retryActiveRequest(item.id)
+    if (result?.status !== 'retried') {
+      const next = new Set(retryingLogIds.value)
+      next.delete(item.id)
+      retryingLogIds.value = next
+    }
+    await refreshLogsIfChanged()
+  } catch (error) {
+    console.error('failed to retry active request', error)
+    const next = new Set(retryingLogIds.value)
+    next.delete(item.id)
+    retryingLogIds.value = next
+  }
+}
 
 const formatFirstTokenDuration = (item: RequestLog) => {
   return formatDuration(item.first_token_duration_sec)
@@ -749,6 +811,7 @@ const formatTokenNumber = (value?: number) => {
 }
 
 const formatLogTokenNumber = (item: RequestLog, value?: number) => {
+  if (isRetryLog(item)) return '0'
   if (isProcessingLog(item)) return '—'
   return formatTokenNumber(value)
 }

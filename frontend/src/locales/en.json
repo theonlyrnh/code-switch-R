@@ -172,6 +172,127 @@
         "statusOn": "Managed",
         "statusOff": "Not managed"
       },
+      "docs": {
+        "tooltip": "View documentation",
+        "title": "Code Switch Documentation",
+        "tocTitle": "Contents",
+        "copy": "Copy",
+        "copied": "Code copied",
+        "copyFailed": "Copy failed",
+        "sections": {
+          "quickStart": {
+            "title": "Quick Start",
+            "body": "For first-time setup, complete the flow in this order: add a provider, create a key and pool, bind the key to the pool, then configure Codex.",
+            "items": [
+              "Add a provider: choose OpenAI Responses or the matching platform on the home page, add an upstream provider, then fill in Base URL, API Key, protocol endpoint, and model settings.",
+              "Create a key: open the Keys page and generate a Relay Key. The full key is shown only once, so copy and store it immediately.",
+              "Create a pool and bind the key: return to Provider Pools, create a pool, choose members and mode, then bind the Relay Key to that pool.",
+              "Configure the pool: use managed mode for auto-selection, retry, and fallback; use manual mode to pin traffic to one provider. Make sure pool members are enabled.",
+              "Configure Codex: point Codex Base URL to the Code Switch OpenAI/Codex relay address, use the Relay Key as the API key, then enable OpenAI Responses hosting."
+            ]
+          },
+          "overview": {
+            "title": "Overview",
+            "body": "Code Switch centralizes providers, relay keys, and diagnostics for Claude Code, Codex/OpenAI Responses, OpenAI Chat, and custom CLI tools.",
+            "items": [
+              "The home page groups providers and provider pools by platform; use the top tabs to switch platforms.",
+              "When hosting is enabled, the local relay takes over the matching CLI API traffic and chooses providers from your configuration.",
+              "Settings, Keys, Logs, and Console cover system configuration, access control, request tracing, and runtime debugging."
+            ]
+          },
+          "providers": {
+            "title": "Providers",
+            "body": "A provider is an upstream API configuration with a name, base URL, API key, protocol endpoints, model whitelist, model mapping, and optional availability checks.",
+            "items": [
+              "Open a provider tab and add a provider, then fill in the API Base URL, API Key, and protocol endpoint.",
+              "Use the model whitelist to declare supported models, and model mapping to translate CLI model names to upstream model names.",
+              "Enabled providers can participate in hosted traffic; disabled providers keep their configuration but are skipped by routing."
+            ]
+          },
+          "pools": {
+            "title": "Pools",
+            "body": "Pools combine multiple providers into one routing unit for automatic selection, retry, and fallback.",
+            "items": [
+              "Create a pool from the Provider Pools view, then choose managed mode or manual mode.",
+              "Managed mode lets enabled providers in the pool participate in auto-selection, retries, and fallback.",
+              "Manual mode uses only the selected provider, which is useful for debugging or a temporary fixed upstream."
+            ]
+          },
+          "keys": {
+            "title": "Keys",
+            "body": "The Keys page manages API keys for Code Switch Relay. Clients must use generated keys when calling the local or server relay.",
+            "items": [
+              "The full key is shown only once after creation; save it immediately because later views only show a masked value.",
+              "You can rename and delete keys, then inspect calls and token usage across time ranges.",
+              "Create separate keys per device, project, or automation job to simplify auditing and revocation."
+            ]
+          },
+          "binding": {
+            "title": "Binding Keys to Pools",
+            "body": "After a key is bound to a pool, requests made with that key are routed according to that pool's provider rules.",
+            "items": [
+              "Open the Provider Pools view and bind an unbound key from the pool card.",
+              "Bound keys appear in the pool's key list and can be unbound at any time.",
+              "Keys without a bound pool use the current platform default behavior; separate bindings isolate teams, projects, or environments."
+            ]
+          },
+          "logs": {
+            "title": "Logs",
+            "body": "The Logs page shows relay request records, errors, token breakdowns, and provider hits.",
+            "items": [
+              "Filter by platform, provider, and limit, or switch to the errors-only view to find failed requests.",
+              "The summary shows today's request count, failures, token traffic, and cache reads.",
+              "Relay key, model, HTTP status, first-token latency, and duration help identify whether an issue is in the client, relay, or upstream."
+            ]
+          },
+          "console": {
+            "title": "Console",
+            "body": "The Console shows application runtime output for diagnosing relay startup, config writes, upstream connectivity, and backend service errors.",
+            "items": [
+              "If hosting does not enable, a provider cannot be saved, or a CLI cannot connect, check the latest console errors first.",
+              "Console output complements request logs: logs explain individual requests, while the console explains application state.",
+              "Clear the console after debugging when you want to watch only the output from the next operation."
+            ]
+          },
+          "codex": {
+            "title": "Configuring Codex",
+            "body": "Codex/OpenAI Responses traffic is routed through the local relay, usually from the OpenAI Responses tab and the Keys page.",
+            "items": [
+              "Add a provider under OpenAI Responses, including upstream Base URL, API Key, Responses endpoint, and model configuration.",
+              "Generate a Relay Key, then configure Codex with the Code Switch OpenAI/Codex relay Base URL and that Relay Key as the API key.",
+              "Enable hosting for OpenAI Responses; bind the Relay Key to a specific pool when you need project-level routing isolation."
+            ],
+            "codeBlocks": [
+              {
+                "label": "Write ~/.codex/config.toml",
+                "code": "model = \"gpt-5.5\"\nmodel_provider = \"wcisman\"\nmodel_reasoning_effort = \"high\"\npreferred_auth_method = 'apikey'\n\n\n[model_providers.wcisman]\nbase_url = \"https://api.wcisman.cc\"\nname = 'codex'\nrequires_openai_auth = true\nwire_api = 'responses'"
+              },
+              {
+                "label": "Verify the relay before launching",
+                "code": "curl https://api.wcisman.cc/v1/models \\\n  -H \"Authorization: Bearer csrk_your_relay_key_here\""
+              }
+            ]
+          },
+          "customCli": {
+            "title": "Custom CLI",
+            "body": "Custom CLI support is for tools such as Droid, RooCode, or other clients that read local config files.",
+            "items": [
+              "Add a CLI tool from the others tab and register its config file path and format.",
+              "After proxy injection fields are configured, hosting writes the local relay address and auth data into those config fields.",
+              "Each custom CLI can keep its own provider list and hosting state."
+            ]
+          },
+          "settings": {
+            "title": "Settings and Security",
+            "body": "Settings cover appearance, startup, notifications, network listening, admin security, and availability monitoring.",
+            "items": [
+              "Network listening controls whether the admin UI and relay are exposed only locally, on the LAN, or on a custom address.",
+              "Security settings manage admin sign-in and sessions; use strong credentials and be careful with LAN exposure for public deployments.",
+              "Availability monitoring can check providers periodically, and auto-blacklist reduces the impact of unavailable upstreams."
+            ]
+          }
+        }
+      },
       "customCli": {
         "selectToolFirst": "Please select a CLI tool first",
         "noTools": "No custom CLI tools yet",
@@ -473,6 +594,10 @@
       },
       "status": {
         "processing": "Processing"
+      },
+      "retry": {
+        "action": "Retry",
+        "label": "Retry"
       },
       "tokenLabels": {
         "input": "Input",

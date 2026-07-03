@@ -173,6 +173,127 @@
         "statusOn": "已托管",
         "statusOff": "未托管"
       },
+      "docs": {
+        "tooltip": "查看使用文档",
+        "title": "Code Switch 使用文档",
+        "tocTitle": "目录",
+        "copy": "复制",
+        "copied": "已复制代码",
+        "copyFailed": "复制失败",
+        "sections": {
+          "quickStart": {
+            "title": "使用说明",
+            "body": "第一次使用建议按这个顺序完成基础配置：先添加供应商，再创建密钥和池子，最后把密钥绑定到池子并配置 Codex。",
+            "items": [
+              "添加供应商：在首页选择 OpenAI Responses 或对应平台，进入供应商页新增上游，填写 Base URL、API Key、协议端点和模型配置。",
+              "创建密钥：进入密钥页面生成 Relay Key，完整 key 只显示一次，复制后妥善保存。",
+              "创建池子并绑定密钥：回到供应商池页面创建池子，选择池子成员和模式，然后把刚生成的密钥绑定到该池子。",
+              "配置池子：托管模式适合自动选择、重试和降级；手动模式适合固定使用某个供应商。确认池子内供应商已启用。",
+              "配置 Codex：把 Codex 的 Base URL 指向 Code Switch 的 OpenAI/Codex relay 地址，把 API Key 填为刚创建的 Relay Key，然后打开 OpenAI Responses 托管开关。"
+            ]
+          },
+          "overview": {
+            "title": "总览",
+            "body": "Code Switch 用来集中管理 Claude Code、Codex/OpenAI Responses、OpenAI Chat 以及自定义 CLI 的供应商、转发密钥和运行日志。",
+            "items": [
+              "首页按平台分组展示供应商与供应商池，可在顶部标签间切换。",
+              "打开托管开关后，本地代理会接管对应 CLI 的 API 访问，并按配置选择供应商。",
+              "右侧设置、密钥、日志、控制台页面分别负责系统配置、访问控制、请求追踪和运行调试。"
+            ]
+          },
+          "providers": {
+            "title": "供应商",
+            "body": "供应商是一组上游 API 配置，包括名称、地址、密钥、协议端点、模型白名单、模型映射和可用性监控。",
+            "items": [
+              "在供应商标签页点击新增供应商，填写 API Base URL、API Key 和对应协议端点。",
+              "模型白名单用于声明该供应商可处理的模型，模型映射用于把 CLI 请求模型转换为上游实际模型。",
+              "启用供应商后，它可以被池子自动选择；未启用的供应商会保留配置但不参与托管流量。"
+            ]
+          },
+          "pools": {
+            "title": "池子",
+            "body": "池子把多个供应商组合成一个可被密钥或平台使用的调度单元，适合做自动选择、失败重试和降级。",
+            "items": [
+              "在供应商池子页创建池子，选择托管模式或手动模式。",
+              "托管模式会让池子内启用的供应商参与自动选择、重试和降级。",
+              "手动模式只使用指定供应商，适合需要固定某个上游的调试或临时切换。"
+            ]
+          },
+          "keys": {
+            "title": "密钥",
+            "body": "密钥页面管理访问 Code Switch Relay 的 API Key，客户端必须使用这里生成的密钥调用本地或服务器上的代理服务。",
+            "items": [
+              "创建密钥后完整值只显示一次，请立即保存；列表中之后只展示脱敏值。",
+              "可以给密钥改名、删除密钥，并查看不同时间范围内的调用次数和 token 消耗。",
+              "建议按设备、项目或自动化任务分别创建密钥，便于审计和停用。"
+            ]
+          },
+          "binding": {
+            "title": "密钥绑定池子",
+            "body": "密钥绑定池子后，该密钥的请求会优先按绑定池子的供应商规则调度。",
+            "items": [
+              "进入供应商池子页，在池子卡片里选择未绑定的密钥进行绑定。",
+              "绑定后，对应密钥会显示在池子的绑定密钥列表里，也可以随时解绑。",
+              "没有绑定池子的密钥会使用平台当前默认规则；给不同密钥绑定不同池子可以隔离团队、项目或环境。"
+            ]
+          },
+          "logs": {
+            "title": "日志",
+            "body": "日志页面用于查看代理请求记录、错误、token 明细和供应商命中情况。",
+            "items": [
+              "可按平台、供应商、条数筛选，也可以切换到仅错误视图定位失败请求。",
+              "摘要区域展示今日请求量、失败次数、token 流量和缓存命中。",
+              "表格中的调用密钥、模型、HTTP 状态、首 token 和耗时可以帮助判断问题来自客户端、代理还是上游。"
+            ]
+          },
+          "console": {
+            "title": "控制台",
+            "body": "控制台显示应用运行输出，适合排查代理启动、配置写入、上游连接和后台服务异常。",
+            "items": [
+              "遇到托管开关无效、供应商无法保存或 CLI 无法连接时，先打开控制台查看最新错误。",
+              "控制台信息通常与日志页面互补：日志看单次请求，控制台看应用级运行状态。",
+              "调试完成后可以清空控制台，便于观察下一次操作产生的新输出。"
+            ]
+          },
+          "codex": {
+            "title": "如何配置 Codex",
+            "body": "Codex/OpenAI Responses 通过本地 relay 统一访问供应商，常用入口是首页的 OpenAI Responses 标签和密钥页面。",
+            "items": [
+              "先在 OpenAI Responses 标签下新增供应商，填写上游 Base URL、API Key、Responses endpoint 和模型配置。",
+              "生成一个 Relay Key，并在 Codex 客户端中把 Base URL 指向 Code Switch 的 OpenAI/Codex relay 地址，把 API Key 填为该 Relay Key。",
+              "打开 OpenAI Responses 的托管开关；如需按项目隔离，把该 Relay Key 绑定到指定池子。"
+            ],
+            "codeBlocks": [
+              {
+                "label": "写入 ~/.codex/config.toml",
+                "code": "model = \"gpt-5.5\"\nmodel_provider = \"wcisman\"\nmodel_reasoning_effort = \"high\"\npreferred_auth_method = 'apikey'\n\n\n[model_providers.wcisman]\nbase_url = \"https://api.wcisman.cc\"\nname = 'codex'\nrequires_openai_auth = true\nwire_api = 'responses'"
+              },
+              {
+                "label": "启动前验证 relay 是否可达",
+                "code": "curl https://api.wcisman.cc/v1/models \\\n  -H \"Authorization: Bearer csrk_your_relay_key_here\""
+              }
+            ]
+          },
+          "customCli": {
+            "title": "自定义 CLI",
+            "body": "自定义 CLI 适合接入 Droid、RooCode 或其他读取配置文件的工具。",
+            "items": [
+              "在 others 标签中添加 CLI 工具，登记它的配置文件路径和格式。",
+              "配置代理注入字段后，托管开关会把本地代理地址和认证信息写入对应配置字段。",
+              "每个自定义 CLI 都可以维护自己的供应商列表和托管状态。"
+            ]
+          },
+          "settings": {
+            "title": "设置与安全",
+            "body": "设置页面集中管理外观、启动、通知、网络监听、安全登录和可用性监控。",
+            "items": [
+              "网络监听决定管理端和 relay 对本机、局域网或自定义地址开放的范围。",
+              "安全设置用于管理员登录和会话管理；公网部署时应使用强密码并谨慎开启局域网监听。",
+              "可用性监控可定期检测供应商，配合自动拉黑降低不可用上游对请求的影响。"
+            ]
+          }
+        }
+      },
       "customCli": {
         "selectToolFirst": "请先选择一个 CLI 工具",
         "noTools": "暂无自定义 CLI 工具",
@@ -474,6 +595,10 @@
       },
       "status": {
         "processing": "处理中"
+      },
+      "retry": {
+        "action": "重试",
+        "label": "重试"
       },
       "tokenLabels": {
         "input": "输入",

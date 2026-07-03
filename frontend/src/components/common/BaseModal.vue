@@ -12,7 +12,7 @@
           leave-from="opacity-100 translate-y-0"
           leave-to="opacity-0 translate-y-4"
         >
-          <DialogPanel :class="['modal', variantClass]">
+          <DialogPanel :class="['modal', variantClass, sizeClass]">
             <header class="modal-header">
               <DialogTitle class="modal-title">{{ title }}</DialogTitle>
               <button class="ghost-icon" aria-label="Close" @click="$emit('close')">✕</button>
@@ -32,17 +32,20 @@ import { computed } from 'vue'
 import { Dialog, DialogPanel, DialogTitle, TransitionChild, TransitionRoot } from '@headlessui/vue'
 
 type Variant = 'default' | 'confirm'
+type Size = 'default' | 'wide'
 
 const props = withDefaults(
   defineProps<{
     open: boolean
     title: string
     variant?: Variant
+    size?: Size
   }>(),
-  { variant: 'default' },
+  { variant: 'default', size: 'default' },
 )
 
 defineEmits<{ (e: 'close'): void }>()
 
 const variantClass = computed(() => (props.variant === 'confirm' ? 'confirm-modal' : ''))
+const sizeClass = computed(() => (props.size === 'wide' ? 'modal-wide' : ''))
 </script>

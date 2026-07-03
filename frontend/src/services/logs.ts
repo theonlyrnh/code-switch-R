@@ -25,6 +25,7 @@ export type RequestLog = {
   error_message?: string
   created_at: string
   status?: 'processing' | 'completed' | string
+  retry_requested?: boolean
 }
 
 type RequestLogQuery = {
@@ -38,6 +39,14 @@ export const fetchRequestLogs = async (query: RequestLogQuery = {}): Promise<Req
   const provider = query.provider ?? ''
   const limit = query.limit ?? 100
   return Call.ByName('codeswitch/services.LogService.ListRequestLogs', platform, provider, limit)
+}
+
+export type RetryActiveRequestResult = {
+  status: 'retried' | 'ignored_finished' | 'ignored_response_started' | 'ignored_unauthorized' | string
+}
+
+export const retryActiveRequest = async (id: number): Promise<RetryActiveRequestResult> => {
+  return Call.ByName('codeswitch/services.LogService.RetryActiveRequest', id)
 }
 
 export const fetchLogProviders = async (platform: LogPlatform | '' = ''): Promise<string[]> => {
