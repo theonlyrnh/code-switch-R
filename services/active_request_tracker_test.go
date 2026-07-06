@@ -133,7 +133,7 @@ func TestActiveRequestTrackerRetryCancelsAndMarksLog(t *testing.T) {
 	}
 }
 
-func TestActiveRequestTrackerRetryIgnoresFinishedStartedAndWrongUser(t *testing.T) {
+func TestActiveRequestTrackerRetryIgnoresFinishedFirstTextAndWrongUser(t *testing.T) {
 	tracker := newActiveRequestTracker()
 
 	if result := tracker.Retry(-123, ""); result.Status != activeRequestRetryIgnoredFinished {
@@ -147,11 +147,22 @@ func TestActiveRequestTrackerRetryIgnoresFinishedStartedAndWrongUser(t *testing.
 
 	startedID := tracker.Start(&ReqeustLog{UserID: "user-a"}, time.Now())
 	tracker.MarkResponseStarted(startedID)
-	if result := tracker.Retry(-startedID, "user-a"); result.Status != activeRequestRetryIgnoredResponseStarted {
-		t.Fatalf("started retry status = %q, want response started", result.Status)
+	if result := tracker.Retry(-startedID, "user-a"); result.Status != activeRequestRetryTriggered {
+		t.Fatalf("response-started retry status = %q, want %q", result.Status, activeRequestRetryTriggered)
 	}
-	if tracker.IsRetryRequested(startedID) {
-		t.Fatalf("started request should not be marked retrying")
+
+	firstTextID := tracker.Start(&ReqeustLog{
+		UserID:                "user-a",
+		FirstTokenDurationSec: 0.42,
+		FirstTextSec:          0.42,
+	}, time.Now())
+	if result := tracker.Retry(-firstTextID, "user-a"); result.Status != activeRequestRetryIgnoredFirstText {
+		t.Fatalf("first-text retry status = %q, want %q", result.Status, activeRequestRetryIgnoredFirstText)
+	} else if result.FirstTokenDurationSec != 0.42 || result.FirstTextSec != 0.42 {
+		t.Fatalf("first-text retry result = %#v, want first token/text seconds", result)
+	}
+	if tracker.IsRetryRequested(firstTextID) {
+		t.Fatalf("first-text request should not be marked retrying")
 	}
 }
 

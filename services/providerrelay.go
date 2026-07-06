@@ -1319,6 +1319,10 @@ func (prs *ProviderRelayService) forwardRequest(
 				var responseWritten bool
 				_, responseWritten, copyErr = writeCodexGuardedStreamingResponse(c.Writer, resp, requestLog, ReqeustLogHook(c, kind, requestLog))
 				if copyErr != nil && (errors.Is(copyErr, errCodexEmptyStream) || !responseWritten) {
+					if defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
+						requestLog.markRetryRequested()
+						return false, errActiveRequestRetryRequested
+					}
 					return false, copyErr
 				}
 			} else {
@@ -1329,6 +1333,10 @@ func (prs *ProviderRelayService) forwardRequest(
 		} else {
 			defaultActiveRequestTracker.MarkResponseStarted(requestLog.ActiveRequestID)
 			_, copyErr = resp.ToHttpResponseWriter(c.Writer, ReqeustLogHook(c, kind, requestLog))
+		}
+		if defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
+			requestLog.markRetryRequested()
+			return false, errActiveRequestRetryRequested
 		}
 		if copyErr != nil {
 			fmt.Printf("[WARN] 复制响应到客户端失败（不影响provider成功判定）: %v\n", copyErr)
@@ -1406,6 +1414,10 @@ func (prs *ProviderRelayService) forwardRequest(
 				var responseWritten bool
 				_, responseWritten, copyErr = writeCodexGuardedStreamingResponse(c.Writer, resp, requestLog, ReqeustLogHook(c, kind, requestLog))
 				if copyErr != nil && (errors.Is(copyErr, errCodexEmptyStream) || !responseWritten) {
+					if defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
+						requestLog.markRetryRequested()
+						return false, errActiveRequestRetryRequested
+					}
 					return false, copyErr
 				}
 			} else {
@@ -1416,6 +1428,10 @@ func (prs *ProviderRelayService) forwardRequest(
 		} else {
 			defaultActiveRequestTracker.MarkResponseStarted(requestLog.ActiveRequestID)
 			_, copyErr = resp.ToHttpResponseWriter(c.Writer, ReqeustLogHook(c, kind, requestLog))
+		}
+		if defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
+			requestLog.markRetryRequested()
+			return false, errActiveRequestRetryRequested
 		}
 		if copyErr != nil {
 			fmt.Printf("[WARN] 复制响应到客户端失败（不影响provider成功判定）: %v\n", copyErr)

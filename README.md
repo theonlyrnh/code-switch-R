@@ -77,6 +77,7 @@ SERVICE_NAME="codeswitch.service"
 
 - 普通发布只上传构建产物到生产机的 `~/apps/code-switch`。
 - 需要 `sudo` 的操作由服务器操作员手动执行。
+- 自动化助手或发布脚本不得尝试 `sudo`、`sudo -n`、`systemctl restart`、`systemctl stop`、`systemctl start`。如果发布需要重启，只能在产物替换完成后停止操作，并把下方“操作员重启”命令发给有 sudo 权限的人执行。
 - 不用 `kill` / `pkill` 绕过 systemd 管理生产服务。
 - 修改 `/etc`、Caddy/Nginx、nftables、防火墙、systemd、apt 安装软件都属于系统级操作。
 
@@ -312,6 +313,12 @@ sudo systemctl status codeswitch.service --no-pager -l
 
 后端通过 `CODE_SWITCH_STATIC_DIR` 从磁盘读取前端构建产物，不会把 `frontend/dist` 打进二进制。
 
+发布执行边界：
+
+- 发布者可以构建、上传、解压、备份和替换 `~/apps/code-switch` 下的产物。
+- 发布者可以做不需要 sudo 的检查，例如 `curl http://127.0.0.1:8080/healthz`、`curl http://127.0.0.1:18100/v1/models`、`systemctl is-active codeswitch.service`。
+- 发布者不能尝试任何 sudo 操作，也不能尝试重启 systemd 服务。即使认为当前用户可能有免密 sudo，也必须停止并通知操作员手动执行。
+
 发布类型：
 
 - 只改前端：上传 `frontend/dist`，通常不需要重启。
@@ -402,9 +409,29 @@ ssh "$PROD_SSH" "
 "
 ```
 
-替换后由服务器操作员重启：
+到这里自动发布必须停止。发布者需要把本次 `STAMP` 一并发给服务器操作员；下面命令由操作员在生产机上手动执行重启和验证：
 
 ```bash
+sudo systemctl restart codeswitch.service
+sudo systemctl status codeswitch.service --no-pager -l
+curl -fsS http://127.0.0.1:8080/healthz
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18100/v1/models
+```
+
+预期：
+
+- `healthz` 返回 `{"ok":true}`。
+- 未带 relay key 请求 `127.0.0.1:18100` 返回 `401`。
+
+如果重启后异常，由操作员执行回滚：
+
+```bash
+STAMP="<本次发布时间戳，例如 20260706-205801>"
+cd ~/apps/code-switch
+cp codeswitch-web.bak.$STAMP codeswitch-web
+rm -rf frontend/dist
+mv frontend/dist.bak.$STAMP frontend/dist
+chmod +x codeswitch-web
 sudo systemctl restart codeswitch.service
 sudo systemctl status codeswitch.service --no-pager -l
 ```

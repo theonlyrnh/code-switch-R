@@ -24,7 +24,7 @@ export type RequestLog = {
   first_text_sec?: number
   error_message?: string
   created_at: string
-  status?: 'processing' | 'completed' | string
+  status?: 'processing' | 'retrying' | 'completed' | string
   retry_requested?: boolean
 }
 
@@ -42,7 +42,15 @@ export const fetchRequestLogs = async (query: RequestLogQuery = {}): Promise<Req
 }
 
 export type RetryActiveRequestResult = {
-  status: 'retried' | 'ignored_finished' | 'ignored_response_started' | 'ignored_unauthorized' | string
+  status:
+    | 'retried'
+    | 'ignored_finished'
+    | 'ignored_first_text'
+    | 'ignored_response_started'
+    | 'ignored_unauthorized'
+    | string
+  first_token_duration_sec?: number
+  first_text_sec?: number
 }
 
 export const retryActiveRequest = async (id: number): Promise<RetryActiveRequestResult> => {

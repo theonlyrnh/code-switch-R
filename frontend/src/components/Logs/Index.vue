@@ -112,9 +112,6 @@
               >
                 {{ t('components.logs.retry.action') }}
               </button>
-              <span v-else-if="isRetryLog(item)" class="retry-token-label">
-                {{ t('components.logs.retry.label') }}
-              </span>
               <div v-else class="token-breakdown">
                 <div>
                   <span class="token-label">{{ t('components.logs.tokenLabels.input') }}</span>
@@ -575,6 +572,7 @@ const logSignature = (item: RequestLog) => [
   item.is_stream ?? '',
   item.duration_sec ?? '',
   item.first_token_duration_sec ?? '',
+  item.first_text_sec ?? '',
   item.input_tokens ?? '',
   item.output_tokens ?? '',
   item.cache_create_tokens ?? '',
@@ -716,10 +714,9 @@ const isRetryLog = (item: RequestLog) => {
   return item.retry_requested === true || item.status === 'retrying' || item.error_message === '重试' || retryingLogIds.value.has(item.id)
 }
 
-const hasFirstToken = (item: RequestLog) => {
-  const value = item.first_token_duration_sec
-  return typeof value === 'number' && Number.isFinite(value) && value > 0
-}
+const isPositiveDuration = (value?: number): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0
+
+const hasFirstToken = (item: RequestLog) => isPositiveDuration(item.first_token_duration_sec)
 
 const showRetryButton = (item: RequestLog) => {
   return isProcessingLog(item) && !isRetryLog(item)
@@ -737,22 +734,43 @@ const markRetryingLog = (id: number) => {
   retryingLogIds.value = new Set([...retryingLogIds.value, id])
 }
 
+const clearRetryingLog = (id: number) => {
+  const next = new Set(retryingLogIds.value)
+  next.delete(id)
+  retryingLogIds.value = next
+}
+
+const markLogFirstTokenSeen = (id: number, firstTokenSec?: number, firstTextSec?: number) => {
+  const fallbackFirstTokenSec = isPositiveDuration(firstTokenSec) ? firstTokenSec : 0.001
+  const fallbackFirstTextSec = isPositiveDuration(firstTextSec) ? firstTextSec : fallbackFirstTokenSec
+  logs.value = logs.value.map((log) => {
+    if (log.id !== id) return log
+    const firstTokenValue = hasFirstToken(log) ? log.first_token_duration_sec : fallbackFirstTokenSec
+    const firstTextValue = isPositiveDuration(log.first_text_sec) ? log.first_text_sec : fallbackFirstTextSec
+    return {
+      ...log,
+      first_token_duration_sec: firstTokenValue,
+      first_text_sec: firstTextValue,
+    }
+  })
+  lastLogsSignature = logsSignature(logs.value)
+}
+
 const handleRetryLog = async (item: RequestLog) => {
   if (!canRetryLog(item)) return
   markRetryingLog(item.id)
   try {
     const result = await retryActiveRequest(item.id)
     if (result?.status !== 'retried') {
-      const next = new Set(retryingLogIds.value)
-      next.delete(item.id)
-      retryingLogIds.value = next
+      clearRetryingLog(item.id)
+      if (result?.status === 'ignored_first_text' || result?.status === 'ignored_response_started') {
+        markLogFirstTokenSeen(item.id, result.first_token_duration_sec, result.first_text_sec)
+      }
     }
     await refreshLogsIfChanged()
   } catch (error) {
     console.error('failed to retry active request', error)
-    const next = new Set(retryingLogIds.value)
-    next.delete(item.id)
-    retryingLogIds.value = next
+    clearRetryingLog(item.id)
   }
 }
 

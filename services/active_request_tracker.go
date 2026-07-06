@@ -19,6 +19,7 @@ var defaultActiveRequestTracker = newActiveRequestTracker()
 const (
 	activeRequestRetryTriggered              = "retried"
 	activeRequestRetryIgnoredFinished        = "ignored_finished"
+	activeRequestRetryIgnoredFirstText       = "ignored_first_text"
 	activeRequestRetryIgnoredResponseStarted = "ignored_response_started"
 	activeRequestRetryIgnoredUnauthorized    = "ignored_unauthorized"
 )
@@ -38,7 +39,9 @@ type activeRequestSnapshot struct {
 }
 
 type ActiveRequestRetryResult struct {
-	Status string `json:"status"`
+	Status                string  `json:"status"`
+	FirstTokenDurationSec float64 `json:"first_token_duration_sec,omitempty"`
+	FirstTextSec          float64 `json:"first_text_sec,omitempty"`
 }
 
 func newActiveRequestTracker() *activeRequestTracker {
@@ -160,9 +163,15 @@ func (t *activeRequestTracker) Retry(id int64, userID string) ActiveRequestRetry
 		t.mu.Unlock()
 		return ActiveRequestRetryResult{Status: activeRequestRetryIgnoredUnauthorized}
 	}
-	if existing.responseStarted {
+	if activeRequestHasFirstText(existing.log) {
+		firstTokenSec := existing.log.FirstTokenDurationSec
+		firstTextSec := existing.log.FirstTextSec
 		t.mu.Unlock()
-		return ActiveRequestRetryResult{Status: activeRequestRetryIgnoredResponseStarted}
+		return ActiveRequestRetryResult{
+			Status:                activeRequestRetryIgnoredFirstText,
+			FirstTokenDurationSec: firstTokenSec,
+			FirstTextSec:          firstTextSec,
+		}
 	}
 	existing.retryRequested = true
 	existing.log.RetryRequested = true
@@ -175,6 +184,10 @@ func (t *activeRequestTracker) Retry(id int64, userID string) ActiveRequestRetry
 		cancel()
 	}
 	return ActiveRequestRetryResult{Status: activeRequestRetryTriggered}
+}
+
+func activeRequestHasFirstText(logEntry ReqeustLog) bool {
+	return logEntry.FirstTextSec > 0 || logEntry.FirstTokenDurationSec > 0
 }
 
 func (t *activeRequestTracker) List(platform, provider, userID string) []ReqeustLog {
