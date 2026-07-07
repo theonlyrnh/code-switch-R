@@ -146,7 +146,10 @@ export async function refreshAdminAuthStatus(force = false): Promise<AdminAuthSt
     return statusPromise
   }
 
-  adminAuthState.loading = true
+  const shouldShowLoading = !adminAuthState.ready
+  if (shouldShowLoading) {
+    adminAuthState.loading = true
+  }
   statusPromise = adminRequest<AdminAuthStatus>('/api/admin/status')
     .then((status) => {
       applyStatus(status)
@@ -157,7 +160,9 @@ export async function refreshAdminAuthStatus(force = false): Promise<AdminAuthSt
       throw error
     })
     .finally(() => {
-      adminAuthState.loading = false
+      if (shouldShowLoading) {
+        adminAuthState.loading = false
+      }
       statusPromise = null
     })
 

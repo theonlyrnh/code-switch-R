@@ -184,6 +184,65 @@ func (s *userScopedLogService) ProviderDailyStats(ctx context.Context, platform 
 	return s.base.ProviderDailyStatsForUser(user.ID, platform)
 }
 
+type userScopedCostService struct {
+	base *services.CostService
+}
+
+func (s *userScopedCostService) TodayUsage(ctx context.Context, platform string, provider string) ([]services.CostUsageItem, error) {
+	if s == nil || s.base == nil {
+		return []services.CostUsageItem{}, nil
+	}
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.base.TodayUsageForUser(user.ID, platform, provider)
+}
+
+func (s *userScopedCostService) GetSettings(ctx context.Context) (services.CostSettings, error) {
+	if s == nil || s.base == nil {
+		return services.CostSettings{}, nil
+	}
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return services.CostSettings{}, err
+	}
+	return s.base.GetSettingsForUser(user.ID)
+}
+
+func (s *userScopedCostService) SaveSettings(ctx context.Context, settings services.CostSettings) (services.CostSettings, error) {
+	if s == nil || s.base == nil {
+		return settings, nil
+	}
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return settings, err
+	}
+	return s.base.SaveSettingsForUser(user.ID, settings)
+}
+
+func (s *userScopedCostService) ResetProviderMultiplier(ctx context.Context, platform string, provider string) error {
+	if s == nil || s.base == nil {
+		return nil
+	}
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	return s.base.ResetProviderMultiplierForUser(user.ID, platform, provider)
+}
+
+func (s *userScopedCostService) ResetModelOverride(ctx context.Context, platform string, provider string, model string) error {
+	if s == nil || s.base == nil {
+		return nil
+	}
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	return s.base.ResetModelOverrideForUser(user.ID, platform, provider, model)
+}
+
 type userScopedHealthCheckService struct {
 	base *services.HealthCheckService
 }

@@ -34,6 +34,7 @@ type appRuntime struct {
 	codexSettings      *services.CodexSettingsService
 	cliConfigService   *services.CliConfigService
 	logService         *services.LogService
+	costService        *services.CostService
 	appSettings        *services.AppSettingsService
 	adminAuth          *services.AdminAuthService
 	adminSecurity      *adminSecurity
@@ -89,6 +90,7 @@ func newAppRuntime() (*appRuntime, error) {
 	codexSettings := services.NewCodexSettingsService(providerRelay.Addr(), codexRelayKeys)
 	cliConfigService := services.NewCliConfigService(providerRelay.Addr(), codexRelayKeys)
 	logService := services.NewLogService()
+	costService := services.NewCostService()
 	mcpService := services.NewMCPService()
 	skillService := services.NewSkillService()
 	promptService := services.NewPromptService()
@@ -156,6 +158,7 @@ func newAppRuntime() (*appRuntime, error) {
 		codexSettings:      codexSettings,
 		cliConfigService:   cliConfigService,
 		logService:         logService,
+		costService:        costService,
 		appSettings:        appSettings,
 		adminAuth:          adminAuth,
 		adminSecurity:      adminSecurity,
@@ -206,6 +209,7 @@ func (rt *appRuntime) registerServices(registry *rpcRegistry) {
 	registry.Register("codeswitch/services.CodexSettingsService", &userScopedCodexSettingsService{base: rt.codexSettings})
 	registry.Register("codeswitch/services.CliConfigService", &userScopedCliConfigService{})
 	registry.Register("codeswitch/services.LogService", &userScopedLogService{base: rt.logService})
+	registry.Register("codeswitch/services.CostService", &userScopedCostService{base: rt.costService})
 	registry.Register("codeswitch/services.AppSettingsService", rt.appSettings)
 	registry.Register("codeswitch/services.MCPService", rt.mcpService)
 	registry.Register("codeswitch/services.SkillService", rt.skillService)

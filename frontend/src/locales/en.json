@@ -29,7 +29,8 @@
     "logs": "Logs",
     "console": "Console",
     "settings": "Settings",
-    "keys": "Keys"
+    "keys": "Keys",
+    "costs": "Costs"
   },
   "common": {
     "save": "Save",
@@ -742,6 +743,66 @@
       "savePartialSuccess": "{success} saved, {fail} failed",
       "tabPreview": "Preview",
       "tabCurrent": "Current"
+    },
+    "costs": {
+      "eyebrow": "Today cost",
+      "title": "Costs",
+      "description": "Estimate today's successful request cost from log tokens and provider pricing.",
+      "refresh": "Refresh",
+      "empty": "No billable successful requests today.",
+      "loadFailed": "Failed to load costs",
+      "missingPrice": "Missing price",
+      "overridePrice": "Custom price",
+      "notCounted": "Not counted",
+      "unknownProvider": "Unknown provider",
+      "summary": {
+        "totalCost": "Today total cost",
+        "todayOnly": "UTC logs grouped by Beijing day",
+        "billableTokens": "Billable tokens",
+        "billableHint": "Input minus cache read + output + cache read",
+        "unpricedModels": "Unpriced models",
+        "unpricedHint": "Excluded from total",
+        "requests": "Requests",
+        "successOnly": "2xx and input tokens > 0"
+      },
+      "settings": {
+        "title": "Price settings",
+        "unit": "Unit: USD / 1M tokens. Empty values use default prices when available.",
+        "save": "Save settings",
+        "chooseProvider": "Select one platform and provider to edit multiplier and model price overrides.",
+        "multiplier": "Provider multiplier",
+        "resetMultiplier": "Reset multiplier",
+        "clearOverride": "Clear override",
+        "defaultPrice": "Default price",
+        "saved": "Cost settings saved",
+        "saveFailed": "Failed to save cost settings",
+        "resetDone": "Reset complete"
+      },
+      "details": {
+        "title": "Cost details",
+        "groupedByProvider": "Grouped by provider and model.",
+        "groupedByModel": "Grouped by model for the selected provider."
+      },
+      "price": {
+        "input": "Input",
+        "output": "Output",
+        "cacheRead": "Cache read"
+      },
+      "tokenLabels": {
+        "input": "Input",
+        "output": "Output",
+        "cacheRead": "Cache read",
+        "cacheCreate": "Cache create (not billed)",
+        "reasoning": "Reasoning (not billed)"
+      },
+      "table": {
+        "model": "Model",
+        "requests": "Requests",
+        "tokens": "Tokens",
+        "prices": "Prices",
+        "multiplier": "Multiplier",
+        "subtotal": "Subtotal"
+      }
     }
   },
   "keys": {

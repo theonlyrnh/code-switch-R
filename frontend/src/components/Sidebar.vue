@@ -59,6 +59,7 @@ interface NavItem {
 const navItems: NavItem[] = [
   { path: '/', icon: 'home', labelKey: 'sidebar.home' },
   { path: '/logs', icon: 'bar-chart', labelKey: 'sidebar.logs' },
+  { path: '/costs', icon: 'dollar', labelKey: 'sidebar.costs' },
   { path: '/console', icon: 'terminal', labelKey: 'sidebar.console' },
   { path: '/keys', icon: 'key', labelKey: 'sidebar.keys' },
   { path: '/settings', icon: 'settings', labelKey: 'sidebar.settings' },
@@ -108,6 +109,12 @@ const navigate = (path: string) => {
         <!-- Activity -->
         <svg v-else-if="item.icon === 'activity'" class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+        </svg>
+
+        <!-- Dollar -->
+        <svg v-else-if="item.icon === 'dollar'" class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="12" y1="1" x2="12" y2="23"></line>
+          <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7H14.5a3.5 3.5 0 0 1 0 7H6"></path>
         </svg>
 
         <!-- Terminal -->

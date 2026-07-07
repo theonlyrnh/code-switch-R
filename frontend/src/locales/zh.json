@@ -29,7 +29,8 @@
     "logs": "日志",
     "console": "控制台",
     "settings": "设置",
-    "keys": "密钥"
+    "keys": "密钥",
+    "costs": "费用"
   },
   "common": {
     "save": "保存",
@@ -743,6 +744,66 @@
       "savePartialSuccess": "成功 {success} 个，失败 {fail} 个",
       "tabPreview": "预览效果",
       "tabCurrent": "当前磁盘"
+    },
+    "costs": {
+      "eyebrow": "今日费用",
+      "title": "费用",
+      "description": "根据日志中的 token 用量和供应商价格估算今日成功请求费用。",
+      "refresh": "刷新",
+      "empty": "今天暂无可计费的成功请求。",
+      "loadFailed": "费用加载失败",
+      "missingPrice": "缺少价格",
+      "overridePrice": "自定义价格",
+      "notCounted": "未计入",
+      "unknownProvider": "未知供应商",
+      "summary": {
+        "totalCost": "今日总费用",
+        "todayOnly": "按北京时间今日统计",
+        "billableTokens": "计费 Tokens",
+        "billableHint": "输入扣除缓存读取 + 输出 + 缓存读取",
+        "unpricedModels": "未计价模型",
+        "unpricedHint": "不计入总费用",
+        "requests": "请求数",
+        "successOnly": "仅 2xx 且有输入 token"
+      },
+      "settings": {
+        "title": "价格设置",
+        "unit": "单位：USD / 百万 tokens。留空时使用可用默认价格。",
+        "save": "保存设置",
+        "chooseProvider": "请选择具体平台和供应商后编辑倍率和模型覆盖价格。",
+        "multiplier": "供应商倍率",
+        "resetMultiplier": "重置倍率",
+        "clearOverride": "清空覆盖",
+        "defaultPrice": "默认价格",
+        "saved": "费用设置已保存",
+        "saveFailed": "费用设置保存失败",
+        "resetDone": "已重置"
+      },
+      "details": {
+        "title": "费用明细",
+        "groupedByProvider": "按供应商和模型分组展示。",
+        "groupedByModel": "按当前供应商下的模型分组展示。"
+      },
+      "price": {
+        "input": "输入",
+        "output": "输出",
+        "cacheRead": "缓存读取"
+      },
+      "tokenLabels": {
+        "input": "输入",
+        "output": "输出",
+        "cacheRead": "缓存读取",
+        "cacheCreate": "缓存创建（不计费）",
+        "reasoning": "推理（不计费）"
+      },
+      "table": {
+        "model": "模型",
+        "requests": "请求数",
+        "tokens": "Tokens",
+        "prices": "价格",
+        "multiplier": "倍率",
+        "subtotal": "小计"
+      }
     }
   },
   "keys": {
