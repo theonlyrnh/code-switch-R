@@ -419,6 +419,16 @@ func nextProviderNameAfterIndex(levels []int, levelGroups map[int][]Provider, cu
 	return ""
 }
 
+type providerAttemptPlan struct {
+	pool           *ProviderPool
+	userID         string
+	poolID         string
+	active         []Provider
+	levelGroups    map[int][]Provider
+	levels         []int
+	allBlacklisted bool
+}
+
 // isProviderBlacklistedForUser checks whether a provider is currently blacklisted in the given user pool.
 func (prs *ProviderRelayService) isProviderBlacklistedForUser(userID, platform, poolID string, providerID int64) bool {
 	prs.poolPenaltyMu.Lock()
@@ -697,6 +707,50 @@ func (prs *ProviderRelayService) selectProvidersForRequest(kind string, pool *Pr
 	return prs.selectProvidersForRequestForUser("", kind, pool, requestedModel)
 }
 
+func (prs *ProviderRelayService) buildProviderAttemptPlan(c *gin.Context, kind string, requestedModel string) (*providerAttemptPlan, bool, error) {
+	pool, err := prs.resolvePoolFromContext(c, kind)
+	if err != nil {
+		return nil, false, err
+	}
+
+	userID := relayUserIDFromContext(c)
+	active, err := prs.selectProvidersForRequestForUser(userID, kind, pool, requestedModel)
+	if err != nil {
+		return nil, true, err
+	}
+
+	poolID := pool.ID
+	plan := &providerAttemptPlan{
+		pool:   pool,
+		userID: userID,
+		poolID: poolID,
+		active: active,
+	}
+
+	if pool.Mode == ProviderPoolModeManaged {
+		beforeBlacklist := len(active)
+		active = prs.filterBlacklistedProvidersForUser(userID, kind, poolID, active)
+		plan.active = active
+		plan.allBlacklisted = beforeBlacklist > 0 && len(active) == 0
+	}
+
+	levelGroups := make(map[int][]Provider)
+	for _, provider := range active {
+		level := getProviderLevelInPool(pool, provider)
+		levelGroups[level] = append(levelGroups[level], provider)
+	}
+
+	levels := make([]int, 0, len(levelGroups))
+	for level := range levelGroups {
+		levels = append(levels, level)
+	}
+	sort.Ints(levels)
+
+	plan.levelGroups = levelGroups
+	plan.levels = levels
+	return plan, true, nil
+}
+
 // EnsureDefaultPoolsAndBindings 启动时确保默认池子存在
 // relay key 绑定只在一次性迁移（version < 2）时执行
 // 迁移完成后，新 key 不会被自动绑定，必须由用户显式设置
@@ -907,218 +961,206 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 			fmt.Printf("[WARN] 请求未指定模型名，无法执行模型智能降级\n")
 		}
 
-		// ========== Pool 维度供应商选择（fail-closed）==========
-		// 从请求上下文解析池子，然后只在该池子内选择供应商
-		// 不回退默认池子，不回退旧 platform 逻辑
-		pool, poolErr := prs.resolvePoolFromContext(c, kind)
-		if poolErr != nil {
-			fmt.Printf("[ERROR] 解析 %s 的池子失败: %v\n", kind, poolErr)
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": fmt.Sprintf("relay key 无权访问 %s 的供应商池: %v", kind, poolErr),
-			})
-			return
-		}
-
-		fmt.Printf("[INFO] 池子模式: %s/%s (模式: %s, 成员: %d)\n", kind, pool.Name, pool.Mode, len(pool.Members))
-		active, selectErr := prs.selectProvidersForRequestForUser(relayUserIDFromContext(c), kind, pool, requestedModel)
-		if selectErr != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": selectErr.Error()})
-			return
-		}
-		if len(active) == 0 {
-			if requestedModel != "" {
-				c.JSON(http.StatusNotFound, gin.H{
-					"error": fmt.Sprintf("没有可用的 provider 支持模型 '%s'（池子: %s/%s）", requestedModel, kind, pool.Name),
-				})
-			} else {
-				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("no providers available in pool %s/%s", kind, pool.Name)})
-			}
-			return
-		}
-
-		fmt.Printf("[INFO] 池子 %s 找到 %d 个可用的 provider：", pool.Name, len(active))
-		for _, p := range active {
-			fmt.Printf("%s ", p.Name)
-		}
-		fmt.Println()
-
-		c.Set("pool_mode", pool.Mode)
-		c.Set("pool", pool)
-		c.Set(providerPoolIDContextKey, pool.ID)
-		poolID := pool.ID
-		userID := relayUserIDFromContext(c)
-
-		// 过滤掉当前 pool 下仍在拉黑期的 provider（仅 managed 模式）
-		if pool.Mode == ProviderPoolModeManaged {
-			active = prs.filterBlacklistedProvidersForUser(userID, kind, poolID, active)
-		}
-
-		if len(active) == 0 {
-			fmt.Printf("[WARN] 池子 %s 的所有 provider 均在拉黑期，无可用供应商\n", pool.Name)
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": fmt.Sprintf("池子 %s 内所有 provider 均在临时拉黑期，请稍后重试或手动解除拉黑", pool.Name),
-			})
-			return
-		}
-
-		fmt.Printf("[INFO] 池子 %s 找到 %d 个可用的 provider（拉黑过滤后）：", pool.Name, len(active))
-		for _, p := range active {
-			fmt.Printf("%s ", p.Name)
-		}
-		fmt.Println()
-
-		// 按 Level 分组（使用 pool member Level，回退到 provider 全局 Level）
-		levelGroups := make(map[int][]Provider)
-		for _, provider := range active {
-			level := getProviderLevelInPool(pool, provider)
-			levelGroups[level] = append(levelGroups[level], provider)
-		}
-
-		// 获取所有 level 并升序排序
-		levels := make([]int, 0, len(levelGroups))
-		for level := range levelGroups {
-			levels = append(levels, level)
-		}
-		sort.Ints(levels)
-
-		fmt.Printf("[INFO] 共 %d 个 Level 分组：%v\n", len(levels), levels)
-
 		query := flattenQuery(c.Request.URL.Query())
 		clientHeaders := cloneHeaders(c.Request.Header)
 
-		// 【降级模式】：按 Level 顺序选择主 provider。
-		// 只要当前主 provider 没被拉黑，就持续使用它；只有触发拉黑后才切到同级/下一级的下一个 provider。
-		fmt.Printf("[INFO] 🔄 降级模式（主 provider 粘性 + 自动拉黑切换）\n")
-
-		var lastError error
-		var lastProvider string
-		var lastDuration time.Duration
 		totalAttempts := 0
-		stopOnStickyFailure := false
+		for selectionRound := 0; ; selectionRound++ {
+			if selectionRound > 0 {
+				fmt.Printf("[INFO] 用户触发重试，重新读取当前池子和 provider 配置\n")
+			}
 
-		for _, level := range levels {
-			providersInLevel := levelGroups[level]
-
-			fmt.Printf("[INFO] === 尝试 Level %d（%d 个 provider）===\n", level, len(providersInLevel))
-
-			for i, provider := range providersInLevel {
-				totalAttempts++
-
-				// 获取实际应该使用的模型名
-				effectiveModel := provider.GetEffectiveModel(requestedModel)
-
-				// 如果需要映射，修改请求体
-				currentBodyBytes := bodyBytes
-				if effectiveModel != requestedModel && requestedModel != "" {
-					fmt.Printf("[INFO] Provider %s 映射模型: %s -> %s\n", provider.Name, requestedModel, effectiveModel)
-
-					modifiedBody, err := ReplaceModelInRequestBody(bodyBytes, effectiveModel)
-					if err != nil {
-						fmt.Printf("[ERROR] 替换模型名失败: %v\n", err)
-						// 映射失败不应阻止尝试其他 provider
-						continue
-					}
-					currentBodyBytes = modifiedBody
+			plan, poolResolved, selectErr := prs.buildProviderAttemptPlan(c, kind, requestedModel)
+			if selectErr != nil {
+				if !poolResolved {
+					fmt.Printf("[ERROR] 解析 %s 的池子失败: %v\n", kind, selectErr)
+					c.JSON(http.StatusForbidden, gin.H{
+						"error": fmt.Sprintf("relay key 无权访问 %s 的供应商池: %v", kind, selectErr),
+					})
+				} else {
+					c.JSON(http.StatusNotFound, gin.H{"error": selectErr.Error()})
 				}
+				return
+			}
 
-				fmt.Printf("[INFO]   [%d/%d] Provider: %s | Model: %s\n", i+1, len(providersInLevel), provider.Name, effectiveModel)
+			pool := plan.pool
+			poolID := plan.poolID
+			userID := plan.userID
 
-				// 尝试发送请求
-				// 获取有效的端点（用户配置优先）
-				effectiveEndpoint := prs.resolveRelayEndpoint(kind, provider, endpoint)
-				startTime := time.Now()
-				ok, err := prs.forwardRequest(c, kind, provider, effectiveEndpoint, query, clientHeaders, currentBodyBytes, isStream, effectiveModel)
-				duration := time.Since(startTime)
-				for errors.Is(err, errActiveRequestRetryRequested) {
-					fmt.Printf("[INFO] 用户触发重试，重新发送请求: Provider=%s | Model=%s\n", provider.Name, effectiveModel)
-					ok, err = prs.forwardRequest(c, kind, provider, effectiveEndpoint, query, clientHeaders, currentBodyBytes, isStream, effectiveModel)
-					duration = time.Since(startTime)
-				}
-				failedFromEmptyStreamRetry := false
-				if !ok && errors.Is(err, errCodexEmptyStream) {
-					var retryAttempts int
-					var retryDuration time.Duration
-					ok, provider, err, retryAttempts, retryDuration, failedFromEmptyStreamRetry = prs.retryCodexEmptyStreamSameProvider(c, kind, poolID, pool, provider, endpoint, query, clientHeaders, bodyBytes, isStream, requestedModel)
-					totalAttempts += retryAttempts
-					duration += retryDuration
-				}
+			fmt.Printf("[INFO] 池子模式: %s/%s (模式: %s, 成员: %d)\n", kind, pool.Name, pool.Mode, len(pool.Members))
 
-				if ok {
-					fmt.Printf("[INFO]   ✓ Level %d 成功: %s | 耗时: %.2fs\n", level, provider.Name, duration.Seconds())
-
-					// 记录最后使用的供应商
-					prs.setLastUsedProviderForUser(userID, kind, poolID, provider.Name)
-					// 成功：清空该 provider 连续失败计数
-					prs.recordProviderSuccessForUser(userID, kind, poolID, provider)
-
-					return // 成功，立即返回
-				}
-
-				// 失败：记录错误并尝试下一个
-				lastError = err
-				lastProvider = provider.Name
-				lastDuration = duration
-
-				errorMsg := "未知错误"
-				if err != nil {
-					errorMsg = err.Error()
-				}
-				fmt.Printf("[WARN]   ✗ Level %d 失败: %s | 错误: %s | 耗时: %.2fs\n",
-					level, provider.Name, errorMsg, duration.Seconds())
-
-				if errors.Is(err, errClientAbort) {
-					fmt.Printf("[INFO] 客户端中断，停止重试: %s\n", provider.Name)
+			if len(plan.active) == 0 {
+				if plan.allBlacklisted {
+					fmt.Printf("[WARN] 池子 %s 的所有 provider 均在拉黑期，无可用供应商\n", pool.Name)
+					c.JSON(http.StatusServiceUnavailable, gin.H{
+						"error": fmt.Sprintf("池子 %s 内所有 provider 均在临时拉黑期，请稍后重试或手动解除拉黑", pool.Name),
+					})
 					return
 				}
-
-				// 记录 provider 失败（自动拉黑逻辑）。空流重试路径已在内部计数，跳过。
-				blacklistedAfterFailure := false
-				if !failedFromEmptyStreamRetry {
-					blacklistedAfterFailure = prs.recordProviderFailureForUser(userID, kind, poolID, pool, provider, errorMsg)
+				if requestedModel != "" {
+					c.JSON(http.StatusNotFound, gin.H{
+						"error": fmt.Sprintf("没有可用的 provider 支持模型 '%s'（池子: %s/%s）", requestedModel, kind, pool.Name),
+					})
 				} else {
-					blacklistedAfterFailure = prs.isProviderBlacklistedForUser(userID, kind, poolID, provider.ID)
+					c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("no providers available in pool %s/%s", kind, pool.Name)})
 				}
+				return
+			}
 
-				if !blacklistedAfterFailure {
-					fmt.Printf("[WARN] Provider %s 本次失败但未进入拉黑，保持为主 provider，停止继续切换\n", provider.Name)
-					stopOnStickyFailure = true
-					break
-				}
+			fmt.Printf("[INFO] 池子 %s 找到 %d 个可用的 provider（拉黑过滤后）：", pool.Name, len(plan.active))
+			for _, p := range plan.active {
+				fmt.Printf("%s ", p.Name)
+			}
+			fmt.Println()
 
-				// 发送切换通知：仅在 provider 进入拉黑后，才切到下一个可用 provider
-				if prs.notificationService != nil {
-					nextProvider := nextProviderNameAfterIndex(levels, levelGroups, level, i)
-					if nextProvider != "" {
-						prs.notificationService.NotifyProviderSwitch(SwitchNotification{
-							FromProvider: provider.Name,
-							ToProvider:   nextProvider,
-							Reason:       errorMsg,
-							Platform:     kind,
-						})
+			c.Set("pool_mode", pool.Mode)
+			c.Set("pool", pool)
+			c.Set(providerPoolIDContextKey, poolID)
+
+			fmt.Printf("[INFO] 共 %d 个 Level 分组：%v\n", len(plan.levels), plan.levels)
+			fmt.Printf("[INFO] 🔄 降级模式（主 provider 粘性 + 自动拉黑切换）\n")
+
+			var lastError error
+			var lastProvider string
+			var lastDuration time.Duration
+			stopOnStickyFailure := false
+			retryRequested := false
+
+			for _, level := range plan.levels {
+				providersInLevel := plan.levelGroups[level]
+
+				fmt.Printf("[INFO] === 尝试 Level %d（%d 个 provider）===\n", level, len(providersInLevel))
+
+				for i, provider := range providersInLevel {
+					totalAttempts++
+
+					// 获取实际应该使用的模型名
+					effectiveModel := provider.GetEffectiveModel(requestedModel)
+
+					// 如果需要映射，修改请求体
+					currentBodyBytes := bodyBytes
+					if effectiveModel != requestedModel && requestedModel != "" {
+						fmt.Printf("[INFO] Provider %s 映射模型: %s -> %s\n", provider.Name, requestedModel, effectiveModel)
+
+						modifiedBody, err := ReplaceModelInRequestBody(bodyBytes, effectiveModel)
+						if err != nil {
+							fmt.Printf("[ERROR] 替换模型名失败: %v\n", err)
+							// 映射失败不应阻止尝试其他 provider
+							continue
+						}
+						currentBodyBytes = modifiedBody
+					}
+
+					fmt.Printf("[INFO]   [%d/%d] Provider: %s | Model: %s\n", i+1, len(providersInLevel), provider.Name, effectiveModel)
+
+					// 尝试发送请求
+					// 获取有效的端点（用户配置优先）
+					effectiveEndpoint := prs.resolveRelayEndpoint(kind, provider, endpoint)
+					startTime := time.Now()
+					ok, err := prs.forwardRequest(c, kind, provider, effectiveEndpoint, query, clientHeaders, currentBodyBytes, isStream, effectiveModel)
+					duration := time.Since(startTime)
+					if errors.Is(err, errActiveRequestRetryRequested) {
+						fmt.Printf("[INFO] 用户触发重试，放弃当前 provider 并重新选择: Provider=%s | Model=%s\n", provider.Name, effectiveModel)
+						retryRequested = true
+						break
+					}
+
+					failedFromEmptyStreamRetry := false
+					if !ok && errors.Is(err, errCodexEmptyStream) {
+						var retryAttempts int
+						var retryDuration time.Duration
+						ok, provider, err, retryAttempts, retryDuration, failedFromEmptyStreamRetry = prs.retryCodexEmptyStreamSameProvider(c, kind, poolID, pool, provider, endpoint, query, clientHeaders, bodyBytes, isStream, requestedModel)
+						totalAttempts += retryAttempts
+						duration += retryDuration
+						if errors.Is(err, errActiveRequestRetryRequested) {
+							fmt.Printf("[INFO] 用户在空流保护重试期间触发重试，放弃当前 provider 并重新选择: Provider=%s\n", provider.Name)
+							retryRequested = true
+							break
+						}
+					}
+
+					if ok {
+						fmt.Printf("[INFO]   ✓ Level %d 成功: %s | 耗时: %.2fs\n", level, provider.Name, duration.Seconds())
+
+						// 记录最后使用的供应商
+						prs.setLastUsedProviderForUser(userID, kind, poolID, provider.Name)
+						// 成功：清空该 provider 连续失败计数
+						prs.recordProviderSuccessForUser(userID, kind, poolID, provider)
+
+						return // 成功，立即返回
+					}
+
+					// 失败：记录错误并尝试下一个
+					lastError = err
+					lastProvider = provider.Name
+					lastDuration = duration
+
+					errorMsg := "未知错误"
+					if err != nil {
+						errorMsg = err.Error()
+					}
+					fmt.Printf("[WARN]   ✗ Level %d 失败: %s | 错误: %s | 耗时: %.2fs\n",
+						level, provider.Name, errorMsg, duration.Seconds())
+
+					if errors.Is(err, errClientAbort) {
+						fmt.Printf("[INFO] 客户端中断，停止重试: %s\n", provider.Name)
+						return
+					}
+
+					// 记录 provider 失败（自动拉黑逻辑）。空流重试路径已在内部计数，跳过。
+					blacklistedAfterFailure := false
+					if !failedFromEmptyStreamRetry {
+						blacklistedAfterFailure = prs.recordProviderFailureForUser(userID, kind, poolID, pool, provider, errorMsg)
+					} else {
+						blacklistedAfterFailure = prs.isProviderBlacklistedForUser(userID, kind, poolID, provider.ID)
+					}
+
+					if !blacklistedAfterFailure {
+						fmt.Printf("[WARN] Provider %s 本次失败但未进入拉黑，保持为主 provider，停止继续切换\n", provider.Name)
+						stopOnStickyFailure = true
+						break
+					}
+
+					// 发送切换通知：仅在 provider 进入拉黑后，才切到下一个可用 provider
+					if prs.notificationService != nil {
+						nextProvider := nextProviderNameAfterIndex(plan.levels, plan.levelGroups, level, i)
+						if nextProvider != "" {
+							prs.notificationService.NotifyProviderSwitch(SwitchNotification{
+								FromProvider: provider.Name,
+								ToProvider:   nextProvider,
+								Reason:       errorMsg,
+								Platform:     kind,
+							})
+						}
 					}
 				}
+
+				if retryRequested || stopOnStickyFailure {
+					break
+				}
+				fmt.Printf("[WARN] Level %d 的所有 %d 个 provider 均失败，尝试下一 Level\n", level, len(providersInLevel))
 			}
 
-			if stopOnStickyFailure {
-				break
+			if retryRequested {
+				continue
 			}
-			fmt.Printf("[WARN] Level %d 的所有 %d 个 provider 均失败，尝试下一 Level\n", level, len(providersInLevel))
-		}
 
-		// 所有 provider 都失败，返回 502
-		errorMsg := "未知错误"
-		if lastError != nil {
-			errorMsg = lastError.Error()
-		}
-		fmt.Printf("[ERROR] 所有 %d 个 provider 均失败，最后尝试: %s | 错误: %s\n",
-			totalAttempts, lastProvider, errorMsg)
+			// 所有 provider 都失败，返回 502
+			errorMsg := "未知错误"
+			if lastError != nil {
+				errorMsg = lastError.Error()
+			}
+			fmt.Printf("[ERROR] 所有 %d 个 provider 均失败，最后尝试: %s | 错误: %s\n",
+				totalAttempts, lastProvider, errorMsg)
 
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error":          fmt.Sprintf("所有 %d 个 provider 均失败，最后错误: %s", totalAttempts, errorMsg),
-			"last_provider":  lastProvider,
-			"last_duration":  fmt.Sprintf("%.2fs", lastDuration.Seconds()),
-			"total_attempts": totalAttempts,
-		})
+			c.JSON(http.StatusBadGateway, gin.H{
+				"error":          fmt.Sprintf("所有 %d 个 provider 均失败，最后错误: %s", totalAttempts, errorMsg),
+				"last_provider":  lastProvider,
+				"last_duration":  fmt.Sprintf("%.2fs", lastDuration.Seconds()),
+				"total_attempts": totalAttempts,
+			})
+			return
+		}
 	}
 }
 

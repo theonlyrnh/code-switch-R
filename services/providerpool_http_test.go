@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -392,5 +394,423 @@ func TestHTTPStickyPrimaryProviderUntilBlacklisted(t *testing.T) {
 	}
 	if !strings.Contains(w3.Body.String(), `"provider":"provider-b"`) {
 		t.Fatalf("third request should route directly to provider-b, got: %s", w3.Body.String())
+	}
+}
+
+func TestHTTPRetryRereadsCurrentProviderPriority(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+
+	configDir := filepath.Join(testHome, ".code-switch")
+	_ = os.MkdirAll(configDir, 0o700)
+
+	providerAEntered := make(chan struct{}, 1)
+	var providerAHits int32
+	var providerBHits int32
+
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerAHits, 1)
+		providerAEntered <- struct{}{}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(5 * time.Second):
+			w.WriteHeader(http.StatusGatewayTimeout)
+			_, _ = w.Write([]byte(`{"error":"provider-a was not retried"}`))
+		}
+	}))
+	defer upstreamA.Close()
+
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerBHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"provider":"provider-b","choices":[{"message":{"content":"from-b"}}]}`))
+	}))
+	defer upstreamB.Close()
+
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstreamA.URL, APIKey: "key-a"},
+		{ID: 2, Name: "provider-b", Enabled: true, APIURL: upstreamB.URL, APIKey: "key-b"},
+	}
+	payload, _ := json.Marshal(providerEnvelope{Providers: providers})
+	_ = os.WriteFile(filepath.Join(configDir, "openai-chat.json"), payload, 0o600)
+
+	providerService := NewProviderService()
+	poolService := NewProviderPoolService()
+	keyService := NewCodexRelayKeyService()
+	poolService.SetBindingChecker(keyService)
+	appSettings := NewAppSettingsService(nil)
+	notificationService := NewNotificationService(appSettings)
+
+	relay := NewProviderRelayService(
+		providerService, poolService, keyService,
+		notificationService, appSettings,
+		DefaultRelayBindAddr,
+	)
+
+	pool := &ProviderPool{
+		Platform: "openai-chat",
+		Name:     "Retry Pool",
+		Mode:     ProviderPoolModeManaged,
+		Members: []ProviderPoolMember{
+			{ProviderID: 1, Enabled: true, Level: 1},
+			{ProviderID: 2, Enabled: true, Level: 2},
+		},
+	}
+	poolID, _ := poolService.SavePool(pool)
+
+	key, _ := keyService.CreateKey("retry-key")
+	_ = keyService.SetPoolBinding(key.ID, "openai-chat", poolID)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	relay.registerRoutes(router)
+
+	keySecret, _ := keyService.GetKeySecret(key.ID)
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+keySecret)
+
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	select {
+	case <-providerAEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider-a was not called")
+	}
+
+	pool.Members = []ProviderPoolMember{
+		{ProviderID: 2, Enabled: true, Level: 1},
+		{ProviderID: 1, Enabled: true, Level: 2},
+	}
+	if _, err := poolService.SavePool(pool); err != nil {
+		t.Fatalf("update pool priority: %v", err)
+	}
+
+	var retryResult ActiveRequestRetryResult
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		active := defaultActiveRequestTracker.List("openai-chat", "", "")
+		if len(active) > 0 {
+			retryResult = defaultActiveRequestTracker.Retry(active[0].ID, "")
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if retryResult.Status != activeRequestRetryTriggered {
+		t.Fatalf("retry status = %q, want %q", retryResult.Status, activeRequestRetryTriggered)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("request did not finish after retry")
+	}
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry request expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if atomic.LoadInt32(&providerAHits) != 1 {
+		t.Fatalf("provider-a hits = %d, want 1", providerAHits)
+	}
+	if atomic.LoadInt32(&providerBHits) != 1 {
+		t.Fatalf("provider-b hits = %d, want 1", providerBHits)
+	}
+	if !strings.Contains(w.Body.String(), `"provider":"provider-b"`) {
+		t.Fatalf("retry should route to current highest priority provider-b, got: %s", w.Body.String())
+	}
+}
+
+func TestHTTPRetryRereadsCurrentManualProvider(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+
+	configDir := filepath.Join(testHome, ".code-switch")
+	_ = os.MkdirAll(configDir, 0o700)
+
+	providerAEntered := make(chan struct{}, 1)
+	var providerAHits int32
+	var providerBHits int32
+
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerAHits, 1)
+		providerAEntered <- struct{}{}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(5 * time.Second):
+			w.WriteHeader(http.StatusGatewayTimeout)
+			_, _ = w.Write([]byte(`{"error":"provider-a was not retried"}`))
+		}
+	}))
+	defer upstreamA.Close()
+
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerBHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"provider":"provider-b","choices":[{"message":{"content":"from-b"}}]}`))
+	}))
+	defer upstreamB.Close()
+
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstreamA.URL, APIKey: "key-a"},
+		{ID: 2, Name: "provider-b", Enabled: true, APIURL: upstreamB.URL, APIKey: "key-b"},
+	}
+	payload, _ := json.Marshal(providerEnvelope{Providers: providers})
+	_ = os.WriteFile(filepath.Join(configDir, "openai-chat.json"), payload, 0o600)
+
+	providerService := NewProviderService()
+	poolService := NewProviderPoolService()
+	keyService := NewCodexRelayKeyService()
+	poolService.SetBindingChecker(keyService)
+	appSettings := NewAppSettingsService(nil)
+	notificationService := NewNotificationService(appSettings)
+
+	relay := NewProviderRelayService(
+		providerService, poolService, keyService,
+		notificationService, appSettings,
+		DefaultRelayBindAddr,
+	)
+
+	manualA := int64(1)
+	manualB := int64(2)
+	pool := &ProviderPool{
+		Platform:         "openai-chat",
+		Name:             "Manual Retry Pool",
+		Mode:             ProviderPoolModeManual,
+		ManualProviderID: &manualA,
+		Members: []ProviderPoolMember{
+			{ProviderID: 1, Enabled: true},
+			{ProviderID: 2, Enabled: false},
+		},
+	}
+	poolID, _ := poolService.SavePool(pool)
+
+	key, _ := keyService.CreateKey("manual-retry-key")
+	_ = keyService.SetPoolBinding(key.ID, "openai-chat", poolID)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	relay.registerRoutes(router)
+
+	keySecret, _ := keyService.GetKeySecret(key.ID)
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+keySecret)
+
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	select {
+	case <-providerAEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider-a was not called")
+	}
+
+	pool.ManualProviderID = &manualB
+	if _, err := poolService.SavePool(pool); err != nil {
+		t.Fatalf("update manual provider: %v", err)
+	}
+
+	var retryResult ActiveRequestRetryResult
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		active := defaultActiveRequestTracker.List("openai-chat", "", "")
+		if len(active) > 0 {
+			retryResult = defaultActiveRequestTracker.Retry(active[0].ID, "")
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if retryResult.Status != activeRequestRetryTriggered {
+		t.Fatalf("retry status = %q, want %q", retryResult.Status, activeRequestRetryTriggered)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("request did not finish after retry")
+	}
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("manual retry request expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if atomic.LoadInt32(&providerAHits) != 1 {
+		t.Fatalf("provider-a hits = %d, want 1", providerAHits)
+	}
+	if atomic.LoadInt32(&providerBHits) != 1 {
+		t.Fatalf("provider-b hits = %d, want 1", providerBHits)
+	}
+	if !strings.Contains(w.Body.String(), `"provider":"provider-b"`) {
+		t.Fatalf("retry should route to current manual provider-b, got: %s", w.Body.String())
+	}
+}
+
+func TestHTTPRetryDuringCodexEmptyStreamRetryRereadsProviderPriority(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+
+	configDir := filepath.Join(testHome, ".code-switch")
+	_ = os.MkdirAll(configDir, 0o700)
+
+	providerASecondAttempt := make(chan struct{}, 1)
+	var providerAHits int32
+	var providerBHits int32
+
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit := atomic.AddInt32(&providerAHits, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if hit == 1 {
+			return
+		}
+		providerASecondAttempt <- struct{}{}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(5 * time.Second):
+			w.WriteHeader(http.StatusGatewayTimeout)
+			_, _ = w.Write([]byte("data: {\"error\":\"provider-a was not retried\"}\n\n"))
+		}
+	}))
+	defer upstreamA.Close()
+
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerBHits, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"from-b\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstreamB.Close()
+
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstreamA.URL, APIKey: "key-a"},
+		{ID: 2, Name: "provider-b", Enabled: true, APIURL: upstreamB.URL, APIKey: "key-b"},
+	}
+	payload, _ := json.Marshal(providerEnvelope{Providers: providers})
+	_ = os.WriteFile(filepath.Join(configDir, "openai-responses.json"), payload, 0o600)
+
+	providerService := NewProviderService()
+	poolService := NewProviderPoolService()
+	keyService := NewCodexRelayKeyService()
+	poolService.SetBindingChecker(keyService)
+	appSettings := NewAppSettingsService(nil)
+	notificationService := NewNotificationService(appSettings)
+
+	relay := NewProviderRelayService(
+		providerService, poolService, keyService,
+		notificationService, appSettings,
+		DefaultRelayBindAddr,
+	)
+
+	pool := &ProviderPool{
+		Platform:                     "openai-responses",
+		Name:                         "Responses Retry Pool",
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       2,
+		AutoBlacklistDurationMinutes: 10,
+		Members: []ProviderPoolMember{
+			{ProviderID: 1, Enabled: true, Level: 1},
+			{ProviderID: 2, Enabled: true, Level: 2},
+		},
+	}
+	poolID, _ := poolService.SavePool(pool)
+
+	key, _ := keyService.CreateKey("responses-retry-key")
+	_ = keyService.SetPoolBinding(key.ID, "openai-responses", poolID)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	relay.registerRoutes(router)
+
+	keySecret, _ := keyService.GetKeySecret(key.ID)
+	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+keySecret)
+
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	select {
+	case <-providerASecondAttempt:
+	case <-time.After(4 * time.Second):
+		t.Fatal("provider-a second empty-stream retry attempt was not called")
+	}
+
+	pool.Members = []ProviderPoolMember{
+		{ProviderID: 2, Enabled: true, Level: 1},
+		{ProviderID: 1, Enabled: true, Level: 2},
+	}
+	if _, err := poolService.SavePool(pool); err != nil {
+		t.Fatalf("update responses pool priority: %v", err)
+	}
+
+	var retryResult ActiveRequestRetryResult
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		active := defaultActiveRequestTracker.List("openai-responses", "", "")
+		if len(active) > 0 {
+			retryResult = defaultActiveRequestTracker.Retry(active[0].ID, "")
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if retryResult.Status != activeRequestRetryTriggered {
+		t.Fatalf("retry status = %q, want %q", retryResult.Status, activeRequestRetryTriggered)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("responses request did not finish after retry")
+	}
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("responses retry request expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if atomic.LoadInt32(&providerAHits) != 2 {
+		t.Fatalf("provider-a hits = %d, want 2", providerAHits)
+	}
+	if atomic.LoadInt32(&providerBHits) != 1 {
+		t.Fatalf("provider-b hits = %d, want 1", providerBHits)
+	}
+	if !strings.Contains(w.Body.String(), "from-b") {
+		t.Fatalf("retry should route to current highest priority provider-b, got: %s", w.Body.String())
+	}
+	blacklisted := relay.ListProviderBlacklistStatus("openai-responses", poolID)
+	if len(blacklisted) != 0 {
+		t.Fatalf("user-triggered retry should not blacklist provider-a, got: %+v", blacklisted)
 	}
 }
