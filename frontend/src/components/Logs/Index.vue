@@ -88,7 +88,7 @@
           </tr>
         </thead>
         <tbody>
-          <tr v-for="item in pagedLogs" :key="item.id" :class="isProcessingLog(item) ? 'processing-row' : ''">
+          <tr v-for="item in pagedLogs" :key="item.id" :class="isActiveLog(item) ? 'processing-row' : ''">
             <td :data-label="t('components.logs.table.time')">{{ formatTime(item.created_at) }}</td>
             <td :data-label="t('components.logs.table.platform')">{{ item.platform || '—' }}</td>
             <td :data-label="t('components.logs.table.provider')" class="provider-cell">{{ item.provider || '—' }}</td>
@@ -96,15 +96,17 @@
             <td :data-label="t('components.logs.table.model')">{{ item.model || '—' }}</td>
             <td :data-label="t('components.logs.table.clientIp')" class="client-ip-cell">{{ item.client_ip || '—' }}</td>
             <td :data-label="t('components.logs.table.httpCode')" :class="['code', httpCodeClassForLog(item)]">
-              <span v-if="isProcessingLog(item)" class="processing-tag">{{ t('components.logs.status.processing') }}</span>
+              <span v-if="isQueuedLog(item)" class="processing-tag queued-tag">{{ formatQueueStatus(item) }}</span>
+              <span v-else-if="isProcessingLog(item)" class="processing-tag">{{ t('components.logs.status.processing') }}</span>
               <span v-else>{{ item.http_code || '—' }}</span>
             </td>
             <td :data-label="t('components.logs.table.stream')"><span :class="['stream-tag', item.is_stream ? 'on' : 'off']">{{ formatStream(item.is_stream) }}</span></td>
             <td :data-label="t('components.logs.table.firstToken')"><span :class="['duration-tag', durationColorForLog(item, item.first_token_duration_sec)]">{{ formatFirstTokenDuration(item) }}</span></td>
             <td :data-label="t('components.logs.table.duration')"><span :class="['duration-tag', durationColor(item.duration_sec)]">{{ formatDuration(item.duration_sec) }}</span></td>
             <td :data-label="t('components.logs.table.tokens')" class="token-cell">
+              <div v-if="isQueuedLog(item)" class="queued-token">{{ formatQueueStatus(item) }}</div>
               <button
-                v-if="showRetryButton(item)"
+                v-else-if="showRetryButton(item)"
                 type="button"
                 class="retry-token-button"
                 :disabled="isRetryDisabled(item)"
@@ -573,6 +575,8 @@ const logSignature = (item: RequestLog) => [
   item.duration_sec ?? '',
   item.first_token_duration_sec ?? '',
   item.first_text_sec ?? '',
+  item.queue_position ?? '',
+  item.queue_started_at ?? '',
   item.input_tokens ?? '',
   item.output_tokens ?? '',
   item.cache_create_tokens ?? '',
@@ -708,7 +712,11 @@ const formatDuration = (value?: number) => {
   return `${value.toFixed(2)}s`
 }
 
+const isQueuedLog = (item: RequestLog) => item.status === 'queued'
+
 const isProcessingLog = (item: RequestLog) => item.status === 'processing' || item.status === 'retrying'
+
+const isActiveLog = (item: RequestLog) => isQueuedLog(item) || isProcessingLog(item)
 
 const isRetryLog = (item: RequestLog) => {
   return item.retry_requested === true || item.status === 'retrying' || item.error_message === '重试' || retryingLogIds.value.has(item.id)
@@ -778,6 +786,14 @@ const formatFirstTokenDuration = (item: RequestLog) => {
   return formatDuration(item.first_token_duration_sec)
 }
 
+const formatQueueStatus = (item: RequestLog) => {
+  const position = item.queue_position
+  if (typeof position === 'number' && Number.isFinite(position) && position > 0) {
+    return t('components.logs.status.queuedWithPosition', { position })
+  }
+  return t('components.logs.status.queued')
+}
+
 const httpCodeClass = (code: number) => {
   if (code >= 500) return 'http-server-error'
   if (code >= 400) return 'http-client-error'
@@ -787,7 +803,7 @@ const httpCodeClass = (code: number) => {
 }
 
 const httpCodeClassForLog = (item: RequestLog) => {
-  if (isProcessingLog(item)) return 'http-processing'
+  if (isActiveLog(item)) return 'http-processing'
   return httpCodeClass(item.http_code)
 }
 
@@ -799,7 +815,7 @@ const durationColor = (value?: number) => {
 }
 
 const durationColorForLog = (item: RequestLog, value?: number) => {
-  if (isProcessingLog(item) && (!value || Number.isNaN(value))) return 'neutral'
+  if (isActiveLog(item) && (!value || Number.isNaN(value))) return 'neutral'
   return durationColor(value)
 }
 
@@ -829,6 +845,7 @@ const formatTokenNumber = (value?: number) => {
 }
 
 const formatLogTokenNumber = (item: RequestLog, value?: number) => {
+  if (isQueuedLog(item)) return formatQueueStatus(item)
   if (isRetryLog(item)) return '0'
   if (isProcessingLog(item)) return '—'
   return formatTokenNumber(value)
@@ -930,6 +947,22 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.queued-tag,
+.queued-token {
+  color: #b45309;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.queued-token {
+  font-size: 0.85rem;
+}
+
+html.dark .queued-tag,
+html.dark .queued-token {
+  color: #fbbf24;
+}
+
 .logs-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));

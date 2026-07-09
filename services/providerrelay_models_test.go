@@ -52,6 +52,7 @@ func newTestRelayService(t *testing.T) (*ProviderService, *ProviderRelayService)
 	}
 	_ = os.Remove(filepath.Join(homeDir, ".code-switch", "claude-code.json"))
 	_ = os.Remove(filepath.Join(homeDir, ".code-switch", "codex.json"))
+	_ = os.Remove(filepath.Join(homeDir, ".code-switch", providerPoolsFile))
 	_ = os.Remove(filepath.Join(homeDir, ".code-switch", codexRelayKeysFile))
 	_ = os.RemoveAll(filepath.Join(homeDir, ".code-switch", "providers"))
 	_ = os.Remove(filepath.Join(homeDir, ".codex", "config.toml"))
@@ -135,12 +136,13 @@ func TestModelsHandler(t *testing.T) {
 
 	// 创建测试用的 provider（使用模拟服务器的 URL）
 	testProvider := Provider{
-		ID:      1,
-		Name:    "TestProvider",
-		APIURL:  upstreamServer.URL,
-		APIKey:  "test-api-key",
-		Enabled: true,
-		Level:   1,
+		ID:             1,
+		Name:           "TestProvider",
+		APIURL:         upstreamServer.URL,
+		APIKey:         "test-api-key",
+		Enabled:        true,
+		Level:          1,
+		MaxConcurrency: defaultProviderMaxConcurrency,
 	}
 
 	// 保存 provider 配置
@@ -156,6 +158,19 @@ func TestModelsHandler(t *testing.T) {
 	relayKey, err := relayService.codexRelayKeys.EnsureDefaultKey()
 	if err != nil {
 		t.Fatalf("创建 relay key 失败: %v", err)
+	}
+	pool := &ProviderPool{
+		Platform: "claude",
+		Name:     "Models Pool",
+		Mode:     ProviderPoolModeManaged,
+		Members:  []ProviderPoolMember{{ProviderID: 1, Enabled: true, Level: 1}},
+	}
+	poolID, err := relayService.poolService.SavePool(pool)
+	if err != nil {
+		t.Fatalf("创建模型列表测试池失败: %v", err)
+	}
+	if err := relayService.codexRelayKeys.SetPoolBinding(relayKey.ID, "claude", poolID); err != nil {
+		t.Fatalf("绑定模型列表测试池失败: %v", err)
 	}
 
 	// 创建测试请求
@@ -238,12 +253,13 @@ func TestCustomModelsHandler(t *testing.T) {
 
 	// 创建测试用的 provider（使用模拟服务器的 URL）
 	testProvider := Provider{
-		ID:      1,
-		Name:    "CustomTestProvider",
-		APIURL:  upstreamServer.URL,
-		APIKey:  "custom-api-key",
-		Enabled: true,
-		Level:   1,
+		ID:             1,
+		Name:           "CustomTestProvider",
+		APIURL:         upstreamServer.URL,
+		APIKey:         "custom-api-key",
+		Enabled:        true,
+		Level:          1,
+		MaxConcurrency: defaultProviderMaxConcurrency,
 	}
 
 	// 保存 provider 配置（使用自定义 CLI 工具的 kind）
@@ -327,12 +343,13 @@ func TestCodexResponsesRequireManagedKey(t *testing.T) {
 	providerService, relayService := newTestRelayService(t)
 	err := providerService.SaveProviders("openai-responses", []Provider{
 		{
-			ID:      1,
-			Name:    "CodexProvider",
-			APIURL:  upstreamServer.URL,
-			APIKey:  "provider-api-key",
-			Enabled: true,
-			Level:   1,
+			ID:             1,
+			Name:           "CodexProvider",
+			APIURL:         upstreamServer.URL,
+			APIKey:         "provider-api-key",
+			Enabled:        true,
+			Level:          1,
+			MaxConcurrency: defaultProviderMaxConcurrency,
 		},
 	})
 	if err != nil {
@@ -468,6 +485,19 @@ func TestModelsHandler_NoProviders(t *testing.T) {
 	relayKey, err := relayService.codexRelayKeys.EnsureDefaultKey()
 	if err != nil {
 		t.Fatalf("创建 relay key 失败: %v", err)
+	}
+	pool := &ProviderPool{
+		Platform: "claude",
+		Name:     "Empty Models Pool",
+		Mode:     ProviderPoolModeManaged,
+		Members:  []ProviderPoolMember{},
+	}
+	poolID, err := relayService.poolService.SavePool(pool)
+	if err != nil {
+		t.Fatalf("创建空模型列表测试池失败: %v", err)
+	}
+	if err := relayService.codexRelayKeys.SetPoolBinding(relayKey.ID, "claude", poolID); err != nil {
+		t.Fatalf("绑定空模型列表测试池失败: %v", err)
 	}
 
 	// 创建测试请求

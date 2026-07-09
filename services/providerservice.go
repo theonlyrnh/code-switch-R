@@ -58,6 +58,9 @@ type Provider struct {
 	// 使用 omitempty 确保零值不序列化，向后兼容
 	Level int `json:"level,omitempty"`
 
+	// 最大并发数 - 缺省/旧配置运行时归一化为 defaultProviderMaxConcurrency
+	MaxConcurrency int `json:"maxConcurrency,omitempty"`
+
 	// ========== 可用性监控字段（新增 v0.5.0） ==========
 
 	// 可用性监控开关 - 在可用性页面配置
@@ -101,6 +104,8 @@ type providerEnvelope struct {
 type ProviderService struct {
 	mu sync.Mutex
 }
+
+const defaultProviderMaxConcurrency = 99999
 
 func NewProviderService() *ProviderService {
 	return &ProviderService{}
@@ -268,6 +273,9 @@ func (ps *ProviderService) saveProvidersToPathLocked(path string, kind string, p
 				validationErrors = append(validationErrors, fmt.Sprintf("[%s] %s", p.Name, errMsg))
 			}
 		}
+		if p.MaxConcurrency <= 0 {
+			validationErrors = append(validationErrors, fmt.Sprintf("[%s] 并发限制必须大于 0", p.Name))
+		}
 
 		// 清除旧可用性字段，确保保存时不再写入
 		p.clearLegacyFields()
@@ -321,6 +329,7 @@ func (ps *ProviderService) LoadProviders(kind string) ([]Provider, error) {
 	// 执行字段迁移：将旧字段值迁移到新字段
 	migrated := false
 	for i := range envelope.Providers {
+		envelope.Providers[i].normalizeRuntimeDefaults()
 		if envelope.Providers[i].migrateFromLegacy() {
 			migrated = true
 		}
@@ -371,6 +380,7 @@ func (ps *ProviderService) loadProvidersFromPath(path string, kind string, persi
 
 	migrated := false
 	for i := range envelope.Providers {
+		envelope.Providers[i].normalizeRuntimeDefaults()
 		if envelope.Providers[i].migrateFromLegacy() {
 			migrated = true
 		}
@@ -415,6 +425,7 @@ func (ps *ProviderService) loadProvidersNoLock(kind string) ([]Provider, error) 
 	// 执行字段迁移（但不保存，避免在持锁时再次加锁）
 	migrated := false
 	for i := range envelope.Providers {
+		envelope.Providers[i].normalizeRuntimeDefaults()
 		if envelope.Providers[i].migrateFromLegacy() {
 			migrated = true
 		}
@@ -570,6 +581,7 @@ func (ps *ProviderService) DuplicateProvider(kind string, sourceID int64) (*Prov
 		ChatEndpoint:         source.ChatEndpoint,         // 复制 Chat 端点配置
 		SupportsCountTokens:  source.SupportsCountTokens,  // 复制 count_tokens 支持开关
 		ConnectivityAuthType: source.ConnectivityAuthType, // 复制认证方式
+		MaxConcurrency:       source.NormalizedMaxConcurrency(),
 		// 可用性监控配置
 		AvailabilityMonitorEnabled: source.AvailabilityMonitorEnabled,
 	}
@@ -654,6 +666,7 @@ func (ps *ProviderService) DuplicateProviderForUser(userID string, kind string, 
 		ChatEndpoint:               source.ChatEndpoint,
 		SupportsCountTokens:        source.SupportsCountTokens,
 		ConnectivityAuthType:       source.ConnectivityAuthType,
+		MaxConcurrency:             source.NormalizedMaxConcurrency(),
 		AvailabilityMonitorEnabled: source.AvailabilityMonitorEnabled,
 	}
 	if source.SupportedModels != nil {
@@ -723,6 +736,22 @@ func (p *Provider) IsModelSupported(modelName string) bool {
 
 	// 场景 C：不支持
 	return false
+}
+
+func (p *Provider) normalizeRuntimeDefaults() {
+	if p == nil {
+		return
+	}
+	if p.MaxConcurrency <= 0 {
+		p.MaxConcurrency = defaultProviderMaxConcurrency
+	}
+}
+
+func (p Provider) NormalizedMaxConcurrency() int {
+	if p.MaxConcurrency <= 0 {
+		return defaultProviderMaxConcurrency
+	}
+	return p.MaxConcurrency
 }
 
 // GetEffectiveModel 获取实际应该使用的模型名

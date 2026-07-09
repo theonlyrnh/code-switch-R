@@ -12,6 +12,7 @@ const (
 	requestLogStatusCompleted  = "completed"
 	requestLogStatusProcessing = "processing"
 	requestLogStatusRetrying   = "retrying"
+	requestLogStatusQueued     = "queued"
 )
 
 var defaultActiveRequestTracker = newActiveRequestTracker()
@@ -22,6 +23,7 @@ const (
 	activeRequestRetryIgnoredFirstText       = "ignored_first_text"
 	activeRequestRetryIgnoredResponseStarted = "ignored_response_started"
 	activeRequestRetryIgnoredUnauthorized    = "ignored_unauthorized"
+	activeRequestRetryIgnoredQueued          = "ignored_queued"
 )
 
 type activeRequestTracker struct {
@@ -83,7 +85,7 @@ func (t *activeRequestTracker) Update(id int64, logEntry *ReqeustLog) {
 	next.cancel = existing.cancel
 	next.retryRequested = existing.retryRequested
 	next.responseStarted = existing.responseStarted
-	if next.retryRequested {
+	if next.retryRequested && next.log.Status != requestLogStatusQueued {
 		next.log.RetryRequested = true
 		next.log.Status = requestLogStatusRetrying
 	}
@@ -132,6 +134,77 @@ func (t *activeRequestTracker) MarkResponseStarted(id int64) {
 	t.requests[id] = existing
 }
 
+func (t *activeRequestTracker) MarkQueued(id int64, queueKey string, position int) {
+	if t == nil || id == 0 {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	existing, ok := t.requests[id]
+	if !ok {
+		return
+	}
+	if existing.log.QueueStartedAt == "" {
+		existing.log.QueueStartedAt = time.Now().In(beijingLocation).Format(timeLayout)
+	}
+	existing.log.Status = requestLogStatusQueued
+	existing.log.Provider = ""
+	existing.log.QueueKey = queueKey
+	existing.log.QueuePosition = position
+	existing.log.ErrorMessage = "排队中"
+	existing.log.RetryRequested = false
+	existing.retryRequested = false
+	existing.responseStarted = false
+	t.requests[id] = existing
+}
+
+func (t *activeRequestTracker) MarkProcessing(id int64, provider string) {
+	if t == nil || id == 0 {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	existing, ok := t.requests[id]
+	if !ok {
+		return
+	}
+	existing.log.Status = requestLogStatusProcessing
+	existing.log.Provider = provider
+	existing.log.QueueKey = ""
+	existing.log.QueuePosition = 0
+	existing.log.QueueStartedAt = ""
+	existing.log.ErrorMessage = ""
+	existing.log.RetryRequested = false
+	existing.retryRequested = false
+	existing.responseStarted = false
+	t.requests[id] = existing
+}
+
+func (t *activeRequestTracker) UpdateQueuePositions(queueKey string, positions map[int64]int) {
+	if t == nil || strings.TrimSpace(queueKey) == "" {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for id, existing := range t.requests {
+		if existing.log.Status != requestLogStatusQueued || existing.log.QueueKey != queueKey {
+			continue
+		}
+		position, ok := positions[id]
+		if !ok {
+			continue
+		}
+		existing.log.QueuePosition = position
+		t.requests[id] = existing
+	}
+}
+
 func (t *activeRequestTracker) IsRetryRequested(id int64) bool {
 	if t == nil || id == 0 {
 		return false
@@ -172,6 +245,10 @@ func (t *activeRequestTracker) Retry(id int64, userID string) ActiveRequestRetry
 			FirstTokenDurationSec: firstTokenSec,
 			FirstTextSec:          firstTextSec,
 		}
+	}
+	if existing.log.Status == requestLogStatusQueued {
+		t.mu.Unlock()
+		return ActiveRequestRetryResult{Status: activeRequestRetryIgnoredQueued}
 	}
 	existing.retryRequested = true
 	existing.log.RetryRequested = true
@@ -228,6 +305,10 @@ func (t *activeRequestTracker) List(platform, provider, userID string) []Reqeust
 			logEntry.DurationSec = 0
 		}
 		if snapshot.retryRequested {
+			if logEntry.Status == requestLogStatusQueued {
+				logs = append(logs, logEntry)
+				continue
+			}
 			logEntry.RetryRequested = true
 			logEntry.Status = requestLogStatusRetrying
 		}
@@ -242,7 +323,9 @@ func snapshotActiveRequest(id int64, logEntry *ReqeustLog, startedAt time.Time) 
 	snapshot.HttpCode = 0
 	snapshot.DurationSec = 0
 	snapshot.CreatedAt = startedAt.In(beijingLocation).Format(timeLayout)
-	snapshot.Status = requestLogStatusProcessing
+	if snapshot.Status == "" {
+		snapshot.Status = requestLogStatusProcessing
+	}
 	return activeRequestSnapshot{
 		startedAt: startedAt,
 		log:       snapshot,

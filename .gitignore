@@ -19,3 +19,5 @@ codeswitch-web
 /*.test
 node_modules/
 package-lock.json
+.plan/
+.deploy/

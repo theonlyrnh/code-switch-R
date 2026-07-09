@@ -24,8 +24,10 @@ export type RequestLog = {
   first_text_sec?: number
   error_message?: string
   created_at: string
-  status?: 'processing' | 'retrying' | 'completed' | string
+  status?: 'queued' | 'processing' | 'retrying' | 'completed' | string
   retry_requested?: boolean
+  queue_position?: number
+  queue_started_at?: string
 }
 
 type RequestLogQuery = {
@@ -48,6 +50,7 @@ export type RetryActiveRequestResult = {
     | 'ignored_first_text'
     | 'ignored_response_started'
     | 'ignored_unauthorized'
+    | 'ignored_queued'
     | string
   first_token_duration_sec?: number
   first_text_sec?: number

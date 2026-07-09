@@ -22,6 +22,8 @@ export type AutomationCard = {
   chatEndpoint?: string
   // 模型列表端点（可选）
   modelsEndpoint?: string
+  // Provider 并发限制；99999 表示实际上不限
+  maxConcurrency?: number
 
   // === 可用性监控配置（新） ===
   // 可用性监控开关：是否启用后台健康检查
@@ -42,6 +44,14 @@ export type AutomationCard = {
   connectivityTestEndpoint?: string
   /** @deprecated 已迁移到可用性配置中的认证方式 */
   connectivityAuthType?: string
+}
+
+export const defaultProviderMaxConcurrency = 99999
+
+export function normalizeProviderMaxConcurrency(value?: number | string): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 1) return defaultProviderMaxConcurrency
+  return Math.floor(parsed)
 }
 
 export const automationCardGroups: Record<'claude' | 'openai-responses' | 'openai-chat', AutomationCard[]> = {
@@ -111,5 +121,6 @@ export function createAutomationCards(data: AutomationCard[] = []): AutomationCa
   return data.map((item) => ({
     ...item,
     officialSite: item.officialSite ?? '',
+    maxConcurrency: normalizeProviderMaxConcurrency(item.maxConcurrency),
   }))
 }

@@ -133,6 +133,38 @@ func TestActiveRequestTrackerRetryCancelsAndMarksLog(t *testing.T) {
 	}
 }
 
+func TestActiveRequestTrackerQueuedStateAndRetryNoop(t *testing.T) {
+	tracker := newActiveRequestTracker()
+	firstID := tracker.Start(&ReqeustLog{UserID: "user-a", Platform: "openai-chat", Provider: "provider-a"}, time.Now())
+	secondID := tracker.Start(&ReqeustLog{UserID: "user-a", Platform: "openai-chat", Provider: "provider-a"}, time.Now())
+	queueKey := providerQueueKey("user-a", "openai-chat", "pool-a")
+
+	tracker.MarkQueued(firstID, queueKey, 1)
+	tracker.MarkQueued(secondID, queueKey, 2)
+
+	if result := tracker.Retry(-firstID, "user-a"); result.Status != activeRequestRetryIgnoredQueued {
+		t.Fatalf("queued retry status = %q, want %q", result.Status, activeRequestRetryIgnoredQueued)
+	}
+
+	tracker.UpdateQueuePositions(queueKey, map[int64]int{secondID: 1})
+	logs := tracker.List("openai-chat", "", "user-a")
+	var foundSecond bool
+	for _, logEntry := range logs {
+		if logEntry.ID == -secondID {
+			foundSecond = true
+			if logEntry.Status != requestLogStatusQueued || logEntry.QueuePosition != 1 {
+				t.Fatalf("second queued log = status %q position %d, want queued #1", logEntry.Status, logEntry.QueuePosition)
+			}
+			if logEntry.Provider != "" || logEntry.ErrorMessage != "排队中" {
+				t.Fatalf("queued log provider/error = %q/%q, want empty/排队中", logEntry.Provider, logEntry.ErrorMessage)
+			}
+		}
+	}
+	if !foundSecond {
+		t.Fatal("second queued log not found")
+	}
+}
+
 func TestActiveRequestTrackerRetryIgnoresFinishedFirstTextAndWrongUser(t *testing.T) {
 	tracker := newActiveRequestTracker()
 

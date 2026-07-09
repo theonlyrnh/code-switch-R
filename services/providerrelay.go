@@ -52,6 +52,7 @@ type ProviderRelayService struct {
 	notificationService *NotificationService
 	appSettings         *AppSettingsService
 	httpClient          *http.Client
+	concurrencyLimiter  *ProviderConcurrencyLimiter
 	server              *http.Server
 	addr                string
 	lastUsed            map[string]*LastUsedProvider // 各平台最后使用的供应商
@@ -92,6 +93,7 @@ func NewProviderRelayService(providerService *ProviderService, poolService *Prov
 		notificationService: notificationService,
 		appSettings:         appSettings,
 		httpClient:          newRelayHTTPClient(),
+		concurrencyLimiter:  NewProviderConcurrencyLimiter(),
 		addr:                addr,
 		lastUsed: map[string]*LastUsedProvider{
 			"claude":           nil,
@@ -926,7 +928,7 @@ func (prs *ProviderRelayService) registerRoutes(router gin.IRouter) {
 
 	// /v1/models 端点（OpenAI-compatible API）
 	// 支持 Claude 和 Codex 平台
-	router.GET("/v1/models", codexAuth, prs.modelsHandler("claude"))
+	router.GET("/v1/models", codexAuth, prs.modelsHandler(""))
 
 	// 自定义 CLI 工具端点（路由格式: /custom/:toolId/v1/messages）
 	// toolId 用于区分不同的 CLI 工具，对应 provider kind 为 "custom:{toolId}"
@@ -942,6 +944,9 @@ func (prs *ProviderRelayService) resolveRelayEndpoint(kind string, provider Prov
 
 func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if prs.concurrencyLimiter == nil {
+			prs.concurrencyLimiter = NewProviderConcurrencyLimiter()
+		}
 		var bodyBytes []byte
 		if c.Request.Body != nil {
 			data, err := io.ReadAll(c.Request.Body)
@@ -964,14 +969,49 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 		query := flattenQuery(c.Request.URL.Query())
 		clientHeaders := cloneHeaders(c.Request.Header)
 
+		var requestLog *ReqeustLog
+		var queueItem *ProviderQueueItem
+		ensureRequestLog := func() *ReqeustLog {
+			if requestLog == nil {
+				requestLog = prs.startActiveRequestLog(c, kind, requestedModel, isStream)
+			}
+			return requestLog
+		}
+		defer func() {
+			if requestLog != nil {
+				prs.finishActiveRequestLog(requestLog)
+			}
+		}()
+
 		totalAttempts := 0
 		for selectionRound := 0; ; selectionRound++ {
 			if selectionRound > 0 {
-				fmt.Printf("[INFO] 用户触发重试，重新读取当前池子和 provider 配置\n")
+				fmt.Printf("[INFO] 重新读取当前池子和 provider 配置\n")
+			}
+			if err := c.Request.Context().Err(); err != nil {
+				if requestLog != nil {
+					requestLog.HttpCode = 499
+					requestLog.ErrorMessage = "client cancelled"
+				}
+				if queueItem != nil {
+					prs.completeQueueWakeAndReserveNext(queueItem.UserID, queueItem.Platform, providerQueueKey(queueItem.UserID, queueItem.Platform, queueItem.PoolID), queueItem.RequestID)
+				}
+				return
 			}
 
 			plan, poolResolved, selectErr := prs.buildProviderAttemptPlan(c, kind, requestedModel)
 			if selectErr != nil {
+				if requestLog != nil {
+					if !poolResolved {
+						requestLog.HttpCode = http.StatusForbidden
+					} else {
+						requestLog.HttpCode = http.StatusNotFound
+					}
+					requestLog.ErrorMessage = selectErr.Error()
+				}
+				if queueItem != nil && prs.concurrencyLimiter != nil {
+					prs.completeQueueWakeAndReserveNext(queueItem.UserID, queueItem.Platform, providerQueueKey(queueItem.UserID, queueItem.Platform, queueItem.PoolID), queueItem.RequestID)
+				}
 				if !poolResolved {
 					fmt.Printf("[ERROR] 解析 %s 的池子失败: %v\n", kind, selectErr)
 					c.JSON(http.StatusForbidden, gin.H{
@@ -990,12 +1030,23 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 			fmt.Printf("[INFO] 池子模式: %s/%s (模式: %s, 成员: %d)\n", kind, pool.Name, pool.Mode, len(pool.Members))
 
 			if len(plan.active) == 0 {
+				if queueItem != nil && prs.concurrencyLimiter != nil {
+					prs.completeQueueWakeAndReserveNext(queueItem.UserID, queueItem.Platform, providerQueueKey(queueItem.UserID, queueItem.Platform, queueItem.PoolID), queueItem.RequestID)
+				}
 				if plan.allBlacklisted {
 					fmt.Printf("[WARN] 池子 %s 的所有 provider 均在拉黑期，无可用供应商\n", pool.Name)
+					if requestLog != nil {
+						requestLog.HttpCode = http.StatusServiceUnavailable
+						requestLog.ErrorMessage = fmt.Sprintf("池子 %s 内所有 provider 均在临时拉黑期", pool.Name)
+					}
 					c.JSON(http.StatusServiceUnavailable, gin.H{
 						"error": fmt.Sprintf("池子 %s 内所有 provider 均在临时拉黑期，请稍后重试或手动解除拉黑", pool.Name),
 					})
 					return
+				}
+				if requestLog != nil {
+					requestLog.HttpCode = http.StatusNotFound
+					requestLog.ErrorMessage = fmt.Sprintf("no providers available in pool %s/%s", kind, pool.Name)
 				}
 				if requestedModel != "" {
 					c.JSON(http.StatusNotFound, gin.H{
@@ -1005,6 +1056,33 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 					c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("no providers available in pool %s/%s", kind, pool.Name)})
 				}
 				return
+			}
+
+			currentLog := ensureRequestLog()
+			queueKey := providerQueueKey(userID, kind, poolID)
+			candidateProviders := providersFromAttemptPlan(plan)
+			candidateProviderIDs := providerIDsFromProviders(candidateProviders)
+			if queueItem != nil && queueItem.FlexibleProvider {
+				prs.refreshFlexibleQueueReservation(userID, kind, currentLog.ActiveRequestID, candidateProviders)
+			}
+			if prs.concurrencyLimiter != nil && prs.concurrencyLimiter.HasQueueAhead(queueKey, currentLog.ActiveRequestID) {
+				if queueItem == nil {
+					queueItem = &ProviderQueueItem{
+						RequestID:   currentLog.ActiveRequestID,
+						UserID:      userID,
+						Platform:    kind,
+						PoolID:      poolID,
+						Model:       requestedModel,
+						Providers:   candidateProviders,
+						ProviderIDs: candidateProviderIDs,
+					}
+				}
+				refreshProviderQueueItem(queueItem, userID, kind, poolID, requestedModel, candidateProviders, candidateProviderIDs)
+				fmt.Printf("[INFO] 池子 %s 已有等待队列，请求排到队尾\n", pool.Name)
+				if !prs.waitForProviderQueueTurn(c, queueItem, currentLog, false, candidateProviders, false) {
+					return
+				}
+				continue
 			}
 
 			fmt.Printf("[INFO] 池子 %s 找到 %d 个可用的 provider（拉黑过滤后）：", pool.Name, len(plan.active))
@@ -1020,11 +1098,23 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 			fmt.Printf("[INFO] 共 %d 个 Level 分组：%v\n", len(plan.levels), plan.levels)
 			fmt.Printf("[INFO] 🔄 降级模式（主 provider 粘性 + 自动拉黑切换）\n")
 
+			reservedProviderID := int64(0)
+			if prs.concurrencyLimiter != nil {
+				if id, ok := prs.concurrencyLimiter.ReservedProviderForRequest(currentLog.ActiveRequestID); ok {
+					reservedProviderID = id
+					if !providerIDInProviders(candidateProviders, reservedProviderID) {
+						fmt.Printf("[INFO] 保留的 provider %d 当前不可用，释放保留并重新选择 provider\n", reservedProviderID)
+						prs.completeQueueWakeAndReserveNext(userID, kind, queueKey, currentLog.ActiveRequestID)
+						reservedProviderID = 0
+					}
+				}
+			}
 			var lastError error
 			var lastProvider string
 			var lastDuration time.Duration
 			stopOnStickyFailure := false
 			retryRequested := false
+			sawConcurrencyFull := false
 
 			for _, level := range plan.levels {
 				providersInLevel := plan.levelGroups[level]
@@ -1032,6 +1122,29 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 				fmt.Printf("[INFO] === 尝试 Level %d（%d 个 provider）===\n", level, len(providersInLevel))
 
 				for i, provider := range providersInLevel {
+					if reservedProviderID != 0 && provider.ID != reservedProviderID {
+						continue
+					}
+					releaseSlot, acquired := prs.concurrencyLimiter.TryAcquireForRequest(userID, kind, provider, currentLog.ActiveRequestID)
+					if !acquired {
+						sawConcurrencyFull = true
+						fmt.Printf("[INFO]   [%d/%d] Provider %s 并发已满（limit=%d），跳过当前 provider\n",
+							i+1, len(providersInLevel), provider.Name, provider.NormalizedMaxConcurrency())
+						continue
+					}
+					prs.completeQueueWakeAfterAcquire(userID, kind, queueKey, currentLog.ActiveRequestID, provider)
+					slotReleased := false
+					releaseProviderSlot := func(wake bool) {
+						if slotReleased {
+							return
+						}
+						slotReleased = true
+						if releaseSlot != nil {
+							for _, queueKey := range releaseSlot(wake) {
+								prs.syncProviderQueuePositions(queueKey)
+							}
+						}
+					}
 					totalAttempts++
 
 					// 获取实际应该使用的模型名
@@ -1046,6 +1159,7 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 						if err != nil {
 							fmt.Printf("[ERROR] 替换模型名失败: %v\n", err)
 							// 映射失败不应阻止尝试其他 provider
+							releaseProviderSlot(true)
 							continue
 						}
 						currentBodyBytes = modifiedBody
@@ -1057,10 +1171,28 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 					// 获取有效的端点（用户配置优先）
 					effectiveEndpoint := prs.resolveRelayEndpoint(kind, provider, endpoint)
 					startTime := time.Now()
-					ok, err := prs.forwardRequest(c, kind, provider, effectiveEndpoint, query, clientHeaders, currentBodyBytes, isStream, effectiveModel)
+					ok, err := prs.forwardRequestWithLog(c, kind, provider, effectiveEndpoint, query, clientHeaders, currentBodyBytes, isStream, effectiveModel, currentLog)
 					duration := time.Since(startTime)
 					if errors.Is(err, errActiveRequestRetryRequested) {
 						fmt.Printf("[INFO] 用户触发重试，放弃当前 provider 并重新选择: Provider=%s | Model=%s\n", provider.Name, effectiveModel)
+						releaseProviderSlot(false)
+						if queueItem == nil {
+							queueItem = &ProviderQueueItem{
+								RequestID:   currentLog.ActiveRequestID,
+								UserID:      userID,
+								Platform:    kind,
+								PoolID:      poolID,
+								Model:       requestedModel,
+								Providers:   candidateProviders,
+								ProviderIDs: candidateProviderIDs,
+							}
+						}
+						retryProviders, retryProviderIDs := prs.currentProviderQueueCandidates(c, kind, requestedModel, candidateProviders)
+						refreshProviderQueueItem(queueItem, userID, kind, poolID, requestedModel, retryProviders, retryProviderIDs)
+						queueItem.FlexibleProvider = true
+						if !prs.waitForProviderQueueTurn(c, queueItem, currentLog, false, nil, true) {
+							return
+						}
 						retryRequested = true
 						break
 					}
@@ -1069,17 +1201,36 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 					if !ok && errors.Is(err, errCodexEmptyStream) {
 						var retryAttempts int
 						var retryDuration time.Duration
-						ok, provider, err, retryAttempts, retryDuration, failedFromEmptyStreamRetry = prs.retryCodexEmptyStreamSameProvider(c, kind, poolID, pool, provider, endpoint, query, clientHeaders, bodyBytes, isStream, requestedModel)
+						ok, provider, err, retryAttempts, retryDuration, failedFromEmptyStreamRetry = prs.retryCodexEmptyStreamSameProvider(c, kind, poolID, pool, provider, endpoint, query, clientHeaders, bodyBytes, isStream, requestedModel, currentLog)
 						totalAttempts += retryAttempts
 						duration += retryDuration
 						if errors.Is(err, errActiveRequestRetryRequested) {
 							fmt.Printf("[INFO] 用户在空流保护重试期间触发重试，放弃当前 provider 并重新选择: Provider=%s\n", provider.Name)
+							releaseProviderSlot(false)
+							if queueItem == nil {
+								queueItem = &ProviderQueueItem{
+									RequestID:   currentLog.ActiveRequestID,
+									UserID:      userID,
+									Platform:    kind,
+									PoolID:      poolID,
+									Model:       requestedModel,
+									Providers:   candidateProviders,
+									ProviderIDs: candidateProviderIDs,
+								}
+							}
+							retryProviders, retryProviderIDs := prs.currentProviderQueueCandidates(c, kind, requestedModel, candidateProviders)
+							refreshProviderQueueItem(queueItem, userID, kind, poolID, requestedModel, retryProviders, retryProviderIDs)
+							queueItem.FlexibleProvider = true
+							if !prs.waitForProviderQueueTurn(c, queueItem, currentLog, false, nil, true) {
+								return
+							}
 							retryRequested = true
 							break
 						}
 					}
 
 					if ok {
+						releaseProviderSlot(true)
 						fmt.Printf("[INFO]   ✓ Level %d 成功: %s | 耗时: %.2fs\n", level, provider.Name, duration.Seconds())
 
 						// 记录最后使用的供应商
@@ -1104,6 +1255,7 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 
 					if errors.Is(err, errClientAbort) {
 						fmt.Printf("[INFO] 客户端中断，停止重试: %s\n", provider.Name)
+						releaseProviderSlot(true)
 						return
 					}
 
@@ -1117,6 +1269,7 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 
 					if !blacklistedAfterFailure {
 						fmt.Printf("[WARN] Provider %s 本次失败但未进入拉黑，保持为主 provider，停止继续切换\n", provider.Name)
+						releaseProviderSlot(true)
 						stopOnStickyFailure = true
 						break
 					}
@@ -1133,6 +1286,7 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 							})
 						}
 					}
+					releaseProviderSlot(true)
 				}
 
 				if retryRequested || stopOnStickyFailure {
@@ -1145,6 +1299,27 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 				continue
 			}
 
+			if sawConcurrencyFull && !stopOnStickyFailure {
+				if queueItem == nil {
+					queueItem = &ProviderQueueItem{
+						RequestID:   currentLog.ActiveRequestID,
+						UserID:      userID,
+						Platform:    kind,
+						PoolID:      poolID,
+						Model:       requestedModel,
+						Providers:   candidateProviders,
+						ProviderIDs: candidateProviderIDs,
+					}
+				}
+				refreshProviderQueueItem(queueItem, userID, kind, poolID, requestedModel, candidateProviders, candidateProviderIDs)
+				requeueFront := currentLog.Status == requestLogStatusQueued && currentLog.QueueKey == queueKey
+				fmt.Printf("[INFO] 池子 %s 剩余候选 provider 并发已满，请求进入队列\n", pool.Name)
+				if !prs.waitForProviderQueueTurn(c, queueItem, currentLog, requeueFront, candidateProviders, false) {
+					return
+				}
+				continue
+			}
+
 			// 所有 provider 都失败，返回 502
 			errorMsg := "未知错误"
 			if lastError != nil {
@@ -1153,6 +1328,10 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 			fmt.Printf("[ERROR] 所有 %d 个 provider 均失败，最后尝试: %s | 错误: %s\n",
 				totalAttempts, lastProvider, errorMsg)
 
+			if requestLog != nil {
+				requestLog.HttpCode = http.StatusBadGateway
+				requestLog.ErrorMessage = errorMsg
+			}
 			c.JSON(http.StatusBadGateway, gin.H{
 				"error":          fmt.Sprintf("所有 %d 个 provider 均失败，最后错误: %s", totalAttempts, errorMsg),
 				"last_provider":  lastProvider,
@@ -1161,6 +1340,256 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 			})
 			return
 		}
+	}
+}
+
+func (prs *ProviderRelayService) startActiveRequestLog(c *gin.Context, kind string, model string, isStream bool) *ReqeustLog {
+	start := time.Now()
+	requestLog := &ReqeustLog{
+		Platform:   kind,
+		Model:      model,
+		UserID:     relayUserIDFromContext(c),
+		IsStream:   isStream,
+		RelayKeyID: relayKeyIDFromContext(c),
+		ClientIP:   clientIPFromRequest(c.Request),
+		startedAt:  start,
+	}
+	activeRequestID := defaultActiveRequestTracker.Start(requestLog, start)
+	requestLog.ActiveRequestID = activeRequestID
+	defaultActiveRequestTracker.Update(activeRequestID, requestLog)
+	return requestLog
+}
+
+func (prs *ProviderRelayService) finishActiveRequestLog(requestLog *ReqeustLog) {
+	if requestLog == nil {
+		return
+	}
+	if requestLog.startedAt.IsZero() {
+		requestLog.startedAt = time.Now()
+	}
+	requestLog.DurationSec = time.Since(requestLog.startedAt).Seconds()
+	defaultActiveRequestTracker.Finish(requestLog.ActiveRequestID)
+
+	if GlobalDBQueueLogs == nil {
+		fmt.Printf("⚠️  写入 request_log 失败: 队列未初始化\n")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := GlobalDBQueueLogs.ExecBatchCtx(ctx, `
+		INSERT INTO request_log (
+			user_id, platform, model, provider, relay_key_id, http_code,
+			input_tokens, output_tokens, cache_create_tokens, cache_read_tokens,
+			reasoning_tokens, is_stream, duration_sec, first_token_duration_sec, client_ip,
+			upstream_header_sec, first_event_sec, first_text_sec, error_message, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		requestLog.UserID,
+		requestLog.Platform,
+		requestLog.Model,
+		requestLog.Provider,
+		requestLog.RelayKeyID,
+		requestLog.HttpCode,
+		requestLog.InputTokens,
+		requestLog.OutputTokens,
+		requestLog.CacheCreateTokens,
+		requestLog.CacheReadTokens,
+		requestLog.ReasoningTokens,
+		boolToInt(requestLog.IsStream),
+		requestLog.DurationSec,
+		requestLog.FirstTokenDurationSec,
+		requestLog.ClientIP,
+		requestLog.UpstreamHeaderSec,
+		requestLog.FirstEventSec,
+		requestLog.FirstTextSec,
+		requestLog.ErrorMessage,
+		time.Now().UTC().Format(timeLayout),
+	)
+
+	if err != nil {
+		fmt.Printf("写入 request_log 失败: %v\n", err)
+	}
+	RecordModelMonitorTraffic(requestLog)
+}
+
+func (r *ReqeustLog) prepareProviderAttempt(c *gin.Context, kind string, provider Provider, model string, isStream bool) {
+	if r == nil {
+		return
+	}
+	r.Platform = kind
+	r.Provider = provider.Name
+	r.Model = model
+	r.UserID = relayUserIDFromContext(c)
+	r.IsStream = isStream
+	r.RelayKeyID = relayKeyIDFromContext(c)
+	r.ClientIP = clientIPFromRequest(c.Request)
+	r.HttpCode = 0
+	r.InputTokens = 0
+	r.OutputTokens = 0
+	r.CacheCreateTokens = 0
+	r.CacheReadTokens = 0
+	r.ReasoningTokens = 0
+	r.UpstreamHeaderSec = 0
+	r.FirstEventSec = 0
+	r.FirstTextSec = 0
+	r.FirstTokenDurationSec = 0
+	r.ErrorMessage = ""
+	r.Status = requestLogStatusProcessing
+	r.RetryRequested = false
+	r.QueuePosition = 0
+	r.QueueStartedAt = ""
+	r.QueueKey = ""
+	r.inputTokensIncludeCacheRead = false
+	defaultActiveRequestTracker.MarkProcessing(r.ActiveRequestID, provider.Name)
+	defaultActiveRequestTracker.Update(r.ActiveRequestID, r)
+}
+
+func (prs *ProviderRelayService) syncProviderQueuePositions(queueKey string) {
+	if prs == nil || prs.concurrencyLimiter == nil || strings.TrimSpace(queueKey) == "" {
+		return
+	}
+	defaultActiveRequestTracker.UpdateQueuePositions(queueKey, prs.concurrencyLimiter.QueuePositions(queueKey))
+}
+
+func (prs *ProviderRelayService) wakeProviderQueuesForPlatform(userID, platform string) {
+	if prs == nil || prs.concurrencyLimiter == nil {
+		return
+	}
+	for _, queueKey := range prs.concurrencyLimiter.WakeQueuesForPlatform(userID, platform) {
+		prs.syncProviderQueuePositions(queueKey)
+	}
+}
+
+func (prs *ProviderRelayService) wakeProviderQueuesForProvider(userID, platform string, provider Provider) {
+	if prs == nil || prs.concurrencyLimiter == nil {
+		return
+	}
+	if provider.ID == 0 {
+		prs.wakeProviderQueuesForPlatform(userID, platform)
+		return
+	}
+	for _, queueKey := range prs.concurrencyLimiter.WakeQueueForProvider(userID, platform, provider) {
+		prs.syncProviderQueuePositions(queueKey)
+	}
+}
+
+func (prs *ProviderRelayService) wakeProviderQueuesForReservedProvider(userID, platform string, providerID int64) {
+	if prs == nil || prs.concurrencyLimiter == nil || providerID == 0 {
+		return
+	}
+	for _, queueKey := range prs.concurrencyLimiter.WakeQueueForReservedProvider(userID, platform, providerID) {
+		prs.syncProviderQueuePositions(queueKey)
+	}
+}
+
+func (prs *ProviderRelayService) wakeProviderQueuesForProviders(userID, platform string, providers []Provider) {
+	if len(providers) == 0 {
+		prs.wakeProviderQueuesForPlatform(userID, platform)
+		return
+	}
+	for _, provider := range providers {
+		prs.wakeProviderQueuesForProvider(userID, platform, provider)
+	}
+}
+
+func (prs *ProviderRelayService) completeQueueWakeAndReserveNext(userID, platform, queueKey string, requestID int64) {
+	if prs == nil || prs.concurrencyLimiter == nil || strings.TrimSpace(queueKey) == "" || requestID == 0 {
+		return
+	}
+	for _, syncedQueueKey := range prs.concurrencyLimiter.CompleteWakeAndReserveNext(queueKey, requestID, userID, platform) {
+		prs.syncProviderQueuePositions(syncedQueueKey)
+	}
+}
+
+func (prs *ProviderRelayService) completeQueueWakeAfterAcquire(userID, platform, queueKey string, requestID int64, provider Provider) {
+	if prs == nil || prs.concurrencyLimiter == nil || strings.TrimSpace(queueKey) == "" || requestID == 0 {
+		return
+	}
+	for _, syncedQueueKey := range prs.concurrencyLimiter.CompleteWakeAfterAcquire(queueKey, requestID, userID, platform, provider) {
+		prs.syncProviderQueuePositions(syncedQueueKey)
+	}
+}
+
+func (prs *ProviderRelayService) refreshFlexibleQueueReservation(userID, platform string, requestID int64, providers []Provider) {
+	if prs == nil || prs.concurrencyLimiter == nil || requestID == 0 || len(providers) == 0 {
+		return
+	}
+	queueKeys, refreshed := prs.concurrencyLimiter.RefreshWokenProvidersForRequestAndReserveNext(requestID, providers, userID, platform)
+	if refreshed {
+		for _, queueKey := range queueKeys {
+			prs.syncProviderQueuePositions(queueKey)
+		}
+	}
+}
+
+func (prs *ProviderRelayService) currentProviderQueueCandidates(c *gin.Context, kind, requestedModel string, fallback []Provider) ([]Provider, []int64) {
+	providers := fallback
+	if currentPlan, _, err := prs.buildProviderAttemptPlan(c, kind, requestedModel); err == nil {
+		if currentProviders := providersFromAttemptPlan(currentPlan); len(currentProviders) > 0 {
+			providers = currentProviders
+		}
+	}
+	return providers, providerIDsFromProviders(providers)
+}
+
+func refreshProviderQueueItem(item *ProviderQueueItem, userID, platform, poolID, model string, providers []Provider, providerIDs []int64) {
+	if item == nil {
+		return
+	}
+	item.UserID = userID
+	item.Platform = platform
+	item.PoolID = poolID
+	item.Model = model
+	item.Providers = providers
+	item.ProviderIDs = providerIDs
+}
+
+func (prs *ProviderRelayService) waitForProviderQueueTurn(c *gin.Context, item *ProviderQueueItem, requestLog *ReqeustLog, front bool, wakeAfterEnqueueProviders []Provider, wakeAfterEnqueueAny bool) bool {
+	if prs == nil || prs.concurrencyLimiter == nil || item == nil || requestLog == nil {
+		return false
+	}
+	queueKey := providerQueueKey(item.UserID, item.Platform, item.PoolID)
+	var position int
+	var enqueueQueueKeys []string
+	if front {
+		position, enqueueQueueKeys = prs.concurrencyLimiter.EnqueueFrontWithHandoff(item)
+	} else {
+		position, enqueueQueueKeys = prs.concurrencyLimiter.EnqueueWithHandoff(item)
+	}
+	defaultActiveRequestTracker.MarkQueued(requestLog.ActiveRequestID, queueKey, position)
+	requestLog.Status = requestLogStatusQueued
+	requestLog.Provider = ""
+	requestLog.QueueKey = queueKey
+	requestLog.QueuePosition = position
+	requestLog.ErrorMessage = "排队中"
+	if requestLog.QueueStartedAt == "" {
+		requestLog.QueueStartedAt = time.Now().In(beijingLocation).Format(timeLayout)
+	}
+	enqueueQueueKeys = appendStringUnique(enqueueQueueKeys, queueKey)
+	for _, syncedQueueKey := range enqueueQueueKeys {
+		prs.syncProviderQueuePositions(syncedQueueKey)
+	}
+	if len(wakeAfterEnqueueProviders) > 0 {
+		prs.wakeProviderQueuesForProviders(item.UserID, item.Platform, wakeAfterEnqueueProviders)
+	} else if wakeAfterEnqueueAny {
+		prs.concurrencyLimiter.WakeQueue(item.UserID, item.Platform, item.PoolID)
+		prs.syncProviderQueuePositions(queueKey)
+	}
+
+	select {
+	case <-item.Ready:
+		return true
+	case <-c.Request.Context().Done():
+		_, queueKeys := prs.concurrencyLimiter.RemoveQueuedAndReserveNext(item.RequestID, item.UserID, item.Platform)
+		queueKeys = appendStringUnique(queueKeys, queueKey)
+		for _, syncedQueueKey := range queueKeys {
+			prs.syncProviderQueuePositions(syncedQueueKey)
+		}
+		requestLog.HttpCode = 499
+		requestLog.ErrorMessage = "client cancelled while queued"
+		return false
 	}
 }
 
@@ -1174,6 +1603,23 @@ func (prs *ProviderRelayService) forwardRequest(
 	bodyBytes []byte,
 	isStream bool,
 	model string,
+) (bool, error) {
+	requestLog := prs.startActiveRequestLog(c, kind, model, isStream)
+	defer prs.finishActiveRequestLog(requestLog)
+	return prs.forwardRequestWithLog(c, kind, provider, endpoint, query, clientHeaders, bodyBytes, isStream, model, requestLog)
+}
+
+func (prs *ProviderRelayService) forwardRequestWithLog(
+	c *gin.Context,
+	kind string,
+	provider Provider,
+	endpoint string,
+	query map[string]string,
+	clientHeaders map[string]string,
+	bodyBytes []byte,
+	isStream bool,
+	model string,
+	requestLog *ReqeustLog,
 ) (bool, error) {
 	targetURL := joinURL(provider.APIURL, endpoint)
 	headers := cloneMap(clientHeaders)
@@ -1229,69 +1675,15 @@ func (prs *ProviderRelayService) forwardRequest(
 	}
 
 	requestCtx, requestCancel := context.WithCancel(c.Request.Context())
-	requestLog := &ReqeustLog{
-		Platform:   kind,
-		Provider:   provider.Name,
-		Model:      model,
-		UserID:     relayUserIDFromContext(c),
-		IsStream:   isStream,
-		RelayKeyID: relayKeyIDFromContext(c),
-		ClientIP:   clientIPFromRequest(c.Request),
+	if requestLog == nil {
+		requestLog = prs.startActiveRequestLog(c, kind, model, isStream)
+		defer prs.finishActiveRequestLog(requestLog)
 	}
-	start := time.Now()
-	requestLog.startedAt = start
-	activeRequestID := defaultActiveRequestTracker.Start(requestLog, start)
-	requestLog.ActiveRequestID = activeRequestID
+	requestLog.prepareProviderAttempt(c, kind, provider, model, isStream)
+	activeRequestID := requestLog.ActiveRequestID
 	defaultActiveRequestTracker.RegisterCancel(activeRequestID, requestCancel)
 	defer func() {
 		requestCancel()
-		requestLog.DurationSec = time.Since(start).Seconds()
-		defaultActiveRequestTracker.Finish(activeRequestID)
-
-		// 【修复】判空保护：避免队列未初始化时 panic
-		if GlobalDBQueueLogs == nil {
-			fmt.Printf("⚠️  写入 request_log 失败: 队列未初始化\n")
-			return
-		}
-
-		// 使用批量队列写入 request_log（高频同构操作，批量提交）
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		err := GlobalDBQueueLogs.ExecBatchCtx(ctx, `
-			INSERT INTO request_log (
-				user_id, platform, model, provider, relay_key_id, http_code,
-				input_tokens, output_tokens, cache_create_tokens, cache_read_tokens,
-				reasoning_tokens, is_stream, duration_sec, first_token_duration_sec, client_ip,
-				upstream_header_sec, first_event_sec, first_text_sec, error_message, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`,
-			requestLog.UserID,
-			requestLog.Platform,
-			requestLog.Model,
-			requestLog.Provider,
-			requestLog.RelayKeyID,
-			requestLog.HttpCode,
-			requestLog.InputTokens,
-			requestLog.OutputTokens,
-			requestLog.CacheCreateTokens,
-			requestLog.CacheReadTokens,
-			requestLog.ReasoningTokens,
-			boolToInt(requestLog.IsStream),
-			requestLog.DurationSec,
-			requestLog.FirstTokenDurationSec,
-			requestLog.ClientIP,
-			requestLog.UpstreamHeaderSec,
-			requestLog.FirstEventSec,
-			requestLog.FirstTextSec,
-			requestLog.ErrorMessage,
-			time.Now().UTC().Format(timeLayout),
-		)
-
-		if err != nil {
-			fmt.Printf("写入 request_log 失败: %v\n", err)
-		}
-		RecordModelMonitorTraffic(requestLog)
 	}()
 	defaultActiveRequestTracker.Update(requestLog.ActiveRequestID, requestLog)
 
@@ -1299,6 +1691,11 @@ func (prs *ProviderRelayService) forwardRequest(
 	if err != nil && defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
 		requestLog.markRetryRequested()
 		return false, errActiveRequestRetryRequested
+	}
+	if err != nil && (requestCtx.Err() != nil || c.Request.Context().Err() != nil || errors.Is(err, context.Canceled)) {
+		requestLog.HttpCode = 499
+		requestLog.ErrorMessage = "client aborted"
+		return false, fmt.Errorf("%w: %v", errClientAbort, err)
 	}
 	requestLog.markUpstreamHeaders()
 	defaultActiveRequestTracker.Update(requestLog.ActiveRequestID, requestLog)
@@ -1400,6 +1797,11 @@ func (prs *ProviderRelayService) forwardRequest(
 				if defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
 					requestLog.markRetryRequested()
 					return false, errActiveRequestRetryRequested
+				}
+				if requestCtx.Err() != nil || c.Request.Context().Err() != nil || errors.Is(readErr, context.Canceled) {
+					requestLog.HttpCode = 499
+					requestLog.ErrorMessage = "client aborted"
+					return false, fmt.Errorf("%w: %v", errClientAbort, readErr)
 				}
 				return false, fmt.Errorf("failed to read response body: %w", readErr)
 			}
@@ -1609,6 +2011,7 @@ func (prs *ProviderRelayService) retryCodexEmptyStreamSameProvider(
 	originalBodyBytes []byte,
 	isStream bool,
 	requestedModel string,
+	requestLog *ReqeustLog,
 ) (bool, Provider, error, int, time.Duration, bool) {
 	provider := initialProvider
 	attempts := 0
@@ -1653,7 +2056,7 @@ func (prs *ProviderRelayService) retryCodexEmptyStreamSameProvider(
 			attempts, provider.Name, effectiveModel)
 
 		startTime := time.Now()
-		requestOK, requestErr := prs.forwardRequest(c, kind, provider, effectiveEndpoint, query, clientHeaders, currentBodyBytes, isStream, effectiveModel)
+		requestOK, requestErr := prs.forwardRequestWithLog(c, kind, provider, effectiveEndpoint, query, clientHeaders, currentBodyBytes, isStream, effectiveModel, requestLog)
 		duration := time.Since(startTime)
 		totalDuration += duration
 
@@ -2468,7 +2871,10 @@ type ReqeustLog struct {
 	CreatedAt                   string  `json:"created_at"`
 	Status                      string  `json:"status,omitempty"`
 	RetryRequested              bool    `json:"retry_requested,omitempty"`
+	QueuePosition               int     `json:"queue_position,omitempty"`
+	QueueStartedAt              string  `json:"queue_started_at,omitempty"`
 	ActiveRequestID             int64   `json:"-"`
+	QueueKey                    string  `json:"-"`
 	startedAt                   time.Time
 	inputTokensIncludeCacheRead bool
 }
@@ -2977,16 +3383,163 @@ func (prs *ProviderRelayService) customCliProxyHandler() gin.HandlerFunc {
 	}
 }
 
-// forwardModelsRequest 共享的 /v1/models 请求转发逻辑
-// 返回 (selectedProvider, error)
-func (prs *ProviderRelayService) forwardModelsRequest(
+type modelsProviderResponse struct {
+	statusCode  int
+	header      http.Header
+	contentType string
+	body        []byte
+}
+
+func modelsPlatformCandidates(c *gin.Context, preferredKind string) []string {
+	seen := make(map[string]bool)
+	candidates := make([]string, 0, 3)
+	add := func(kind string) {
+		kind = providerPlatformForPool(kind)
+		if strings.TrimSpace(kind) == "" || seen[kind] {
+			return
+		}
+		seen[kind] = true
+		candidates = append(candidates, kind)
+	}
+
+	add(preferredKind)
+	bindings := relayKeyPoolBindingsFromContext(c)
+	for _, kind := range []string{"openai-responses", "openai-chat", "claude"} {
+		if _, ok := bindings[kind]; ok {
+			add(kind)
+		}
+	}
+	return candidates
+}
+
+func providersFromAttemptPlan(plan *providerAttemptPlan) []Provider {
+	if plan == nil {
+		return nil
+	}
+	providers := make([]Provider, 0, len(plan.active))
+	seen := make(map[int64]bool, len(plan.active))
+	for _, level := range plan.levels {
+		for _, provider := range plan.levelGroups[level] {
+			if provider.ID == 0 || seen[provider.ID] {
+				continue
+			}
+			seen[provider.ID] = true
+			providers = append(providers, provider)
+		}
+	}
+	return providers
+}
+
+func providerIDsFromProviders(providers []Provider) []int64 {
+	if len(providers) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(providers))
+	seen := make(map[int64]bool, len(providers))
+	for _, provider := range providers {
+		if provider.ID == 0 || seen[provider.ID] {
+			continue
+		}
+		seen[provider.ID] = true
+		ids = append(ids, provider.ID)
+	}
+	return ids
+}
+
+func writeModelsProviderResponse(c *gin.Context, response *modelsProviderResponse) {
+	if response == nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "empty models response"})
+		return
+	}
+	for key, values := range response.header {
+		for _, value := range values {
+			c.Header(key, value)
+		}
+	}
+	c.Data(response.statusCode, response.contentType, response.body)
+}
+
+func (prs *ProviderRelayService) fetchModelsFromProvider(
+	c *gin.Context,
+	provider Provider,
+	logPrefix string,
+) (*modelsProviderResponse, error) {
+	endpoint := strings.TrimSpace(provider.ModelsEndpoint)
+	if endpoint == "" {
+		endpoint = "/v1/models"
+	}
+	targetURL := joinURL(provider.APIURL, endpoint)
+
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, targetURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	headers := cloneHeaders(c.Request.Header)
+	removeInboundAuthHeaders(headers)
+	for key, value := range headers {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		req.Header.Set(key, value)
+	}
+
+	authType := strings.ToLower(strings.TrimSpace(provider.ConnectivityAuthType))
+	switch authType {
+	case "x-api-key":
+		req.Header.Set("x-api-key", provider.APIKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+	case "", "bearer":
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", provider.APIKey))
+	default:
+		headerName := strings.TrimSpace(provider.ConnectivityAuthType)
+		if headerName == "" || strings.EqualFold(headerName, "custom") {
+			headerName = "Authorization"
+		}
+		req.Header.Set(headerName, provider.APIKey)
+	}
+
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "application/json")
+	}
+
+	client := prs.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		if c.Request.Context().Err() != nil || errors.Is(err, context.Canceled) {
+			return nil, fmt.Errorf("%w: %v", errClientAbort, err)
+		}
+		fmt.Printf("[%s] ✗ 请求失败: %s | 错误: %v\n", logPrefix, provider.Name, err)
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if c.Request.Context().Err() != nil || errors.Is(err, context.Canceled) {
+			return nil, fmt.Errorf("%w: %v", errClientAbort, err)
+		}
+		fmt.Printf("[%s] ✗ 读取响应失败: %s | 错误: %v\n", logPrefix, provider.Name, err)
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	return &modelsProviderResponse{
+		statusCode:  resp.StatusCode,
+		header:      resp.Header.Clone(),
+		contentType: resp.Header.Get("Content-Type"),
+		body:        body,
+	}, nil
+}
+
+func (prs *ProviderRelayService) forwardLegacyModelsRequest(
 	c *gin.Context,
 	kind string,
 	logPrefix string,
 ) error {
-	fmt.Printf("[%s] 收到 /v1/models 请求, kind=%s\n", logPrefix, kind)
-
-	// 加载 providers
 	userID := relayUserIDFromContext(c)
 	var providers []Provider
 	var err error
@@ -3000,134 +3553,152 @@ func (prs *ProviderRelayService) forwardModelsRequest(
 		return fmt.Errorf("failed to load providers: %w", err)
 	}
 
-	// 过滤可用的 providers（托管模式启用 + URL + APIKey）
-	requireProviderEnabled := prs.shouldRequireProviderEnabled(kind)
-	directAppliedProviderID, requireDirectAppliedProvider := prs.codexDirectAppliedProviderFilter(kind, requireProviderEnabled)
-	var activeProviders []Provider
+	activeProviders := make([]Provider, 0, len(providers))
 	for _, provider := range providers {
-		if (requireProviderEnabled && !provider.Enabled) || provider.APIURL == "" || provider.APIKey == "" {
+		if !provider.Enabled || provider.APIURL == "" || provider.APIKey == "" {
 			continue
 		}
-		if requireDirectAppliedProvider && directAppliedProviderID == nil {
-			continue
-		}
-		if directAppliedProviderID != nil && provider.ID != *directAppliedProviderID {
-			continue
-		}
-
 		activeProviders = append(activeProviders, provider)
 	}
-
 	if len(activeProviders) == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no providers available"})
 		return fmt.Errorf("no providers available")
 	}
 
-	// 按 Level 分组并排序
-	levelGroups := make(map[int][]Provider)
-	for _, provider := range activeProviders {
-		level := provider.Level
-		if level <= 0 {
-			level = 1
+	sort.SliceStable(activeProviders, func(i, j int) bool {
+		left := activeProviders[i].Level
+		if left <= 0 {
+			left = 1
 		}
-		levelGroups[level] = append(levelGroups[level], provider)
-	}
-
-	levels := make([]int, 0, len(levelGroups))
-	for level := range levelGroups {
-		levels = append(levels, level)
-	}
-	sort.Ints(levels)
-
-	// 尝试第一个可用的 provider（按 Level 升序）
-	var selectedProvider *Provider
-	for _, level := range levels {
-		if len(levelGroups[level]) > 0 {
-			p := levelGroups[level][0]
-			selectedProvider = &p
-			break
+		right := activeProviders[j].Level
+		if right <= 0 {
+			right = 1
 		}
-	}
+		return left < right
+	})
 
-	if selectedProvider == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "no providers available"})
-		return fmt.Errorf("no providers available after filtering")
-	}
-
-	fmt.Printf("[%s] 使用 Provider: %s | URL: %s\n", logPrefix, selectedProvider.Name, selectedProvider.APIURL)
-
-	// 构建目标 URL（拼接 provider 的 APIURL 和 /v1/models）
-	targetURL := joinURL(selectedProvider.APIURL, "/v1/models")
-
-	// 创建 HTTP 请求
-	req, err := http.NewRequest("GET", targetURL, nil)
+	provider := activeProviders[0]
+	fmt.Printf("[%s] 使用 Provider: %s | URL: %s\n", logPrefix, provider.Name, provider.APIURL)
+	response, err := prs.fetchModelsFromProvider(c, provider, logPrefix)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("创建请求失败: %v", err)})
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// 复制客户端请求头
-	for key, values := range c.Request.Header {
-		for _, value := range values {
-			req.Header.Add(key, value)
+		if errors.Is(err, errClientAbort) {
+			return err
 		}
-	}
-
-	// 根据认证方式设置请求头（默认 Bearer，与 v2.2.x 保持一致）
-	authType := strings.ToLower(strings.TrimSpace(selectedProvider.ConnectivityAuthType))
-	switch authType {
-	case "x-api-key":
-		req.Header.Set("x-api-key", selectedProvider.APIKey)
-		req.Header.Set("anthropic-version", "2023-06-01")
-	case "", "bearer":
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", selectedProvider.APIKey))
-	default:
-		headerName := strings.TrimSpace(selectedProvider.ConnectivityAuthType)
-		if headerName == "" || strings.EqualFold(headerName, "custom") {
-			headerName = "Authorization"
-		}
-		req.Header.Set(headerName, selectedProvider.APIKey)
-	}
-
-	// 设置默认 Accept 头
-	if req.Header.Get("Accept") == "" {
-		req.Header.Set("Accept", "application/json")
-	}
-
-	// 发送请求
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Printf("[%s] ✗ 请求失败: %s | 错误: %v\n", logPrefix, selectedProvider.Name, err)
 		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("请求失败: %v", err)})
-		return fmt.Errorf("request failed: %w", err)
+		return err
 	}
-	defer resp.Body.Close()
-
-	// 读取响应
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Printf("[%s] ✗ 读取响应失败: %s | 错误: %v\n", logPrefix, selectedProvider.Name, err)
-		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("读取响应失败: %v", err)})
-		return fmt.Errorf("failed to read response: %w", err)
-	}
-
-	// 复制响应头
-	for key, values := range resp.Header {
-		for _, value := range values {
-			c.Header(key, value)
-		}
-	}
-
-	fmt.Printf("[%s] ✓ 成功: %s | HTTP %d\n", logPrefix, selectedProvider.Name, resp.StatusCode)
-
-	// 返回响应
-	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
+	fmt.Printf("[%s] ✓ 成功: %s | HTTP %d\n", logPrefix, provider.Name, response.statusCode)
+	writeModelsProviderResponse(c, response)
 	return nil
 }
 
+// forwardModelsRequest 共享的 /v1/models 请求转发逻辑。
+// 模型列表请求也必须走 relay key 绑定的 pool，并过滤当前 pool 的拉黑状态。
+func (prs *ProviderRelayService) forwardModelsRequest(
+	c *gin.Context,
+	kind string,
+	logPrefix string,
+) error {
+	fmt.Printf("[%s] 收到 /v1/models 请求, kind=%s\n", logPrefix, kind)
+
+	if strings.HasPrefix(providerPlatformForPool(kind), "custom:") && relayKeyPoolBindingsFromContext(c) == nil {
+		return prs.forwardLegacyModelsRequest(c, kind, logPrefix)
+	}
+
+	candidates := modelsPlatformCandidates(c, kind)
+	if len(candidates) == 0 {
+		c.JSON(http.StatusForbidden, gin.H{"error": "relay key 未绑定任何可用于 /v1/models 的供应商池"})
+		return fmt.Errorf("relay key has no models pool binding")
+	}
+
+	var lastErr error
+	var sawAllBlacklisted bool
+	var sawPoolResolved bool
+
+	for _, candidate := range candidates {
+		plan, poolResolved, selectErr := prs.buildProviderAttemptPlan(c, candidate, "")
+		if selectErr != nil {
+			lastErr = selectErr
+			if poolResolved {
+				sawPoolResolved = true
+			}
+			fmt.Printf("[%s][WARN] 跳过 %s 模型列表池: %v\n", logPrefix, candidate, selectErr)
+			continue
+		}
+		sawPoolResolved = true
+		if len(plan.active) == 0 {
+			if plan.allBlacklisted {
+				sawAllBlacklisted = true
+				lastErr = fmt.Errorf("池子 %s 内所有 provider 均在临时拉黑期", plan.pool.Name)
+				fmt.Printf("[%s][WARN] %s\n", logPrefix, lastErr)
+				continue
+			}
+			lastErr = fmt.Errorf("no providers available in pool %s/%s", candidate, plan.pool.Name)
+			fmt.Printf("[%s][WARN] %s\n", logPrefix, lastErr)
+			continue
+		}
+
+		providers := providersFromAttemptPlan(plan)
+		for i, provider := range providers {
+			fmt.Printf("[%s] 使用 Provider: %s | Platform: %s | Pool: %s | URL: %s\n",
+				logPrefix, provider.Name, candidate, plan.pool.Name, provider.APIURL)
+
+			response, fetchErr := prs.fetchModelsFromProvider(c, provider, logPrefix)
+			if fetchErr == nil && response != nil && response.statusCode >= http.StatusOK && response.statusCode < http.StatusMultipleChoices {
+				fmt.Printf("[%s] ✓ 成功: %s | HTTP %d\n", logPrefix, provider.Name, response.statusCode)
+				prs.recordProviderSuccessForUser(plan.userID, candidate, plan.poolID, provider)
+				writeModelsProviderResponse(c, response)
+				return nil
+			}
+
+			if fetchErr == nil && response != nil {
+				bodySummary := summarizeBodyForError(string(response.body), 1000)
+				fetchErr = fmt.Errorf("upstream status %d: %s", response.statusCode, bodySummary)
+			}
+			if fetchErr == nil {
+				fetchErr = fmt.Errorf("empty models response")
+			}
+			if errors.Is(fetchErr, errClientAbort) {
+				return fetchErr
+			}
+			lastErr = fetchErr
+			fmt.Printf("[%s][WARN] Provider %s 模型列表失败: %v\n", logPrefix, provider.Name, fetchErr)
+
+			blacklistedAfterFailure := prs.recordProviderFailureForUser(plan.userID, candidate, plan.poolID, plan.pool, provider, fetchErr.Error())
+			if !blacklistedAfterFailure {
+				if response != nil {
+					writeModelsProviderResponse(c, response)
+					return fetchErr
+				}
+				c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("请求失败: %v", fetchErr)})
+				return fetchErr
+			}
+
+			if prs.notificationService != nil && i+1 < len(providers) {
+				prs.notificationService.NotifyProviderSwitch(SwitchNotification{
+					FromProvider: provider.Name,
+					ToProvider:   providers[i+1].Name,
+					Reason:       fetchErr.Error(),
+					Platform:     candidate,
+				})
+			}
+		}
+	}
+
+	if sawAllBlacklisted {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "所有可用于 /v1/models 的 provider 均在临时拉黑期"})
+		return lastErr
+	}
+	if sawPoolResolved {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("no providers available for /v1/models: %v", lastErr)})
+		return lastErr
+	}
+	c.JSON(http.StatusForbidden, gin.H{"error": fmt.Sprintf("relay key 无权访问 /v1/models 的供应商池: %v", lastErr)})
+	return lastErr
+}
+
 // modelsHandler 处理 /v1/models 请求（OpenAI-compatible API）
-// 将请求转发到第一个可用的 provider 并注入 API Key
+// 将请求转发到 relay key 绑定池子中当前可用的 provider，并注入 API Key。
 func (prs *ProviderRelayService) modelsHandler(kind string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		_ = prs.forwardModelsRequest(c, kind, "Models")

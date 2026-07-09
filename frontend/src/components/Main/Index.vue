@@ -435,6 +435,23 @@
                   />
                 </label>
 
+                <label class="form-field">
+                  <span class="label-row">
+                    {{ t('components.main.form.labels.maxConcurrency') }}
+                    <span v-if="modalState.errors.maxConcurrency" class="field-error">
+                      {{ modalState.errors.maxConcurrency }}
+                    </span>
+                  </span>
+                  <BaseInput
+                    v-model="modalState.form.maxConcurrency"
+                    type="number"
+                    min="1"
+                    step="1"
+                    :placeholder="t('components.main.form.placeholders.maxConcurrency')"
+                    :class="{ 'has-error': !!modalState.errors.maxConcurrency, 'shake-error': shakeFields.maxConcurrency }"
+                  />
+                </label>
+
                 <!-- 协议端点（按平台互斥显示）-->
                 <label v-if="showMessagesEndpointField" class="form-field">
                   <div class="label-with-hint">{{ t('components.main.form.labels.messagesEndpoint') }} <HelpHint :text="t('components.main.form.hints.messagesEndpoint')" /></div>
@@ -808,7 +825,13 @@ import { computed, reactive, ref, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Listbox, ListboxButton, ListboxOptions, ListboxOption } from '@headlessui/vue'
 import { Browser, Call, Events } from '@wailsio/runtime'
-import { automationCardGroups, createAutomationCards, type AutomationCard } from '../../data/cards'
+import {
+  automationCardGroups,
+  createAutomationCards,
+  defaultProviderMaxConcurrency,
+  normalizeProviderMaxConcurrency,
+  type AutomationCard,
+} from '../../data/cards'
 import BaseButton from '../common/BaseButton.vue'
 import BaseModal from '../common/BaseModal.vue'
 import BaseInput from '../common/BaseInput.vue'
@@ -1257,6 +1280,7 @@ const loadInitialProviders = (tabId: Exclude<ProviderTab, 'others'>): Automation
 const serializeProviders = (providers: AutomationCard[]) =>
   providers.map((provider) => ({
     ...provider,
+    maxConcurrency: normalizeProviderMaxConcurrency(provider.maxConcurrency),
     // 确保可用性配置正确序列化
     availabilityMonitorEnabled: !!provider.availabilityMonitorEnabled,
     availabilityConfig: provider.availabilityConfig
@@ -1871,6 +1895,7 @@ const providerModelDropdownOpen = ref(false)
 const shakeFields = reactive({
   apiUrl: false,
   apiKey: false,
+  maxConcurrency: false,
   protocolEndpoint: false,
   modelsEndpoint: false,
   testModel: false,
@@ -1918,6 +1943,7 @@ const triggerFieldShake = (field: keyof typeof shakeFields) => {
 const clearEndpointTestErrors = () => {
   modalState.errors.apiUrl = ''
   modalState.errors.apiKey = ''
+  modalState.errors.maxConcurrency = ''
   modalState.errors.protocolEndpoint = ''
   modalState.errors.modelsEndpoint = ''
   modalState.errors.testModel = ''
@@ -2179,6 +2205,7 @@ type VendorForm = {
   responsesEndpoint?: string
   chatEndpoint?: string
   modelsEndpoint?: string
+  maxConcurrency: string
   // === 可用性监控配置（新） ===
   availabilityMonitorEnabled?: boolean
   availabilityConfig?: {
@@ -2227,6 +2254,7 @@ const defaultFormValues = (platform?: string): VendorForm => ({
   responsesEndpoint: platform === 'openai-responses' ? getDefaultProtocolEndpoint('openai-responses') : '',
   chatEndpoint: platform === 'openai-chat' ? getDefaultProtocolEndpoint('openai-chat') : '',
   modelsEndpoint: '',
+  maxConcurrency: String(defaultProviderMaxConcurrency),
   // 可用性监控配置（新）
   availabilityMonitorEnabled: false,
   availabilityConfig: {
@@ -2282,6 +2310,12 @@ const normalizeLevel = (level: number | string | undefined): number => {
   return Math.floor(num)  // 确保返回整数
 }
 
+const parseMaxConcurrencyInput = (value: string): number | null => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1) return null
+  return parsed
+}
+
 // 按名称排序
 const sortProvidersByLevel = (list: AutomationCard[]) => {
   if (!Array.isArray(list)) return
@@ -2296,6 +2330,7 @@ const modalState = reactive({
   errors: {
     apiUrl: '',
     apiKey: '',
+    maxConcurrency: '',
     protocolEndpoint: '',
     modelsEndpoint: '',
     testModel: '',
@@ -2369,6 +2404,7 @@ const openEditModal = (card: AutomationCard) => {
     responsesEndpoint: legacyResponsesEndpoint(card),
     chatEndpoint: legacyChatEndpoint(card),
     modelsEndpoint: card.modelsEndpoint || '',
+    maxConcurrency: String(normalizeProviderMaxConcurrency(card.maxConcurrency)),
     // 可用性监控配置（新）- 兼容从旧字段迁移
     availabilityMonitorEnabled:
       card.availabilityMonitorEnabled ?? card.connectivityCheck ?? false,
@@ -2441,11 +2477,18 @@ const submitModal = async (): Promise<boolean> => {
   const apiKey = modalState.form.apiKey.trim()
   const officialSite = modalState.form.officialSite.trim()
   modalState.errors.apiUrl = ''
+  modalState.errors.maxConcurrency = ''
   try {
     const parsed = new URL(apiUrl)
     if (!/^https?:/.test(parsed.protocol)) throw new Error('protocol')
   } catch {
     modalState.errors.apiUrl = t('components.main.form.errors.invalidUrl')
+    return false
+  }
+  const maxConcurrency = parseMaxConcurrencyInput(modalState.form.maxConcurrency)
+  if (maxConcurrency === null) {
+    modalState.errors.maxConcurrency = t('components.main.form.errors.maxConcurrency')
+    triggerFieldShake('maxConcurrency')
     return false
   }
 
@@ -2464,6 +2507,7 @@ const submitModal = async (): Promise<boolean> => {
       responsesEndpoint: protocolEndpoints.responsesEndpoint,
       chatEndpoint: protocolEndpoints.chatEndpoint,
       modelsEndpoint: modalState.form.modelsEndpoint || '',
+      maxConcurrency,
       // 可用性监控配置（新）
       availabilityMonitorEnabled: !!modalState.form.availabilityMonitorEnabled,
       availabilityConfig: {
@@ -2501,6 +2545,7 @@ const submitModal = async (): Promise<boolean> => {
       responsesEndpoint: protocolEndpoints.responsesEndpoint,
       chatEndpoint: protocolEndpoints.chatEndpoint,
       modelsEndpoint: modalState.form.modelsEndpoint || '',
+      maxConcurrency,
       // 可用性监控配置（新）
       availabilityMonitorEnabled: !!modalState.form.availabilityMonitorEnabled,
       availabilityConfig: {
@@ -2608,6 +2653,7 @@ const handleDuplicate = (card: AutomationCard) => {
     responsesEndpoint: legacyResponsesEndpoint(card),
     chatEndpoint: legacyChatEndpoint(card),
     modelsEndpoint: card.modelsEndpoint || '',
+    maxConcurrency: String(normalizeProviderMaxConcurrency(card.maxConcurrency)),
     availabilityMonitorEnabled:
       card.availabilityMonitorEnabled ?? card.connectivityCheck ?? false,
     availabilityConfig: {

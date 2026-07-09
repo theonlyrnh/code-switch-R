@@ -227,13 +227,14 @@ func (s *DeepLinkService) buildProviderFromRequest(request *DeepLinkImportReques
 	id := time.Now().UnixNano()
 
 	provider := &Provider{
-		ID:      id,
-		Name:    request.Name,
-		APIURL:  request.Endpoint,
-		APIKey:  request.APIKey,
-		Site:    request.Homepage,
-		Enabled: false, // 默认禁用，用户需手动启用
-		Level:   1,     // 默认最高优先级
+		ID:             id,
+		Name:           request.Name,
+		APIURL:         request.Endpoint,
+		APIKey:         request.APIKey,
+		Site:           request.Homepage,
+		Enabled:        false, // 默认禁用，用户需手动启用
+		Level:          1,     // 默认最高优先级
+		MaxConcurrency: defaultProviderMaxConcurrency,
 	}
 
 	// 如果提供了模型信息，可以设置到 SupportedModels

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -215,6 +216,65 @@ func TestProviderGetEffectiveEndpointFallsBackToLegacyEndpoint(t *testing.T) {
 	}
 	if got := provider.GetEffectiveEndpoint("/chat/completions"); got != "/v1/responses" {
 		t.Fatalf("chat fallback = %q, want /v1/responses", got)
+	}
+}
+
+func TestProviderServiceMaxConcurrencyReadWriteCompatibility(t *testing.T) {
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+	configDir := filepath.Join(testHome, ".code-switch")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+
+	legacyPayload := []byte(`{"providers":[{"id":1,"name":"legacy","apiUrl":"https://example.com","apiKey":"key","enabled":true}]}`)
+	if err := os.WriteFile(filepath.Join(configDir, "claude-code.json"), legacyPayload, 0o600); err != nil {
+		t.Fatalf("write legacy config: %v", err)
+	}
+
+	service := NewProviderService()
+	providers, err := service.LoadProviders("claude")
+	if err != nil {
+		t.Fatalf("LoadProviders: %v", err)
+	}
+	if len(providers) != 1 {
+		t.Fatalf("providers count = %d, want 1", len(providers))
+	}
+	if providers[0].MaxConcurrency != defaultProviderMaxConcurrency {
+		t.Fatalf("legacy maxConcurrency = %d, want %d", providers[0].MaxConcurrency, defaultProviderMaxConcurrency)
+	}
+
+	providers[0].MaxConcurrency = 7
+	if err := service.SaveProviders("claude", providers); err != nil {
+		t.Fatalf("SaveProviders: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(configDir, "claude-code.json"))
+	if err != nil {
+		t.Fatalf("read saved config: %v", err)
+	}
+	if !strings.Contains(string(raw), `"maxConcurrency": 7`) {
+		t.Fatalf("saved config should include maxConcurrency 7, got %s", raw)
+	}
+}
+
+func TestProviderServiceRejectsInvalidMaxConcurrencyOnSave(t *testing.T) {
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+
+	service := NewProviderService()
+	err := service.SaveProviders("claude", []Provider{{
+		ID:             1,
+		Name:           "bad-limit",
+		APIURL:         "https://example.com",
+		APIKey:         "key",
+		Enabled:        true,
+		MaxConcurrency: 0,
+	}})
+	if err == nil {
+		t.Fatal("SaveProviders should reject maxConcurrency <= 0")
+	}
+	if !strings.Contains(err.Error(), "并发限制必须大于 0") {
+		t.Fatalf("error = %v, want max concurrency validation", err)
 	}
 }
 
@@ -882,11 +942,12 @@ func TestSaveProvidersForUserEnsuresUserDefaultPool(t *testing.T) {
 	providerService := NewProviderService()
 	providers := []Provider{
 		{
-			ID:      101,
-			Name:    "user provider",
-			APIURL:  "https://provider.example.com",
-			APIKey:  "sk-test",
-			Enabled: true,
+			ID:             101,
+			Name:           "user provider",
+			APIURL:         "https://provider.example.com",
+			APIKey:         "sk-test",
+			Enabled:        true,
+			MaxConcurrency: defaultProviderMaxConcurrency,
 		},
 	}
 

@@ -1,18 +1,106 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
+
+func setupProviderPoolHTTPTest(t *testing.T, platform string, providers []Provider, pool *ProviderPool) (*ProviderRelayService, *gin.Engine, string, string) {
+	t.Helper()
+
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+	configDir := filepath.Join(testHome, ".code-switch")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	providerPath, err := providerFilePath(platform)
+	if err != nil {
+		t.Fatalf("provider path: %v", err)
+	}
+	payload, _ := json.Marshal(providerEnvelope{Providers: providers})
+	if err := os.WriteFile(providerPath, payload, 0o600); err != nil {
+		t.Fatalf("write providers: %v", err)
+	}
+
+	providerService := NewProviderService()
+	poolService := NewProviderPoolService()
+	keyService := NewCodexRelayKeyService()
+	poolService.SetBindingChecker(keyService)
+	appSettings := NewAppSettingsService(nil)
+	notificationService := NewNotificationService(appSettings)
+	relay := NewProviderRelayService(
+		providerService, poolService, keyService,
+		notificationService, appSettings,
+		DefaultRelayBindAddr,
+	)
+
+	if pool.Platform == "" {
+		pool.Platform = platform
+	}
+	poolID, err := poolService.SavePool(pool)
+	if err != nil {
+		t.Fatalf("save pool: %v", err)
+	}
+
+	key, err := keyService.CreateKey("pool-test-key")
+	if err != nil {
+		t.Fatalf("create relay key: %v", err)
+	}
+	if err := keyService.SetPoolBinding(key.ID, platform, poolID); err != nil {
+		t.Fatalf("bind relay key: %v", err)
+	}
+	keySecret, err := keyService.GetKeySecret(key.ID)
+	if err != nil {
+		t.Fatalf("key secret: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	relay.registerRoutes(router)
+	return relay, router, keySecret, poolID
+}
+
+func serveChatRequest(router *gin.Engine, keySecret string, body string) (*httptest.ResponseRecorder, <-chan struct{}) {
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+keySecret)
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(w, req)
+		close(done)
+	}()
+	return w, done
+}
+
+func waitForActiveLog(t *testing.T, platform string, predicate func(ReqeustLog) bool) ReqeustLog {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		logs := defaultActiveRequestTracker.List(platform, "", "")
+		for _, logEntry := range logs {
+			if predicate(logEntry) {
+				return logEntry
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("active log matching predicate was not found")
+	return ReqeustLog{}
+}
 
 // ========== HTTP 层 fail-closed 集成测试 ==========
 
@@ -394,6 +482,1045 @@ func TestHTTPStickyPrimaryProviderUntilBlacklisted(t *testing.T) {
 	}
 	if !strings.Contains(w3.Body.String(), `"provider":"provider-b"`) {
 		t.Fatalf("third request should route directly to provider-b, got: %s", w3.Body.String())
+	}
+}
+
+func TestHTTPModelsSkipsBlacklistedProvider(t *testing.T) {
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+
+	configDir := filepath.Join(testHome, ".code-switch")
+	_ = os.MkdirAll(configDir, 0o700)
+
+	providerAHits := 0
+	providerBHits := 0
+
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerAHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"provider-a forbidden"}`))
+	}))
+	defer upstreamA.Close()
+
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerBHits++
+		if r.URL.Path != "/v1/models" {
+			t.Errorf("expected /v1/models, got %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"model-b"}]}`))
+	}))
+	defer upstreamB.Close()
+
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstreamA.URL, APIKey: "key-a"},
+		{ID: 2, Name: "provider-b", Enabled: true, APIURL: upstreamB.URL, APIKey: "key-b"},
+	}
+	payload, _ := json.Marshal(providerEnvelope{Providers: providers})
+	_ = os.WriteFile(filepath.Join(configDir, "openai-chat.json"), payload, 0o600)
+
+	providerService := NewProviderService()
+	poolService := NewProviderPoolService()
+	keyService := NewCodexRelayKeyService()
+	poolService.SetBindingChecker(keyService)
+	appSettings := NewAppSettingsService(nil)
+	notificationService := NewNotificationService(appSettings)
+
+	relay := NewProviderRelayService(
+		providerService, poolService, keyService,
+		notificationService, appSettings,
+		DefaultRelayBindAddr,
+	)
+
+	pool := &ProviderPool{
+		Platform:                     "openai-chat",
+		Name:                         "Models Pool",
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       1,
+		AutoBlacklistDurationMinutes: 10,
+		Members: []ProviderPoolMember{
+			{ProviderID: 1, Enabled: true, Level: 1},
+			{ProviderID: 2, Enabled: true, Level: 2},
+		},
+	}
+	poolID, _ := poolService.SavePool(pool)
+
+	key, _ := keyService.CreateKey("models-key")
+	_ = keyService.SetPoolBinding(key.ID, "openai-chat", poolID)
+
+	if !relay.recordProviderFailure("openai-chat", poolID, pool, providers[0], "previous upstream 403") {
+		t.Fatal("expected provider-a to be blacklisted")
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	relay.registerRoutes(router)
+
+	keySecret, _ := keyService.GetKeySecret(key.ID)
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+keySecret)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("models request expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if providerAHits != 0 {
+		t.Fatalf("blacklisted provider-a should not be hit, got %d hits", providerAHits)
+	}
+	if providerBHits != 1 {
+		t.Fatalf("provider-b hits = %d, want 1", providerBHits)
+	}
+	if !strings.Contains(w.Body.String(), "model-b") {
+		t.Fatalf("models response should come from provider-b, got: %s", w.Body.String())
+	}
+}
+
+func TestHTTPProviderConcurrencyManagedFallbackQueueAndCancel(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	aRelease := make(chan struct{})
+	bRelease := make(chan struct{})
+	var providerAHits int32
+	var providerBHits int32
+	var providerCHits int32
+
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerAHits, 1)
+		<-aRelease
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"provider":"provider-a","choices":[{"message":{"content":"from-a"}}]}`))
+	}))
+	defer upstreamA.Close()
+
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerBHits, 1)
+		<-bRelease
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"provider":"provider-b","choices":[{"message":{"content":"from-b"}}]}`))
+	}))
+	defer upstreamB.Close()
+
+	upstreamC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerCHits, 1)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstreamC.Close()
+
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstreamA.URL, APIKey: "key-a", MaxConcurrency: 1},
+		{ID: 2, Name: "provider-b", Enabled: true, APIURL: upstreamB.URL, APIKey: "key-b", MaxConcurrency: 1},
+		{ID: 3, Name: "provider-c", Enabled: true, APIURL: upstreamC.URL, APIKey: "key-c", MaxConcurrency: 1},
+	}
+	pool := &ProviderPool{
+		Platform: "openai-chat",
+		Name:     "Concurrency Pool",
+		Mode:     ProviderPoolModeManaged,
+		Members: []ProviderPoolMember{
+			{ProviderID: 1, Enabled: true, Level: 1},
+			{ProviderID: 2, Enabled: true, Level: 2},
+			{ProviderID: 3, Enabled: false, Level: 3},
+		},
+	}
+	relay, router, keySecret, poolID := setupProviderPoolHTTPTest(t, "openai-chat", providers, pool)
+
+	w1, done1 := serveChatRequest(router, keySecret, `{"model":"gpt-4","messages":[{"role":"user","content":"first"}]}`)
+	for atomic.LoadInt32(&providerAHits) < 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	w2, done2 := serveChatRequest(router, keySecret, `{"model":"gpt-4","messages":[{"role":"user","content":"second"}]}`)
+	for atomic.LoadInt32(&providerBHits) < 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	w3, done3 := serveChatRequest(router, keySecret, `{"model":"gpt-4","messages":[{"role":"user","content":"third"}]}`)
+	queued := waitForActiveLog(t, "openai-chat", func(logEntry ReqeustLog) bool {
+		return logEntry.Status == requestLogStatusQueued && logEntry.QueuePosition == 1
+	})
+	if queued.ErrorMessage != "排队中" {
+		t.Fatalf("queued error message = %q, want 排队中", queued.ErrorMessage)
+	}
+	if result := defaultActiveRequestTracker.Retry(queued.ID, ""); result.Status != activeRequestRetryIgnoredQueued {
+		t.Fatalf("queued retry status = %q, want %q", result.Status, activeRequestRetryIgnoredQueued)
+	}
+
+	ctx, cancelQueued := context.WithCancel(context.Background())
+	req4 := httptest.NewRequest(http.MethodPost, "/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"cancel"}]}`)).WithContext(ctx)
+	req4.Header.Set("Content-Type", "application/json")
+	req4.Header.Set("Authorization", "Bearer "+keySecret)
+	w4 := httptest.NewRecorder()
+	done4 := make(chan struct{})
+	go func() {
+		router.ServeHTTP(w4, req4)
+		close(done4)
+	}()
+	waitForActiveLog(t, "openai-chat", func(logEntry ReqeustLog) bool {
+		return logEntry.Status == requestLogStatusQueued && logEntry.QueuePosition == 2
+	})
+	cancelQueued()
+	select {
+	case <-done4:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled queued request did not return")
+	}
+	waitForActiveLog(t, "openai-chat", func(logEntry ReqeustLog) bool {
+		return logEntry.ID == queued.ID && logEntry.Status == requestLogStatusQueued && logEntry.QueuePosition == 1
+	})
+
+	if statuses := relay.ListProviderBlacklistStatus("openai-chat", poolID); len(statuses) != 0 {
+		t.Fatalf("concurrency full should not blacklist providers, got %+v", statuses)
+	}
+
+	close(aRelease)
+	select {
+	case <-done3:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued request did not finish after provider-a released")
+	}
+	close(bRelease)
+	select {
+	case <-done1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not finish")
+	}
+	select {
+	case <-done2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second request did not finish")
+	}
+
+	if w1.Code != http.StatusOK || w2.Code != http.StatusOK || w3.Code != http.StatusOK {
+		t.Fatalf("codes = first %d second %d third %d, want all 200; third body=%s", w1.Code, w2.Code, w3.Code, w3.Body.String())
+	}
+	if atomic.LoadInt32(&providerAHits) != 2 {
+		t.Fatalf("provider-a hits = %d, want 2", providerAHits)
+	}
+	if atomic.LoadInt32(&providerBHits) != 1 {
+		t.Fatalf("provider-b hits = %d, want 1", providerBHits)
+	}
+	if atomic.LoadInt32(&providerCHits) != 0 {
+		t.Fatalf("disabled provider-c should not be hit, got %d hits", providerCHits)
+	}
+}
+
+func TestHTTPProviderConcurrencyQueuesAfterFailedProviderWhenRemainingProviderFull(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+	configDir := filepath.Join(testHome, ".code-switch")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+
+	var providerAHits int32
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerAHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"provider-a forbidden"}`))
+	}))
+	defer upstreamA.Close()
+
+	bRelease := make(chan struct{})
+	var providerBHits int32
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit := atomic.AddInt32(&providerBHits, 1)
+		if hit == 1 {
+			<-bRelease
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"provider":"provider-b","choices":[{"message":{"content":"from-b"}}]}`))
+	}))
+	defer upstreamB.Close()
+
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstreamA.URL, APIKey: "key-a", MaxConcurrency: 1},
+		{ID: 2, Name: "provider-b", Enabled: true, APIURL: upstreamB.URL, APIKey: "key-b", MaxConcurrency: 1},
+	}
+	payload, _ := json.Marshal(providerEnvelope{Providers: providers})
+	if err := os.WriteFile(filepath.Join(configDir, "openai-chat.json"), payload, 0o600); err != nil {
+		t.Fatalf("write providers: %v", err)
+	}
+
+	providerService := NewProviderService()
+	poolService := NewProviderPoolService()
+	keyService := NewCodexRelayKeyService()
+	poolService.SetBindingChecker(keyService)
+	appSettings := NewAppSettingsService(nil)
+	relay := NewProviderRelayService(providerService, poolService, keyService, NewNotificationService(appSettings), appSettings, DefaultRelayBindAddr)
+
+	blockerPoolID, err := poolService.SavePool(&ProviderPool{
+		Platform: "openai-chat",
+		Name:     "Blocker Pool",
+		Mode:     ProviderPoolModeManaged,
+		Members:  []ProviderPoolMember{{ProviderID: 2, Enabled: true, Level: 1}},
+	})
+	if err != nil {
+		t.Fatalf("save blocker pool: %v", err)
+	}
+	targetPool := &ProviderPool{
+		Platform:                     "openai-chat",
+		Name:                         "Fallback Queue Pool",
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       1,
+		AutoBlacklistDurationMinutes: 10,
+		Members: []ProviderPoolMember{
+			{ProviderID: 1, Enabled: true, Level: 1},
+			{ProviderID: 2, Enabled: true, Level: 2},
+		},
+	}
+	targetPoolID, err := poolService.SavePool(targetPool)
+	if err != nil {
+		t.Fatalf("save target pool: %v", err)
+	}
+
+	blockerKey, err := keyService.CreateKey("blocker-key")
+	if err != nil {
+		t.Fatalf("create blocker key: %v", err)
+	}
+	if err := keyService.SetPoolBinding(blockerKey.ID, "openai-chat", blockerPoolID); err != nil {
+		t.Fatalf("bind blocker key: %v", err)
+	}
+	targetKey, err := keyService.CreateKey("target-key")
+	if err != nil {
+		t.Fatalf("create target key: %v", err)
+	}
+	if err := keyService.SetPoolBinding(targetKey.ID, "openai-chat", targetPoolID); err != nil {
+		t.Fatalf("bind target key: %v", err)
+	}
+	blockerSecret, _ := keyService.GetKeySecret(blockerKey.ID)
+	targetSecret, _ := keyService.GetKeySecret(targetKey.ID)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	relay.registerRoutes(router)
+
+	wBlocker, doneBlocker := serveChatRequest(router, blockerSecret, `{"model":"gpt-4","messages":[{"role":"user","content":"block b"}]}`)
+	for atomic.LoadInt32(&providerBHits) < 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	wTarget, doneTarget := serveChatRequest(router, targetSecret, `{"model":"gpt-4","messages":[{"role":"user","content":"queue after a fails"}]}`)
+	waitForActiveLog(t, "openai-chat", func(logEntry ReqeustLog) bool {
+		return logEntry.Status == requestLogStatusQueued && logEntry.QueuePosition == 1
+	})
+
+	if atomic.LoadInt32(&providerAHits) != 1 {
+		t.Fatalf("provider-a hits = %d, want 1", providerAHits)
+	}
+	if atomic.LoadInt32(&providerBHits) != 1 {
+		t.Fatalf("target request should queue before hitting full provider-b, hits=%d", providerBHits)
+	}
+
+	close(bRelease)
+	select {
+	case <-doneBlocker:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocker request did not finish")
+	}
+	select {
+	case <-doneTarget:
+	case <-time.After(2 * time.Second):
+		t.Fatal("target request did not finish after provider-b released")
+	}
+
+	if wBlocker.Code != http.StatusOK || wTarget.Code != http.StatusOK {
+		t.Fatalf("codes = blocker %d target %d, want both 200; target body=%s", wBlocker.Code, wTarget.Code, wTarget.Body.String())
+	}
+	if atomic.LoadInt32(&providerBHits) != 2 {
+		t.Fatalf("provider-b hits = %d, want 2", providerBHits)
+	}
+	if statuses := relay.ListProviderBlacklistStatus("openai-chat", targetPoolID); len(statuses) != 1 {
+		t.Fatalf("provider-a should be blacklisted in target pool, got %+v", statuses)
+	}
+}
+
+func TestHTTPProviderConcurrencyClearsStaleReservationAfterProviderBlacklisted(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+	configDir := filepath.Join(testHome, ".code-switch")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+
+	aRelease := make(chan struct{})
+	bRelease := make(chan struct{})
+	var closeA sync.Once
+	var closeB sync.Once
+	t.Cleanup(func() {
+		closeA.Do(func() { close(aRelease) })
+		closeB.Do(func() { close(bRelease) })
+	})
+
+	var providerAHits int32
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit := atomic.AddInt32(&providerAHits, 1)
+		if hit == 1 {
+			<-aRelease
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"provider-a forbidden"}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"provider-a should stay blacklisted"}`))
+	}))
+	defer upstreamA.Close()
+
+	var providerBHits int32
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit := atomic.AddInt32(&providerBHits, 1)
+		if hit == 1 {
+			<-bRelease
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"provider":"provider-b","choices":[{"message":{"content":"from-b"}}]}`))
+	}))
+	defer upstreamB.Close()
+
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstreamA.URL, APIKey: "key-a", MaxConcurrency: 1},
+		{ID: 2, Name: "provider-b", Enabled: true, APIURL: upstreamB.URL, APIKey: "key-b", MaxConcurrency: 1},
+	}
+	payload, _ := json.Marshal(providerEnvelope{Providers: providers})
+	if err := os.WriteFile(filepath.Join(configDir, "openai-chat.json"), payload, 0o600); err != nil {
+		t.Fatalf("write providers: %v", err)
+	}
+
+	providerService := NewProviderService()
+	poolService := NewProviderPoolService()
+	keyService := NewCodexRelayKeyService()
+	poolService.SetBindingChecker(keyService)
+	appSettings := NewAppSettingsService(nil)
+	relay := NewProviderRelayService(providerService, poolService, keyService, NewNotificationService(appSettings), appSettings, DefaultRelayBindAddr)
+
+	blockerPoolID, err := poolService.SavePool(&ProviderPool{
+		Platform: "openai-chat",
+		Name:     "Stale Reservation Blocker Pool",
+		Mode:     ProviderPoolModeManaged,
+		Members:  []ProviderPoolMember{{ProviderID: 2, Enabled: true, Level: 1}},
+	})
+	if err != nil {
+		t.Fatalf("save blocker pool: %v", err)
+	}
+	targetPoolID, err := poolService.SavePool(&ProviderPool{
+		Platform:                     "openai-chat",
+		Name:                         "Stale Reservation Target Pool",
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       1,
+		AutoBlacklistDurationMinutes: 10,
+		Members: []ProviderPoolMember{
+			{ProviderID: 1, Enabled: true, Level: 1},
+			{ProviderID: 2, Enabled: true, Level: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("save target pool: %v", err)
+	}
+
+	blockerKey, _ := keyService.CreateKey("stale-reservation-blocker")
+	targetKey, _ := keyService.CreateKey("stale-reservation-target")
+	_ = keyService.SetPoolBinding(blockerKey.ID, "openai-chat", blockerPoolID)
+	_ = keyService.SetPoolBinding(targetKey.ID, "openai-chat", targetPoolID)
+	blockerSecret, _ := keyService.GetKeySecret(blockerKey.ID)
+	targetSecret, _ := keyService.GetKeySecret(targetKey.ID)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	relay.registerRoutes(router)
+
+	wBlocker, doneBlocker := serveChatRequest(router, blockerSecret, `{"model":"gpt-4","messages":[{"role":"user","content":"block b"}]}`)
+	for atomic.LoadInt32(&providerBHits) < 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	wFirst, doneFirst := serveChatRequest(router, targetSecret, `{"model":"gpt-4","messages":[{"role":"user","content":"first hits a"}]}`)
+	for atomic.LoadInt32(&providerAHits) < 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	wQueued, doneQueued := serveChatRequest(router, targetSecret, `{"model":"gpt-4","messages":[{"role":"user","content":"queued should use b"}]}`)
+	waitForActiveLog(t, "openai-chat", func(logEntry ReqeustLog) bool {
+		return logEntry.Status == requestLogStatusQueued && logEntry.QueuePosition == 1
+	})
+
+	closeA.Do(func() { close(aRelease) })
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if statuses := relay.ListProviderBlacklistStatus("openai-chat", targetPoolID); len(statuses) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if statuses := relay.ListProviderBlacklistStatus("openai-chat", targetPoolID); len(statuses) != 1 {
+		t.Fatalf("provider-a should be blacklisted before provider-b releases, got %+v", statuses)
+	}
+
+	closeB.Do(func() { close(bRelease) })
+	for name, done := range map[string]<-chan struct{}{
+		"blocker": doneBlocker,
+		"first":   doneFirst,
+		"queued":  doneQueued,
+	} {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s request did not finish", name)
+		}
+	}
+
+	if wBlocker.Code != http.StatusOK || wFirst.Code != http.StatusOK || wQueued.Code != http.StatusOK {
+		t.Fatalf("codes = blocker %d first %d queued %d, want all 200; queued body=%s", wBlocker.Code, wFirst.Code, wQueued.Code, wQueued.Body.String())
+	}
+	if atomic.LoadInt32(&providerAHits) != 1 {
+		t.Fatalf("provider-a hits = %d, want 1", providerAHits)
+	}
+	if atomic.LoadInt32(&providerBHits) != 3 {
+		t.Fatalf("provider-b hits = %d, want 3", providerBHits)
+	}
+	if !strings.Contains(wQueued.Body.String(), `"provider":"provider-b"`) {
+		t.Fatalf("queued request should route to provider-b after stale reservation clears, got: %s", wQueued.Body.String())
+	}
+}
+
+func TestHTTPProviderConcurrencyManualModeQueuesWithoutFallback(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	aRelease := make(chan struct{})
+	var providerAHits int32
+	var providerBHits int32
+
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerAHits, 1)
+		<-aRelease
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"provider":"provider-a","choices":[{"message":{"content":"from-a"}}]}`))
+	}))
+	defer upstreamA.Close()
+
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&providerBHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"provider":"provider-b","choices":[{"message":{"content":"from-b"}}]}`))
+	}))
+	defer upstreamB.Close()
+
+	manualProviderID := int64(1)
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstreamA.URL, APIKey: "key-a", MaxConcurrency: 1},
+		{ID: 2, Name: "provider-b", Enabled: true, APIURL: upstreamB.URL, APIKey: "key-b", MaxConcurrency: 1},
+	}
+	pool := &ProviderPool{
+		Platform:         "openai-chat",
+		Name:             "Manual Concurrency Pool",
+		Mode:             ProviderPoolModeManual,
+		ManualProviderID: &manualProviderID,
+		Members: []ProviderPoolMember{
+			{ProviderID: 1, Enabled: true},
+			{ProviderID: 2, Enabled: true},
+		},
+	}
+	_, router, keySecret, _ := setupProviderPoolHTTPTest(t, "openai-chat", providers, pool)
+
+	w1, done1 := serveChatRequest(router, keySecret, `{"model":"gpt-4","messages":[{"role":"user","content":"first"}]}`)
+	for atomic.LoadInt32(&providerAHits) < 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	w2, done2 := serveChatRequest(router, keySecret, `{"model":"gpt-4","messages":[{"role":"user","content":"second"}]}`)
+	waitForActiveLog(t, "openai-chat", func(logEntry ReqeustLog) bool {
+		return logEntry.Status == requestLogStatusQueued && logEntry.QueuePosition == 1
+	})
+	if atomic.LoadInt32(&providerBHits) != 0 {
+		t.Fatalf("manual mode should not fallback to provider-b, hits=%d", providerBHits)
+	}
+
+	close(aRelease)
+	select {
+	case <-done1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first manual request did not finish")
+	}
+	select {
+	case <-done2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued manual request did not finish")
+	}
+	if w1.Code != http.StatusOK || w2.Code != http.StatusOK {
+		t.Fatalf("manual codes = first %d second %d, want 200", w1.Code, w2.Code)
+	}
+	if atomic.LoadInt32(&providerAHits) != 2 {
+		t.Fatalf("provider-a hits = %d, want 2", providerAHits)
+	}
+	if atomic.LoadInt32(&providerBHits) != 0 {
+		t.Fatalf("provider-b hits = %d, want 0", providerBHits)
+	}
+}
+
+func TestHTTPProviderConcurrencyStreamingRequestHoldsSlotUntilFinished(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	streamRelease := make(chan struct{})
+	streamStarted := make(chan struct{}, 2)
+	var hits int32
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		streamStarted <- struct{}{}
+		<-streamRelease
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstream.URL, APIKey: "key-a", MaxConcurrency: 1},
+	}
+	pool := &ProviderPool{
+		Platform: "openai-chat",
+		Name:     "Streaming Concurrency Pool",
+		Mode:     ProviderPoolModeManaged,
+		Members:  []ProviderPoolMember{{ProviderID: 1, Enabled: true, Level: 1}},
+	}
+	_, router, keySecret, _ := setupProviderPoolHTTPTest(t, "openai-chat", providers, pool)
+
+	body := `{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"stream"}]}`
+	w1, done1 := serveChatRequest(router, keySecret, body)
+	select {
+	case <-streamStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first stream did not start")
+	}
+
+	w2, done2 := serveChatRequest(router, keySecret, body)
+	waitForActiveLog(t, "openai-chat", func(logEntry ReqeustLog) bool {
+		return logEntry.Status == requestLogStatusQueued && logEntry.QueuePosition == 1
+	})
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("second stream should be queued before first stream finishes, hits=%d", hits)
+	}
+
+	close(streamRelease)
+	select {
+	case <-done1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first stream did not finish")
+	}
+	select {
+	case <-done2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued stream did not finish")
+	}
+	if w1.Code != http.StatusOK || w2.Code != http.StatusOK {
+		t.Fatalf("stream codes = first %d second %d, want both 200", w1.Code, w2.Code)
+	}
+	if atomic.LoadInt32(&hits) != 2 {
+		t.Fatalf("upstream stream hits = %d, want 2", hits)
+	}
+}
+
+func TestHTTPProviderConcurrencySharedProviderWakesQueuedDifferentPool(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+	configDir := filepath.Join(testHome, ".code-switch")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+
+	release := make(chan struct{})
+	var hits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"provider":"provider-a","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstream.URL, APIKey: "key-a", MaxConcurrency: 1},
+	}
+	payload, _ := json.Marshal(providerEnvelope{Providers: providers})
+	if err := os.WriteFile(filepath.Join(configDir, "openai-chat.json"), payload, 0o600); err != nil {
+		t.Fatalf("write providers: %v", err)
+	}
+
+	providerService := NewProviderService()
+	poolService := NewProviderPoolService()
+	keyService := NewCodexRelayKeyService()
+	poolService.SetBindingChecker(keyService)
+	appSettings := NewAppSettingsService(nil)
+	relay := NewProviderRelayService(providerService, poolService, keyService, NewNotificationService(appSettings), appSettings, DefaultRelayBindAddr)
+
+	poolA := &ProviderPool{
+		Platform: "openai-chat",
+		Name:     "Pool A",
+		Mode:     ProviderPoolModeManaged,
+		Members:  []ProviderPoolMember{{ProviderID: 1, Enabled: true, Level: 1}},
+	}
+	poolAID, err := poolService.SavePool(poolA)
+	if err != nil {
+		t.Fatalf("save pool A: %v", err)
+	}
+	poolB := &ProviderPool{
+		Platform: "openai-chat",
+		Name:     "Pool B",
+		Mode:     ProviderPoolModeManaged,
+		Members:  []ProviderPoolMember{{ProviderID: 1, Enabled: true, Level: 1}},
+	}
+	poolBID, err := poolService.SavePool(poolB)
+	if err != nil {
+		t.Fatalf("save pool B: %v", err)
+	}
+	keyA, _ := keyService.CreateKey("key-a")
+	keyB, _ := keyService.CreateKey("key-b")
+	_ = keyService.SetPoolBinding(keyA.ID, "openai-chat", poolAID)
+	_ = keyService.SetPoolBinding(keyB.ID, "openai-chat", poolBID)
+	secretA, _ := keyService.GetKeySecret(keyA.ID)
+	secretB, _ := keyService.GetKeySecret(keyB.ID)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	relay.registerRoutes(router)
+
+	w1, done1 := serveChatRequest(router, secretA, `{"model":"gpt-4","messages":[{"role":"user","content":"pool-a"}]}`)
+	for atomic.LoadInt32(&hits) < 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	w2, done2 := serveChatRequest(router, secretB, `{"model":"gpt-4","messages":[{"role":"user","content":"pool-b"}]}`)
+	waitForActiveLog(t, "openai-chat", func(logEntry ReqeustLog) bool {
+		return logEntry.Status == requestLogStatusQueued && logEntry.QueuePosition == 1
+	})
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("pool B request should be queued while shared provider is occupied, hits=%d", hits)
+	}
+
+	close(release)
+	select {
+	case <-done1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pool A request did not finish")
+	}
+	select {
+	case <-done2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pool B queued request did not wake after shared provider release")
+	}
+	if w1.Code != http.StatusOK || w2.Code != http.StatusOK {
+		t.Fatalf("shared provider codes = poolA %d poolB %d, want both 200", w1.Code, w2.Code)
+	}
+	if atomic.LoadInt32(&hits) != 2 {
+		t.Fatalf("shared provider hits = %d, want 2", hits)
+	}
+}
+
+func TestHTTPClientCancelBeforeUpstreamHeadersDoesNotBlacklistProvider(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	started := make(chan struct{}, 1)
+	unblock := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		<-unblock
+	}))
+	defer upstream.Close()
+
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstream.URL, APIKey: "key-a", MaxConcurrency: 1},
+	}
+	pool := &ProviderPool{
+		Platform:                     "openai-chat",
+		Name:                         "Cancel Pool",
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       1,
+		AutoBlacklistDurationMinutes: 10,
+		Members:                      []ProviderPoolMember{{ProviderID: 1, Enabled: true, Level: 1}},
+	}
+	relay, router, keySecret, poolID := setupProviderPoolHTTPTest(t, "openai-chat", providers, pool)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"cancel"}]}`)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+keySecret)
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream request did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		close(unblock)
+		t.Fatal("cancelled in-flight request did not return")
+	}
+	close(unblock)
+	if statuses := relay.ListProviderBlacklistStatus("openai-chat", poolID); len(statuses) != 0 {
+		t.Fatalf("client cancellation should not blacklist provider, got %+v", statuses)
+	}
+}
+
+func TestHTTPClientCancelDuringNonStreamingBodyDoesNotBlacklistProvider(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	headersSent := make(chan struct{}, 1)
+	unblock := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		headersSent <- struct{}{}
+		<-unblock
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstream.URL, APIKey: "key-a", MaxConcurrency: 1},
+	}
+	pool := &ProviderPool{
+		Platform:                     "openai-chat",
+		Name:                         "Cancel Body Pool",
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       1,
+		AutoBlacklistDurationMinutes: 10,
+		Members:                      []ProviderPoolMember{{ProviderID: 1, Enabled: true, Level: 1}},
+	}
+	relay, router, keySecret, poolID := setupProviderPoolHTTPTest(t, "openai-chat", providers, pool)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"cancel body"}]}`)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+keySecret)
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	select {
+	case <-headersSent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream headers were not sent")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		close(unblock)
+		t.Fatal("cancelled body read did not return")
+	}
+	close(unblock)
+	if statuses := relay.ListProviderBlacklistStatus("openai-chat", poolID); len(statuses) != 0 {
+		t.Fatalf("client cancellation during body read should not blacklist provider, got %+v", statuses)
+	}
+}
+
+func TestHTTPModelsClientCancelDoesNotBlacklistProvider(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	started := make(chan struct{}, 1)
+	unblock := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		<-unblock
+	}))
+	defer upstream.Close()
+
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstream.URL, APIKey: "key-a", MaxConcurrency: 1},
+	}
+	pool := &ProviderPool{
+		Platform:                     "openai-chat",
+		Name:                         "Models Cancel Pool",
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       1,
+		AutoBlacklistDurationMinutes: 10,
+		Members:                      []ProviderPoolMember{{ProviderID: 1, Enabled: true, Level: 1}},
+	}
+	relay, router, keySecret, poolID := setupProviderPoolHTTPTest(t, "openai-chat", providers, pool)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+keySecret)
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream models request did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		close(unblock)
+		t.Fatal("cancelled models request did not return")
+	}
+	close(unblock)
+	if statuses := relay.ListProviderBlacklistStatus("openai-chat", poolID); len(statuses) != 0 {
+		t.Fatalf("models client cancellation should not blacklist provider, got %+v", statuses)
+	}
+}
+
+func TestHTTPProcessingRetryEnqueuesBehindExistingQueue(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	firstEntered := make(chan struct{}, 1)
+	order := make(chan string, 2)
+	var hits int32
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		hit := atomic.AddInt32(&hits, 1)
+		if hit == 1 {
+			firstEntered <- struct{}{}
+			<-r.Context().Done()
+			return
+		}
+		order <- string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"provider":"provider-a","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	providers := []Provider{
+		{ID: 1, Name: "provider-a", Enabled: true, APIURL: upstream.URL, APIKey: "key-a", MaxConcurrency: 1},
+	}
+	pool := &ProviderPool{
+		Platform: "openai-chat",
+		Name:     "Retry FIFO Pool",
+		Mode:     ProviderPoolModeManaged,
+		Members:  []ProviderPoolMember{{ProviderID: 1, Enabled: true, Level: 1}},
+	}
+	_, router, keySecret, _ := setupProviderPoolHTTPTest(t, "openai-chat", providers, pool)
+
+	firstBody := `{"model":"gpt-4","messages":[{"role":"user","content":"first"}]}`
+	secondBody := `{"model":"gpt-4","messages":[{"role":"user","content":"second"}]}`
+	w1, done1 := serveChatRequest(router, keySecret, firstBody)
+	select {
+	case <-firstEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first upstream request did not start")
+	}
+
+	w2, done2 := serveChatRequest(router, keySecret, secondBody)
+	waitForActiveLog(t, "openai-chat", func(logEntry ReqeustLog) bool {
+		return logEntry.Status == requestLogStatusQueued && logEntry.QueuePosition == 1
+	})
+	processing := waitForActiveLog(t, "openai-chat", func(logEntry ReqeustLog) bool {
+		return logEntry.Status == requestLogStatusProcessing && logEntry.Provider == "provider-a"
+	})
+	if result := defaultActiveRequestTracker.Retry(processing.ID, ""); result.Status != activeRequestRetryTriggered {
+		t.Fatalf("processing retry status = %q, want %q", result.Status, activeRequestRetryTriggered)
+	}
+
+	var firstAfterRetry string
+	var secondAfterRetry string
+	select {
+	case firstAfterRetry = <-order:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first queued turn did not reach upstream")
+	}
+	select {
+	case secondAfterRetry = <-order:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retried request did not reach upstream after queued request")
+	}
+
+	if !strings.Contains(firstAfterRetry, "second") {
+		t.Fatalf("first request after retry should be existing queued request, got %s", firstAfterRetry)
+	}
+	if !strings.Contains(secondAfterRetry, "first") {
+		t.Fatalf("retried request should run after existing queue, got %s", secondAfterRetry)
+	}
+
+	select {
+	case <-done1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retried first request did not finish")
+	}
+	select {
+	case <-done2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued second request did not finish")
+	}
+	if w1.Code != http.StatusOK || w2.Code != http.StatusOK {
+		t.Fatalf("retry FIFO codes = first %d second %d, want both 200", w1.Code, w2.Code)
 	}
 }
 
