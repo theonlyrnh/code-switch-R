@@ -132,8 +132,8 @@
               <span class="pool-name">{{ pool.name }}</span>
             </div>
             <div class="pool-header-right">
-              <!-- 模式开关：左=手动(黄色)，右=托管(绿色) -->
-              <div class="mode-switch-group">
+              <!-- 普通池模式开关：左=手动(黄色)，右=托管(绿色) -->
+              <div v-if="!isAccountPool(pool)" class="mode-switch-group">
                 <span class="mode-label manual-label" :class="{ active: pool.mode === 'manual' }">{{ t('components.main.pool.modeManual') }}</span>
                 <label class="mode-switch">
                   <input
@@ -145,6 +145,9 @@
                 </label>
                 <span class="mode-label managed-label" :class="{ active: pool.mode === 'managed' }">{{ t('components.main.pool.modeManaged') }}</span>
               </div>
+              <span v-else class="account-managed-badge">
+                {{ t('components.main.pool.accountManagedOnly') }}
+              </span>
               <button class="ghost-icon" :data-tooltip="t('components.main.pool.editPool')" @click="openEditPool(pool)">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path d="M11.983 2.25a1.125 1.125 0 011.077.81l.563 2.101a7.482 7.482 0 012.326 1.343l2.08-.621a1.125 1.125 0 011.356.651l1.313 3.207a1.125 1.125 0 01-.442 1.339l-1.86 1.205a7.418 7.418 0 010 2.686l1.86 1.205a1.125 1.125 0 01.442 1.339l-1.313 3.207a1.125 1.125 0 01-1.356.651l-2.08-.621a7.482 7.482 0 01-2.326 1.343l-.563 2.101a1.125 1.125 0 01-1.077.81h-2.634a1.125 1.125 0 01-1.077-.81l-.563-2.101a7.482 7.482 0 01-2.326-1.343l-2.08.621a1.125 1.125 0 01-1.356-.651l-1.313-3.207a1.125 1.125 0 01.442-1.339l1.86-1.205a7.418 7.418 0 010-2.686l-1.86-1.205a1.125 1.125 0 01-.442-1.339l1.313-3.207a1.125 1.125 0 011.356-.651l2.08.621a7.482 7.482 0 012.326-1.343l.563-2.101a1.125 1.125 0 011.077-.81h2.634z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
@@ -164,7 +167,7 @@
           </div>
 
           <!-- 池子内的供应商卡片 -->
-          <div class="pool-members">
+          <div v-if="!isAccountPool(pool)" class="pool-members">
             <div
               v-for="member in getPoolMembersWithProviders(pool)"
               :key="member.providerId"
@@ -228,9 +231,41 @@
             </div>
           </div>
 
+          <!-- 号池配置摘要 -->
+          <div v-else class="account-pool-summary">
+            <div class="account-pool-endpoint">
+              <span class="account-summary-label">{{ t('components.main.pool.accountPoolBaseUrl') }}</span>
+              <span class="account-summary-value">{{ pool.accountPoolConfig?.apiUrl || '-' }}</span>
+            </div>
+            <div class="account-pool-endpoint">
+              <span class="account-summary-label">{{ t('components.main.pool.responsesEndpoint') }}</span>
+              <span class="account-summary-value">{{ pool.accountPoolConfig?.responsesEndpoint || '/responses' }}</span>
+            </div>
+            <div class="account-pool-keys">
+              <div class="account-keys-heading">
+                <span class="account-summary-label">{{ t('components.main.pool.accountPoolKeys') }}</span>
+                <span class="account-key-count">{{ t('components.main.pool.accountKeyCount', { count: pool.accountPoolConfig?.keys?.length || 0 }) }}</span>
+              </div>
+              <div class="account-key-list">
+                <span
+                  v-for="key in pool.accountPoolConfig?.keys || []"
+                  :key="key.id"
+                  class="account-key-chip"
+                >
+                  {{ maskAccountKey(key.apiKey) }}
+                </span>
+                <span v-if="!(pool.accountPoolConfig?.keys?.length)" class="pool-no-keys">
+                  {{ t('components.main.pool.noAccountKeys') }}
+                </span>
+              </div>
+            </div>
+          </div>
+
           <!-- 拉黑状态 -->
           <div v-if="(blacklistStatus.get(pool.id) || []).length > 0" class="pool-blacklist-section">
-            <div class="pool-keys-header">{{ t('components.main.pool.blacklistedProviders') }}</div>
+            <div class="pool-keys-header">
+              {{ isAccountPool(pool) ? t('components.main.pool.blacklistedKeys') : t('components.main.pool.blacklistedProviders') }}
+            </div>
             <div class="pool-keys-list">
               <div
                 v-for="penalty in blacklistStatus.get(pool.id) || []"
@@ -242,7 +277,7 @@
                     <path d="M12 2L2 22h20L12 2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
                     <path d="M12 10v4m0 4h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                   </svg>
-                  <span class="pool-key-name">{{ getProviderNameById(penalty.providerID) }}</span>
+                  <span class="pool-key-name">{{ getBlacklistSubjectName(pool, penalty.providerID) }}</span>
                   <span class="blacklist-time">{{ t('components.main.pool.blacklistRemaining', { minutes: getBlacklistRemainingMinutes(penalty) }) }}</span>
                   <button class="ghost-icon key-unbind-btn" :data-tooltip="t('components.main.pool.unblacklist')" @click.stop="unblacklistProvider(pool.id, penalty.providerID)">
                     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -329,7 +364,34 @@
             />
           </label>
 
-          <div class="form-field">
+          <div v-if="props.platform === 'openai-responses'" class="form-field">
+            <span>{{ t('components.main.pool.poolType') }}</span>
+            <div class="pool-type-selector" :class="{ disabled: !!poolModalState.editingId }">
+              <label class="pool-type-option" :class="{ selected: poolModalState.form.poolType === 'normal' }">
+                <input
+                  v-model="poolModalState.form.poolType"
+                  type="radio"
+                  value="normal"
+                  :disabled="!!poolModalState.editingId"
+                />
+                <span>{{ t('components.main.pool.poolTypeNormal') }}</span>
+              </label>
+              <label class="pool-type-option" :class="{ selected: poolModalState.form.poolType === 'account' }">
+                <input
+                  v-model="poolModalState.form.poolType"
+                  type="radio"
+                  value="account"
+                  :disabled="!!poolModalState.editingId"
+                />
+                <span>{{ t('components.main.pool.poolTypeAccount') }}</span>
+              </label>
+            </div>
+            <span v-if="poolModalState.editingId" class="form-field-hint">
+              {{ t('components.main.pool.poolTypeImmutable') }}
+            </span>
+          </div>
+
+          <div v-if="poolModalState.form.poolType === 'normal'" class="form-field">
             <span>{{ t('components.main.pool.poolMode') }}</span>
             <div class="pool-mode-selector">
               <label class="pool-mode-option" :class="{ selected: poolModalState.form.mode === 'managed' }">
@@ -349,8 +411,13 @@
             </div>
           </div>
 
-          <!-- 自动拉黑配置（仅 managed 模式） -->
-          <div v-if="poolModalState.form.mode === 'managed'" class="form-field">
+          <div v-else class="account-managed-notice">
+            <span class="account-managed-dot" aria-hidden="true"></span>
+            <span>{{ t('components.main.pool.accountManagedOnly') }}</span>
+          </div>
+
+          <!-- 普通池自动拉黑配置（仅 managed 模式） -->
+          <div v-if="poolModalState.form.poolType === 'normal' && poolModalState.form.mode === 'managed'" class="form-field">
             <span>{{ t('components.main.pool.autoBlacklist') }}</span>
             <div class="blacklist-config">
               <label class="pool-member-checkbox">
@@ -385,8 +452,75 @@
             </div>
           </div>
 
-          <!-- 选择池子成员供应商 -->
-          <div class="form-field">
+          <!-- 号池上游与密钥配置 -->
+          <template v-if="poolModalState.form.poolType === 'account'">
+            <label class="form-field">
+              <span>{{ t('components.main.pool.accountPoolBaseUrl') }}</span>
+              <input
+                v-model="poolModalState.form.accountApiUrl"
+                class="mac-input"
+                type="url"
+                :placeholder="t('components.main.pool.accountPoolBaseUrlPlaceholder')"
+                required
+              />
+            </label>
+
+            <label class="form-field">
+              <span>{{ t('components.main.pool.responsesEndpoint') }}</span>
+              <input
+                v-model="poolModalState.form.accountResponsesEndpoint"
+                class="mac-input"
+                type="text"
+                :placeholder="t('components.main.pool.responsesEndpointPlaceholder')"
+                required
+              />
+            </label>
+
+            <label class="form-field">
+              <span>{{ t('components.main.pool.accountPoolKeys') }}</span>
+              <textarea
+                v-model="poolModalState.form.accountKeysText"
+                class="mac-input account-keys-textarea"
+                :placeholder="t('components.main.pool.accountPoolKeysPlaceholder')"
+                autocomplete="off"
+                autocapitalize="off"
+                spellcheck="false"
+                required
+              ></textarea>
+              <span class="form-field-hint">{{ t('components.main.pool.accountPoolKeysHint') }}</span>
+            </label>
+
+            <div class="form-field">
+              <span>{{ t('components.main.pool.autoBlacklist') }}</span>
+              <div class="blacklist-config-inputs account-blacklist-inputs">
+                <label class="form-field">
+                  <span>{{ t('components.main.pool.blacklistThreshold') }}</span>
+                  <input
+                    v-model.number="poolModalState.form.autoBlacklistThreshold"
+                    type="number"
+                    :min="1"
+                    :max="100"
+                    class="mac-input"
+                    required
+                  />
+                </label>
+                <label class="form-field">
+                  <span>{{ t('components.main.pool.blacklistDuration') }}</span>
+                  <input
+                    v-model.number="poolModalState.form.autoBlacklistDurationMinutes"
+                    type="number"
+                    :min="1"
+                    :max="1440"
+                    class="mac-input"
+                    required
+                  />
+                </label>
+              </div>
+            </div>
+          </template>
+
+          <!-- 普通池成员供应商 -->
+          <div v-else class="form-field">
             <span>{{ t('components.main.pool.selectMembers') }}</span>
             <div class="pool-member-selector">
               <div
@@ -451,7 +585,19 @@ import BaseButton from '../common/BaseButton.vue'
 import BaseModal from '../common/BaseModal.vue'
 import BaseInput from '../common/BaseInput.vue'
 import { Events } from '../../wails-runtime'
-import { ListPools, SavePool, DeletePool, SetPoolBinding, ListProviderBlacklistStatus, ClearProviderBlacklist, type ProviderPool, type ProviderPoolMode, type ProviderPoolProviderPenalty } from '../../services/providerPool'
+import {
+  ListPools,
+  SavePool,
+  DeletePool,
+  SetPoolBinding,
+  ListProviderBlacklistStatus,
+  ClearProviderBlacklist,
+  type AccountPoolKey,
+  type ProviderPool,
+  type ProviderPoolMode,
+  type ProviderPoolProviderPenalty,
+  type ProviderPoolType,
+} from '../../services/providerPool'
 import type { AutomationCard } from '../../data/cards'
 import { showToast } from '../../utils/toast'
 
@@ -486,19 +632,44 @@ let unsubscribeBlacklistChanged: (() => void) | undefined
 const faviconCache = new Map<string, string | undefined>()
 
 // 池子弹窗状态
-const poolModalState = reactive({
+interface PoolFormState {
+  name: string
+  poolType: ProviderPoolType
+  mode: ProviderPoolMode
+  manualProviderId: number | null
+  memberProviderIds: number[]
+  memberLevels: Record<number, number>
+  accountApiUrl: string
+  accountResponsesEndpoint: string
+  accountKeysText: string
+  autoBlacklistEnabled: boolean
+  autoBlacklistThreshold: number
+  autoBlacklistDurationMinutes: number
+}
+
+const createEmptyPoolForm = (): PoolFormState => ({
+  name: '',
+  poolType: 'normal',
+  mode: 'managed',
+  manualProviderId: null,
+  memberProviderIds: [],
+  memberLevels: {},
+  accountApiUrl: '',
+  accountResponsesEndpoint: '/responses',
+  accountKeysText: '',
+  autoBlacklistEnabled: false,
+  autoBlacklistThreshold: 3,
+  autoBlacklistDurationMinutes: 10,
+})
+
+const poolModalState = reactive<{
+  open: boolean
+  editingId: string
+  form: PoolFormState
+}>({
   open: false,
-  editingId: '' as string,
-  form: {
-    name: '',
-    mode: 'managed' as ProviderPoolMode,
-    manualProviderId: null as number | null,
-    memberProviderIds: [] as number[],
-    memberLevels: {} as Record<number, number>,
-    autoBlacklistEnabled: false,
-    autoBlacklistThreshold: 3,
-    autoBlacklistDurationMinutes: 10,
-  },
+  editingId: '',
+  form: createEmptyPoolForm(),
 })
 
 // 删除确认状态
@@ -575,6 +746,14 @@ const sameProviderId = (a: number | string | null | undefined, b: number | strin
 const isProviderIdInList = (list: Array<number | string>, providerId: number | string | null | undefined): boolean =>
   list.some((id) => sameProviderId(id, providerId))
 
+const isAccountPool = (pool: ProviderPool): boolean => pool.poolType === 'account'
+
+const maskAccountKey = (apiKey: string): string => {
+  const key = apiKey.trim()
+  if (key.length <= 4) return '****'
+  return `****${key.slice(-4)}`
+}
+
 interface PoolMemberWithProvider {
   providerId: number
   name: string
@@ -587,7 +766,7 @@ interface PoolMemberWithProvider {
 }
 
 const getPoolMembersWithProviders = (pool: ProviderPool): PoolMemberWithProvider[] => {
-  return pool.members
+  return (pool.members ?? [])
     .map((member) => {
       const providerID = normalizeProviderId(member.providerId)
       const provider = props.providers.find((p) => sameProviderId(p.id, providerID))
@@ -711,31 +890,26 @@ const updateMemberLevel = async (poolID: string, providerId: number, level: numb
 
 const openCreatePool = () => {
   poolModalState.editingId = ''
-  poolModalState.form = {
-    name: '',
-    mode: 'managed',
-    manualProviderId: null,
-    memberProviderIds: [],
-    memberLevels: {},
-    autoBlacklistEnabled: false,
-    autoBlacklistThreshold: 3,
-    autoBlacklistDurationMinutes: 10,
-  }
+  poolModalState.form = createEmptyPoolForm()
   poolModalState.open = true
 }
 
 const openEditPool = (pool: ProviderPool) => {
   poolModalState.editingId = pool.id
   const levels: Record<number, number> = {}
-  for (const m of pool.members) {
+  for (const m of pool.members ?? []) {
     levels[normalizeProviderId(m.providerId)] = m.level ?? 1
   }
   poolModalState.form = {
     name: pool.name,
-    mode: pool.mode,
+    poolType: isAccountPool(pool) ? 'account' : 'normal',
+    mode: isAccountPool(pool) ? 'managed' : pool.mode,
     manualProviderId: pool.manualProviderId ?? null,
-    memberProviderIds: pool.members.map((m) => normalizeProviderId(m.providerId)),
+    memberProviderIds: (pool.members ?? []).map((m) => normalizeProviderId(m.providerId)),
     memberLevels: levels,
+    accountApiUrl: pool.accountPoolConfig?.apiUrl ?? '',
+    accountResponsesEndpoint: pool.accountPoolConfig?.responsesEndpoint || '/responses',
+    accountKeysText: (pool.accountPoolConfig?.keys ?? []).map((key) => key.apiKey).join('\n'),
     autoBlacklistEnabled: pool.autoBlacklistEnabled ?? false,
     autoBlacklistThreshold: pool.autoBlacklistThreshold || 3,
     autoBlacklistDurationMinutes: pool.autoBlacklistDurationMinutes || 10,
@@ -772,37 +946,77 @@ const setMemberLevel = (providerId: number, level: number) => {
   poolModalState.form.memberLevels[normalizeProviderId(providerId)] = level
 }
 
+const parseAccountKeys = (text: string): string[] => {
+  const seen = new Set<string>()
+  const keys: string[] = []
+  for (const line of text.split(/\r?\n/)) {
+    const key = line.trim()
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    keys.push(key)
+  }
+  return keys
+}
+
 const submitPoolModal = async () => {
-  const { name, mode, memberProviderIds } = poolModalState.form
+  const { name, memberProviderIds } = poolModalState.form
   const existingPool = poolModalState.editingId
     ? pools.value.find((pool) => pool.id === poolModalState.editingId)
     : null
-  const members = memberProviderIds.map((providerId) => {
-    const normalizedProviderId = normalizeProviderId(providerId)
-    const existingMember = existingPool?.members.find((member) => sameProviderId(member.providerId, normalizedProviderId))
-    return {
-      providerId: normalizedProviderId,
-      enabled: existingMember?.enabled ?? true,
-      level: poolModalState.form.memberLevels[normalizedProviderId] ?? 1,
-    }
-  })
-  const existingManualProviderId = existingPool?.manualProviderId ?? null
-  const manualProviderId =
-    mode === 'manual'
-      ? isProviderIdInList(memberProviderIds, existingManualProviderId)
-        ? existingManualProviderId
-        : memberProviderIds[0] ?? null
-      : null
+  const poolType: ProviderPoolType = props.platform === 'openai-responses'
+    ? poolModalState.form.poolType
+    : 'normal'
 
   const poolData: any = {
     platform: props.platform,
     name,
-    mode,
-    manualProviderId,
-    members,
-    autoBlacklistEnabled: poolModalState.form.autoBlacklistEnabled,
+    poolType,
     autoBlacklistThreshold: poolModalState.form.autoBlacklistThreshold,
     autoBlacklistDurationMinutes: poolModalState.form.autoBlacklistDurationMinutes,
+  }
+
+  if (poolType === 'account') {
+    const parsedKeys = parseAccountKeys(poolModalState.form.accountKeysText)
+    if (parsedKeys.length === 0) {
+      showToast(t('components.main.pool.accountPoolKeysRequired'), 'error')
+      return
+    }
+
+    const existingKeysBySecret = new Map<string, AccountPoolKey>(
+      (existingPool?.accountPoolConfig?.keys ?? []).map((key): [string, AccountPoolKey] => [key.apiKey, key])
+    )
+    poolData.mode = 'managed'
+    poolData.manualProviderId = null
+    poolData.members = []
+    poolData.autoBlacklistEnabled = true
+    poolData.accountPoolConfig = {
+      apiUrl: poolModalState.form.accountApiUrl.trim(),
+      responsesEndpoint: poolModalState.form.accountResponsesEndpoint.trim(),
+      keys: parsedKeys.map((apiKey) => ({
+        id: existingKeysBySecret.get(apiKey)?.id ?? 0,
+        apiKey,
+      })),
+    }
+  } else {
+    const mode = poolModalState.form.mode
+    const members = memberProviderIds.map((providerId) => {
+      const normalizedProviderId = normalizeProviderId(providerId)
+      const existingMember = existingPool?.members?.find((member) => sameProviderId(member.providerId, normalizedProviderId))
+      return {
+        providerId: normalizedProviderId,
+        enabled: existingMember?.enabled ?? true,
+        level: poolModalState.form.memberLevels[normalizedProviderId] ?? 1,
+      }
+    })
+    const existingManualProviderId = existingPool?.manualProviderId ?? null
+    poolData.mode = mode
+    poolData.manualProviderId = mode === 'manual'
+      ? isProviderIdInList(memberProviderIds, existingManualProviderId)
+        ? existingManualProviderId
+        : memberProviderIds[0] ?? null
+      : null
+    poolData.members = members
+    poolData.autoBlacklistEnabled = poolModalState.form.autoBlacklistEnabled
   }
 
   if (poolModalState.editingId) {
@@ -854,8 +1068,14 @@ const getBlacklistRemainingMinutes = (penalty: ProviderPoolProviderPenalty): num
 
 // 根据 provider ID 获取 provider 名称
 const getProviderNameById = (providerID: number): string => {
-  const provider = props.providers.find((p) => p.id === providerID)
+  const provider = props.providers.find((p) => sameProviderId(p.id, providerID))
   return provider?.name ?? `Provider #${providerID}`
+}
+
+const getBlacklistSubjectName = (pool: ProviderPool, providerID: number): string => {
+  if (!isAccountPool(pool)) return getProviderNameById(providerID)
+  const key = pool.accountPoolConfig?.keys?.find((item) => sameProviderId(item.id, providerID))
+  return key ? maskAccountKey(key.apiKey) : t('components.main.pool.accountKeyFallback', { id: Math.abs(providerID) })
 }
 
 const closeDeleteConfirm = () => {
@@ -1027,6 +1247,38 @@ watch(
   display: flex;
   align-items: center;
   gap: 4px;
+}
+
+.account-managed-badge,
+.account-managed-notice {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #16803c;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.account-managed-badge {
+  padding: 4px 8px;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  border-radius: 6px;
+  background: rgba(34, 197, 94, 0.08);
+}
+
+.account-managed-notice {
+  align-self: flex-start;
+  padding: 9px 11px;
+  border: 1px solid rgba(34, 197, 94, 0.25);
+  border-radius: 6px;
+  background: rgba(34, 197, 94, 0.06);
+}
+
+.account-managed-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #22c55e;
 }
 
 .mode-label {
@@ -1212,6 +1464,74 @@ watch(
   font-size: 13px;
 }
 
+.account-pool-summary {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(140px, 0.7fr);
+  gap: 10px 20px;
+  padding: 14px 16px;
+}
+
+.account-pool-endpoint,
+.account-pool-keys {
+  min-width: 0;
+}
+
+.account-pool-endpoint {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.account-pool-keys {
+  grid-column: 1 / -1;
+}
+
+.account-summary-label {
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.account-summary-value {
+  color: var(--color-text, #1f2937);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.account-keys-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+
+.account-key-count {
+  color: var(--color-text-tertiary, #9ca3af);
+  font-size: 11px;
+}
+
+.account-key-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.account-key-chip {
+  padding: 4px 8px;
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 5px;
+  background: var(--color-bg, #fff);
+  color: var(--color-text-secondary, #4b5563);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+}
+
+.pool-blacklist-section {
+  padding: 8px 16px;
+  border-top: 1px solid var(--color-border, #e5e7eb);
+}
+
 /* 池子内密钥区域 */
 .pool-keys-section {
   padding: 8px 16px;
@@ -1345,6 +1665,77 @@ watch(
 }
 
 /* 池子表单样式 */
+.pool-type-selector {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  padding: 3px;
+  margin-top: 4px;
+  border: 1px solid var(--color-border, #d1d5db);
+  border-radius: 7px;
+  background: var(--color-bg-header, rgba(0, 0, 0, 0.03));
+}
+
+.pool-type-selector.disabled {
+  opacity: 0.75;
+}
+
+.pool-type-option {
+  cursor: pointer;
+}
+
+.pool-type-selector.disabled .pool-type-option {
+  cursor: default;
+}
+
+.pool-type-option input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.pool-type-option span {
+  display: block;
+  padding: 7px 10px;
+  border-radius: 5px;
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.pool-type-option.selected span {
+  background: var(--color-bg, #fff);
+  color: var(--color-text, #1f2937);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.1);
+}
+
+.form-field-hint {
+  color: var(--color-text-tertiary, #9ca3af);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.account-keys-textarea {
+  min-height: 132px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.account-blacklist-inputs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.account-blacklist-inputs .form-field {
+  margin: 0;
+}
+
 .pool-mode-selector {
   display: flex;
   gap: 8px;
@@ -1509,6 +1900,25 @@ watch(
     padding: 10px;
   }
 
+  .account-pool-summary {
+    grid-template-columns: 1fr;
+    padding: 12px;
+  }
+
+  .account-pool-keys {
+    grid-column: auto;
+  }
+
+  .account-key-list {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .account-key-chip {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
   .pool-member-card {
     width: 100%;
     min-width: 0;
@@ -1554,6 +1964,10 @@ watch(
 
   .pool-mode-selector {
     display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .account-blacklist-inputs {
     grid-template-columns: 1fr;
   }
 

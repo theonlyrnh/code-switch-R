@@ -1,10 +1,14 @@
 package services
 
 import (
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -21,6 +25,14 @@ const (
 	ProviderPoolModeManual  ProviderPoolMode = "manual"  // 手动模式：只使用池子内"直接应用"的供应商
 )
 
+// ProviderPoolType 池子类型
+type ProviderPoolType string
+
+const (
+	ProviderPoolTypeNormal  ProviderPoolType = "normal"
+	ProviderPoolTypeAccount ProviderPoolType = "account"
+)
+
 // normalizePoolMemberLevel 将 pool member Level 归一化：缺失或 <= 0 时默认为 1
 func normalizePoolMemberLevel(level int) int {
 	if level <= 0 {
@@ -31,19 +43,34 @@ func normalizePoolMemberLevel(level int) int {
 
 // ProviderPool 供应商池
 type ProviderPool struct {
-	ID               string               `json:"id"`
-	Platform         string               `json:"platform"`
-	Name             string               `json:"name"`
-	Mode             ProviderPoolMode     `json:"mode"`
-	ManualProviderID *int64               `json:"manualProviderId,omitempty"`
-	Members          []ProviderPoolMember `json:"members"`
-	CreatedAt        string               `json:"createdAt"`
-	UpdatedAt        string               `json:"updatedAt"`
+	ID                string               `json:"id"`
+	Platform          string               `json:"platform"`
+	Name              string               `json:"name"`
+	PoolType          ProviderPoolType     `json:"poolType"`
+	Mode              ProviderPoolMode     `json:"mode"`
+	ManualProviderID  *int64               `json:"manualProviderId,omitempty"`
+	Members           []ProviderPoolMember `json:"members"`
+	AccountPoolConfig *AccountPoolConfig   `json:"accountPoolConfig,omitempty"`
+	CreatedAt         string               `json:"createdAt"`
+	UpdatedAt         string               `json:"updatedAt"`
 
 	// 自动拉黑配置（仅 managed 模式生效）
 	AutoBlacklistEnabled         bool `json:"autoBlacklistEnabled"`
 	AutoBlacklistThreshold       int  `json:"autoBlacklistThreshold"`
 	AutoBlacklistDurationMinutes int  `json:"autoBlacklistDurationMinutes"`
+}
+
+// AccountPoolConfig 号池共享的上游配置及密钥列表。
+type AccountPoolConfig struct {
+	APIURL            string           `json:"apiUrl"`
+	ResponsesEndpoint string           `json:"responsesEndpoint"`
+	Keys              []AccountPoolKey `json:"keys"`
+}
+
+// AccountPoolKey 号池中的单个上游凭据。
+type AccountPoolKey struct {
+	ID     int64  `json:"id"`
+	APIKey string `json:"apiKey"`
 }
 
 // ProviderPoolMember 池子成员（Pool 与 Provider 的关联关系）
@@ -68,9 +95,16 @@ type providerPoolStore struct {
 }
 
 const (
-	providerPoolsFile         = "provider-pools.json"
-	providerPoolsStoreVersion = 2     // version 1 = initial pools; version 2 = migration completed (keys explicitly bound)
-	initialPoolName           = "初始池" // 迁移时自动创建的池子名称
+	providerPoolsFile                    = "provider-pools.json"
+	providerPoolsStoreVersion            = 3 // version 3 = account pool data model
+	providerPoolsBindingMigrationVersion = 2 // version 2 = relay keys explicitly bound
+	initialPoolName                      = "初始池"
+
+	defaultAccountPoolBlacklistThreshold       = 3
+	defaultAccountPoolBlacklistDurationMinutes = 10
+	maxAccountPoolBlacklistThreshold           = 100
+	maxAccountPoolBlacklistDurationMinutes     = 1440
+	maxAccountPoolKeyID                        = int64(1<<52 - 1)
 )
 
 // ========== ProviderPoolService ==========
@@ -210,6 +244,10 @@ func (s *ProviderPoolService) SavePool(pool *ProviderPool) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if pool == nil {
+		return "", errors.New("池子不能为空")
+	}
+
 	if strings.TrimSpace(pool.Platform) == "" {
 		return "", errors.New("池子必须指定 platform")
 	}
@@ -218,8 +256,45 @@ func (s *ProviderPoolService) SavePool(pool *ProviderPool) (string, error) {
 		return "", errors.New("池子名称不能为空")
 	}
 
+	pool.PoolType = normalizedProviderPoolType(pool.PoolType)
+	if pool.PoolType != ProviderPoolTypeNormal && pool.PoolType != ProviderPoolTypeAccount {
+		return "", fmt.Errorf("无效的池子类型: %s（必须是 normal 或 account）", pool.PoolType)
+	}
+	if pool.PoolType == ProviderPoolTypeAccount && pool.Mode == "" {
+		pool.Mode = ProviderPoolModeManaged
+	}
 	if pool.Mode != ProviderPoolModeManaged && pool.Mode != ProviderPoolModeManual {
 		return "", fmt.Errorf("无效的池子模式: %s（必须是 managed 或 manual）", pool.Mode)
+	}
+
+	store, err := s.loadLocked()
+	if err != nil {
+		return "", err
+	}
+	if store.Version > providerPoolsStoreVersion {
+		return "", newerProviderPoolStoreVersionError(store.Version)
+	}
+
+	var existing *ProviderPool
+	for i := range store.Pools {
+		if store.Pools[i].ID == pool.ID && strings.TrimSpace(pool.ID) != "" {
+			existing = &store.Pools[i]
+			break
+		}
+	}
+
+	if existing != nil {
+		// 池子路由身份创建后不可更改。
+		if existing.Platform != pool.Platform {
+			return "", fmt.Errorf("池子的 platform 不可更改（原: %s, 新: %s）", existing.Platform, pool.Platform)
+		}
+		if normalizedProviderPoolType(existing.PoolType) != pool.PoolType {
+			return "", fmt.Errorf("池子类型不可更改（原: %s, 新: %s）", normalizedProviderPoolType(existing.PoolType), pool.PoolType)
+		}
+	}
+
+	if err := normalizeAndValidatePoolForSave(pool, existing, store.Pools); err != nil {
+		return "", err
 	}
 
 	// 手动模式必须指定 direct applied provider（允许 nil 但会在选择时返回"无可用供应商"）
@@ -229,13 +304,7 @@ func (s *ProviderPoolService) SavePool(pool *ProviderPool) (string, error) {
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
-
-	store, err := s.loadLocked()
-	if err != nil {
-		return "", err
-	}
-
-	if strings.TrimSpace(pool.ID) == "" {
+	if existing == nil && strings.TrimSpace(pool.ID) == "" {
 		// 新建池子，生成 ID
 		pool.ID = fmt.Sprintf("pool_%s_%d", pool.Platform, time.Now().UnixNano())
 		pool.CreatedAt = now
@@ -246,10 +315,6 @@ func (s *ProviderPoolService) SavePool(pool *ProviderPool) (string, error) {
 		found := false
 		for i, existing := range store.Pools {
 			if existing.ID == pool.ID {
-				// 不允许更改 platform
-				if existing.Platform != pool.Platform {
-					return "", fmt.Errorf("池子的 platform 不可更改（原: %s, 新: %s）", existing.Platform, pool.Platform)
-				}
 				pool.CreatedAt = existing.CreatedAt // 保留创建时间
 				pool.UpdatedAt = now
 				store.Pools[i] = *pool
@@ -279,6 +344,161 @@ func (s *ProviderPoolService) SavePoolForUser(userID string, pool *ProviderPool)
 	}
 	userService.bindingChecker = s.bindingChecker
 	return userService.SavePool(pool)
+}
+
+func normalizedProviderPoolType(poolType ProviderPoolType) ProviderPoolType {
+	if strings.TrimSpace(string(poolType)) == "" {
+		return ProviderPoolTypeNormal
+	}
+	return ProviderPoolType(strings.TrimSpace(string(poolType)))
+}
+
+func normalizeAndValidatePoolForSave(pool *ProviderPool, existing *ProviderPool, pools []ProviderPool) error {
+	if pool.PoolType == ProviderPoolTypeNormal {
+		pool.AccountPoolConfig = nil
+		return nil
+	}
+
+	if pool.Platform != "openai-responses" {
+		return errors.New("号池仅支持 openai-responses platform")
+	}
+	if pool.Mode != ProviderPoolModeManaged {
+		return errors.New("号池只能使用 managed 托管模式")
+	}
+	if len(pool.Members) != 0 {
+		return errors.New("号池不能添加普通供应商成员")
+	}
+	if pool.ManualProviderID != nil {
+		return errors.New("号池不能指定手动供应商")
+	}
+	if pool.AccountPoolConfig == nil {
+		return errors.New("号池配置不能为空")
+	}
+
+	config := pool.AccountPoolConfig
+	config.APIURL = strings.TrimSpace(config.APIURL)
+	parsedAPIURL, err := url.Parse(config.APIURL)
+	if err != nil || parsedAPIURL.Host == "" || parsedAPIURL.RawQuery != "" || parsedAPIURL.Fragment != "" ||
+		(!strings.EqualFold(parsedAPIURL.Scheme, "http") && !strings.EqualFold(parsedAPIURL.Scheme, "https")) {
+		return errors.New("号池 Base URL 必须是有效的 HTTP(S) URL")
+	}
+	config.APIURL = strings.TrimRight(config.APIURL, "/")
+
+	config.ResponsesEndpoint = strings.TrimSpace(config.ResponsesEndpoint)
+	parsedEndpoint, err := url.Parse(config.ResponsesEndpoint)
+	if err != nil || parsedEndpoint.IsAbs() || parsedEndpoint.Host != "" || parsedEndpoint.Path == "" || parsedEndpoint.Fragment != "" || strings.HasPrefix(config.ResponsesEndpoint, "//") {
+		return errors.New("号池 Responses 端点必须是非空相对路径")
+	}
+	config.ResponsesEndpoint = "/" + strings.TrimLeft(config.ResponsesEndpoint, "/")
+
+	keys, err := normalizeAccountPoolKeys(config.Keys, existing, pools)
+	if err != nil {
+		return err
+	}
+	if len(keys) == 0 {
+		return errors.New("号池至少需要一个有效密钥")
+	}
+	config.Keys = keys
+
+	pool.Members = []ProviderPoolMember{}
+	pool.ManualProviderID = nil
+	pool.AutoBlacklistEnabled = true
+	if pool.AutoBlacklistThreshold <= 0 {
+		pool.AutoBlacklistThreshold = defaultAccountPoolBlacklistThreshold
+	} else if pool.AutoBlacklistThreshold > maxAccountPoolBlacklistThreshold {
+		return fmt.Errorf("号池连续失败次数阈值不能超过 %d", maxAccountPoolBlacklistThreshold)
+	}
+	if pool.AutoBlacklistDurationMinutes <= 0 {
+		pool.AutoBlacklistDurationMinutes = defaultAccountPoolBlacklistDurationMinutes
+	} else if pool.AutoBlacklistDurationMinutes > maxAccountPoolBlacklistDurationMinutes {
+		return fmt.Errorf("号池拉黑时长不能超过 %d 分钟", maxAccountPoolBlacklistDurationMinutes)
+	}
+	return nil
+}
+
+func normalizeAccountPoolKeys(input []AccountPoolKey, existing *ProviderPool, pools []ProviderPool) ([]AccountPoolKey, error) {
+	existingBySecret := make(map[string]int64)
+	if existing != nil && existing.AccountPoolConfig != nil {
+		for _, key := range existing.AccountPoolConfig.Keys {
+			secret := strings.TrimSpace(key.APIKey)
+			if secret == "" {
+				continue
+			}
+			if _, ok := existingBySecret[secret]; !ok {
+				existingBySecret[secret] = key.ID
+			}
+		}
+	}
+
+	usedIDs := make(map[int64]struct{})
+	usedByOtherPools := make(map[int64]struct{})
+	for _, candidatePool := range pools {
+		if candidatePool.AccountPoolConfig == nil {
+			continue
+		}
+		isExistingPool := existing != nil && candidatePool.ID == existing.ID
+		for _, key := range candidatePool.AccountPoolConfig.Keys {
+			if !isValidAccountPoolKeyID(key.ID) {
+				continue
+			}
+			usedIDs[key.ID] = struct{}{}
+			if !isExistingPool {
+				usedByOtherPools[key.ID] = struct{}{}
+			}
+		}
+	}
+
+	normalized := make([]AccountPoolKey, 0, len(input))
+	seenSecrets := make(map[string]struct{}, len(input))
+	assignedIDs := make(map[int64]struct{}, len(input))
+	for _, candidate := range input {
+		secret := strings.TrimSpace(candidate.APIKey)
+		if secret == "" {
+			continue
+		}
+		if _, duplicate := seenSecrets[secret]; duplicate {
+			continue
+		}
+		seenSecrets[secret] = struct{}{}
+
+		id := existingBySecret[secret]
+		_, usedByOther := usedByOtherPools[id]
+		_, alreadyAssigned := assignedIDs[id]
+		if !isValidAccountPoolKeyID(id) || usedByOther || alreadyAssigned {
+			var err error
+			id, err = newAccountPoolKeyID(usedIDs)
+			if err != nil {
+				return nil, err
+			}
+		}
+		usedIDs[id] = struct{}{}
+		assignedIDs[id] = struct{}{}
+		normalized = append(normalized, AccountPoolKey{ID: id, APIKey: secret})
+	}
+	return normalized, nil
+}
+
+func isValidAccountPoolKeyID(id int64) bool {
+	return id < 0 && id >= -maxAccountPoolKeyID
+}
+
+func newAccountPoolKeyID(used map[int64]struct{}) (int64, error) {
+	var randomBytes [8]byte
+	for attempt := 0; attempt < 128; attempt++ {
+		if _, err := cryptorand.Read(randomBytes[:]); err != nil {
+			return 0, fmt.Errorf("生成号池密钥 ID 失败: %w", err)
+		}
+		value := int64(binary.BigEndian.Uint64(randomBytes[:]) & uint64(maxAccountPoolKeyID))
+		if value == 0 {
+			continue
+		}
+		id := -value
+		if _, exists := used[id]; exists {
+			continue
+		}
+		return id, nil
+	}
+	return 0, errors.New("生成唯一的号池密钥 ID 失败")
 }
 
 // DeletePool 删除池子
@@ -380,6 +600,7 @@ func (s *ProviderPoolService) EnsureDefaultPool(platform string, providers []Pro
 		ID:               defaultID,
 		Platform:         platform,
 		Name:             initialPoolName,
+		PoolType:         ProviderPoolTypeNormal,
 		Mode:             seed.Mode,
 		ManualProviderID: seed.ManualProviderID,
 		Members:          members,
@@ -428,7 +649,7 @@ func (s *ProviderPoolService) EnsureDefaultPoolsForAllPlatforms(seeds map[string
 
 // ResolvePoolByID 根据 poolID 查找池子（不回退到初始池）
 // NeedsMigration 检查是否需要执行一次性迁移（从旧版本升级）
-// 返回 true 表示 store version < providerPoolsStoreVersion，需要迁移
+// 返回 true 表示尚未执行 version 2 的 relay key 显式绑定迁移。
 func (s *ProviderPoolService) NeedsMigration() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -437,7 +658,7 @@ func (s *ProviderPoolService) NeedsMigration() bool {
 	if err != nil {
 		return false
 	}
-	return store.Version < providerPoolsStoreVersion
+	return store.Version < providerPoolsBindingMigrationVersion
 }
 
 // MarkMigrationCompleted 将 store version 写入当前版本，标记迁移完成
@@ -449,6 +670,9 @@ func (s *ProviderPoolService) MarkMigrationCompleted() error {
 	store, err := s.loadLocked()
 	if err != nil {
 		return err
+	}
+	if store.Version > providerPoolsStoreVersion {
+		return newerProviderPoolStoreVersionError(store.Version)
 	}
 	store.Version = providerPoolsStoreVersion
 	return s.saveLocked(store)
@@ -522,6 +746,12 @@ func (s *ProviderPoolService) loadLocked() (*providerPoolStore, error) {
 	if store.Pools == nil {
 		store.Pools = []ProviderPool{}
 	}
+	for i := range store.Pools {
+		store.Pools[i].PoolType = normalizedProviderPoolType(store.Pools[i].PoolType)
+		if store.Pools[i].PoolType == ProviderPoolTypeNormal {
+			store.Pools[i].AccountPoolConfig = nil
+		}
+	}
 
 	return store, nil
 }
@@ -530,7 +760,19 @@ func (s *ProviderPoolService) saveLocked(store *providerPoolStore) error {
 	if err := EnsureDir(filepath.Dir(s.path)); err != nil {
 		return err
 	}
+	if store.Version > providerPoolsStoreVersion {
+		return newerProviderPoolStoreVersionError(store.Version)
+	}
+	// Do not let routine pool writes suppress the one-time relay-key binding
+	// migration. Once version 2 has been reached, writes use the latest schema.
+	if store.Version >= providerPoolsBindingMigrationVersion && store.Version < providerPoolsStoreVersion {
+		store.Version = providerPoolsStoreVersion
+	}
 	return AtomicWriteJSON(s.path, store)
+}
+
+func newerProviderPoolStoreVersionError(version int) error {
+	return fmt.Errorf("provider pool store version %d is newer than supported version %d; refusing to overwrite", version, providerPoolsStoreVersion)
 }
 
 // defaultPoolIDForPlatform 生成初始池的 ID
@@ -547,6 +789,41 @@ func defaultPoolIDForPlatform(platform string) string {
 func SelectProvidersFromPool(pool *ProviderPool, allProviders []Provider) ([]Provider, error) {
 	if pool == nil {
 		return nil, errors.New("池子不存在")
+	}
+	poolType := normalizedProviderPoolType(pool.PoolType)
+	if poolType != ProviderPoolTypeNormal && poolType != ProviderPoolTypeAccount {
+		return nil, fmt.Errorf("未知的池子类型: %s", pool.PoolType)
+	}
+	if poolType == ProviderPoolTypeAccount {
+		if pool.Platform != "openai-responses" {
+			return nil, errors.New("号池仅支持 openai-responses platform")
+		}
+		if pool.Mode != ProviderPoolModeManaged {
+			return nil, errors.New("号池只能使用 managed 托管模式")
+		}
+		if pool.AccountPoolConfig == nil {
+			return nil, errors.New("号池配置不能为空")
+		}
+
+		config := pool.AccountPoolConfig
+		selected := make([]Provider, 0, len(config.Keys))
+		for _, key := range config.Keys {
+			if !isValidAccountPoolKeyID(key.ID) || strings.TrimSpace(key.APIKey) == "" {
+				continue
+			}
+			selected = append(selected, Provider{
+				ID:                key.ID,
+				Name:              AccountPoolKeyDisplayName(key),
+				APIURL:            config.APIURL,
+				APIKey:            key.APIKey,
+				Enabled:           true,
+				ResponsesEndpoint: config.ResponsesEndpoint,
+				ModelsEndpoint:    accountPoolModelsEndpoint(config.ResponsesEndpoint),
+				Level:             1,
+				MaxConcurrency:    defaultProviderMaxConcurrency,
+			})
+		}
+		return selected, nil
 	}
 
 	providerByID := make(map[int64]Provider, len(allProviders))
@@ -599,4 +876,34 @@ func SelectProvidersFromPool(pool *ProviderPool, allProviders []Provider) ([]Pro
 	default:
 		return nil, fmt.Errorf("未知的池子模式: %s", pool.Mode)
 	}
+}
+
+// AccountPoolKeyDisplayName returns a stable, unique and secret-safe runtime provider name.
+func AccountPoolKeyDisplayName(key AccountPoolKey) string {
+	id := key.ID
+	if id < 0 {
+		id = -id
+	}
+	return fmt.Sprintf("Account Key %s (#%d)", maskAccountPoolAPIKey(key.APIKey), id)
+}
+
+func maskAccountPoolAPIKey(apiKey string) string {
+	apiKey = strings.TrimSpace(apiKey)
+	if len(apiKey) <= 4 {
+		return "****"
+	}
+	return "****" + apiKey[len(apiKey)-4:]
+}
+
+func accountPoolModelsEndpoint(responsesEndpoint string) string {
+	parsed, err := url.Parse(strings.TrimSpace(responsesEndpoint))
+	if err != nil || strings.TrimSpace(parsed.Path) == "" {
+		return "/v1/models"
+	}
+	endpointPath := strings.TrimRight("/"+strings.TrimLeft(parsed.Path, "/"), "/")
+	dir := pathpkg.Dir(endpointPath)
+	if dir == "/" || dir == "." {
+		return "/models"
+	}
+	return strings.TrimRight(dir, "/") + "/models"
 }

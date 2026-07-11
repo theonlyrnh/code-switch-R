@@ -97,7 +97,9 @@
             <td :data-label="t('components.logs.table.clientIp')" class="client-ip-cell">{{ item.client_ip || '—' }}</td>
             <td :data-label="t('components.logs.table.httpCode')" :class="['code', httpCodeClassForLog(item)]">
               <span v-if="isQueuedLog(item)" class="processing-tag queued-tag">{{ formatQueueStatus(item) }}</span>
-              <span v-else-if="isProcessingLog(item)" class="processing-tag">{{ t('components.logs.status.processing') }}</span>
+              <span v-else-if="isProcessingLog(item)" class="processing-tag">
+                {{ isRetryingLog(item) ? t('components.logs.retry.retrying') : t('components.logs.status.processing') }}
+              </span>
               <span v-else>{{ item.http_code || '—' }}</span>
             </td>
             <td :data-label="t('components.logs.table.stream')"><span :class="['stream-tag', item.is_stream ? 'on' : 'off']">{{ formatStream(item.is_stream) }}</span></td>
@@ -105,11 +107,13 @@
             <td :data-label="t('components.logs.table.duration')"><span :class="['duration-tag', durationColor(item.duration_sec)]">{{ formatDuration(item.duration_sec) }}</span></td>
             <td :data-label="t('components.logs.table.tokens')" class="token-cell">
               <div v-if="isQueuedLog(item)" class="queued-token">{{ formatQueueStatus(item) }}</div>
+              <div v-else-if="isRetryingLog(item)" class="retry-token-label" role="status">
+                {{ t('components.logs.retry.retrying') }}
+              </div>
               <button
                 v-else-if="showRetryButton(item)"
                 type="button"
                 class="retry-token-button"
-                :disabled="isRetryDisabled(item)"
                 @click="handleRetryLog(item)"
               >
                 {{ t('components.logs.retry.action') }}
@@ -219,6 +223,7 @@ import {
 } from 'chart.js'
 import type { ChartOptions } from 'chart.js'
 import { Line } from 'vue-chartjs'
+import { showToast } from '../../utils/toast'
 
 Chart.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend)
 
@@ -505,6 +510,8 @@ const countdown = ref(REFRESH_INTERVAL)
 let timer: number | undefined
 let logAutoRefreshTimer: number | undefined
 let logAutoRefreshBusy = false
+let logRefreshPending = false
+let logRefreshWaiters: Array<() => void> = []
 let lastLogsSignature = ''
 
 const resetTimer = () => {
@@ -589,6 +596,42 @@ const logSignature = (item: RequestLog) => [
 
 const logsSignature = (items: RequestLog[]) => items.map(logSignature).join('\n')
 
+const isPositiveDuration = (value?: number): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0
+
+const hasFirstResponse = (item: RequestLog) => {
+  return isPositiveDuration(item.first_text_sec) || isPositiveDuration(item.first_token_duration_sec)
+}
+
+const isQueuedLog = (item: RequestLog) => item.status === 'queued'
+
+const isProcessingLog = (item: RequestLog) => item.status === 'processing' || item.status === 'retrying'
+
+const isActiveLog = (item: RequestLog) => isQueuedLog(item) || isProcessingLog(item)
+
+const isRetryingLog = (item: RequestLog) => {
+  if (!isProcessingLog(item)) return false
+  return item.retry_requested === true
+    || item.status === 'retrying'
+    || item.error_message === '重试'
+    || retryingLogIds.value.has(item.id)
+}
+
+const reconcileRetryingLogs = (items: RequestLog[]) => {
+  if (!retryingLogIds.value.size) return
+
+  const logsByID = new Map(items.map((item) => [item.id, item]))
+  const next = new Set(retryingLogIds.value)
+  for (const id of retryingLogIds.value) {
+    const item = logsByID.get(id)
+    if (!item || hasFirstResponse(item) || !isActiveLog(item)) {
+      next.delete(id)
+    }
+  }
+  if (next.size !== retryingLogIds.value.size) {
+    retryingLogIds.value = next
+  }
+}
+
 const loadLogs = async () => {
   loading.value = true
   try {
@@ -597,39 +640,68 @@ const loadLogs = async () => {
       provider: filters.provider,
       limit: 200,
     })
-    logs.value = data ?? []
+    const nextLogs = data ?? []
+    reconcileRetryingLogs(nextLogs)
+    logs.value = nextLogs
     lastLogsSignature = logsSignature(logs.value)
     page.value = Math.min(page.value, totalPages.value)
   } catch (error) {
     console.error('failed to load request logs', error)
   } finally {
     loading.value = false
+    if (logRefreshPending) {
+      void refreshLogsIfChanged()
+    }
   }
 }
 
-const refreshLogsIfChanged = async () => {
-  if (logAutoRefreshBusy || loading.value) return
+const refreshLogsIfChanged = async (force = false) => {
+  let forceRefreshCompleted: Promise<void> | undefined
+  if (force) {
+    logRefreshPending = true
+    forceRefreshCompleted = new Promise((resolve) => {
+      logRefreshWaiters.push(resolve)
+    })
+  }
+  if (logAutoRefreshBusy || loading.value) {
+    await forceRefreshCompleted
+    return
+  }
+
   logAutoRefreshBusy = true
   try {
-    const data = await fetchRequestLogs({
-      platform: filters.platform,
-      provider: filters.provider,
-      limit: 200,
-    })
-    const nextLogs = data ?? []
-    const nextSignature = logsSignature(nextLogs)
-    if (nextSignature !== lastLogsSignature) {
-      logs.value = nextLogs
-      lastLogsSignature = nextSignature
-      page.value = Math.min(page.value, totalPages.value)
-      syncProviderOptionsFromLogs(nextLogs)
-      void loadStats()
-    }
-  } catch (error) {
-    console.error('failed to auto refresh request logs', error)
+    do {
+      logRefreshPending = false
+      const refreshWaiters = logRefreshWaiters.splice(0)
+      try {
+        const data = await fetchRequestLogs({
+          platform: filters.platform,
+          provider: filters.provider,
+          limit: 200,
+        })
+        const nextLogs = data ?? []
+        reconcileRetryingLogs(nextLogs)
+        const nextSignature = logsSignature(nextLogs)
+        if (nextSignature !== lastLogsSignature) {
+          logs.value = nextLogs
+          lastLogsSignature = nextSignature
+          page.value = Math.min(page.value, totalPages.value)
+          syncProviderOptionsFromLogs(nextLogs)
+          void loadStats()
+        }
+      } catch (error) {
+        console.error('failed to auto refresh request logs', error)
+      } finally {
+        refreshWaiters.forEach((resolve) => resolve())
+      }
+    } while (logRefreshPending && !loading.value)
   } finally {
     logAutoRefreshBusy = false
+    if (logRefreshPending && !loading.value) {
+      void refreshLogsIfChanged()
+    }
   }
+  await forceRefreshCompleted
 }
 
 const loadStats = async () => {
@@ -712,56 +784,63 @@ const formatDuration = (value?: number) => {
   return `${value.toFixed(2)}s`
 }
 
-const isQueuedLog = (item: RequestLog) => item.status === 'queued'
-
-const isProcessingLog = (item: RequestLog) => item.status === 'processing' || item.status === 'retrying'
-
-const isActiveLog = (item: RequestLog) => isQueuedLog(item) || isProcessingLog(item)
-
-const isRetryLog = (item: RequestLog) => {
-  return item.retry_requested === true || item.status === 'retrying' || item.error_message === '重试' || retryingLogIds.value.has(item.id)
-}
-
-const isPositiveDuration = (value?: number): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0
-
-const hasFirstToken = (item: RequestLog) => isPositiveDuration(item.first_token_duration_sec)
-
 const showRetryButton = (item: RequestLog) => {
-  return isProcessingLog(item) && !isRetryLog(item)
-}
-
-const isRetryDisabled = (item: RequestLog) => {
-  return hasFirstToken(item)
+  return isProcessingLog(item) && !isRetryingLog(item) && !hasFirstResponse(item)
 }
 
 const canRetryLog = (item: RequestLog) => {
-  return showRetryButton(item) && !isRetryDisabled(item)
+  return showRetryButton(item)
 }
 
 const markRetryingLog = (id: number) => {
   retryingLogIds.value = new Set([...retryingLogIds.value, id])
+  lastLogsSignature = logsSignature(logs.value)
 }
 
 const clearRetryingLog = (id: number) => {
   const next = new Set(retryingLogIds.value)
   next.delete(id)
   retryingLogIds.value = next
+  lastLogsSignature = logsSignature(logs.value)
+}
+
+const clearRetryingLogIfSettled = (id: number) => {
+  const item = logs.value.find((log) => log.id === id)
+  if (!item || !isProcessingLog(item) || hasFirstResponse(item)) {
+    clearRetryingLog(id)
+  }
 }
 
 const markLogFirstTokenSeen = (id: number, firstTokenSec?: number, firstTextSec?: number) => {
-  const fallbackFirstTokenSec = isPositiveDuration(firstTokenSec) ? firstTokenSec : 0.001
-  const fallbackFirstTextSec = isPositiveDuration(firstTextSec) ? firstTextSec : fallbackFirstTokenSec
+  if (!isPositiveDuration(firstTokenSec) && !isPositiveDuration(firstTextSec)) return
+
   logs.value = logs.value.map((log) => {
     if (log.id !== id) return log
-    const firstTokenValue = hasFirstToken(log) ? log.first_token_duration_sec : fallbackFirstTokenSec
-    const firstTextValue = isPositiveDuration(log.first_text_sec) ? log.first_text_sec : fallbackFirstTextSec
     return {
       ...log,
-      first_token_duration_sec: firstTokenValue,
-      first_text_sec: firstTextValue,
+      first_token_duration_sec: isPositiveDuration(firstTokenSec) ? firstTokenSec : log.first_token_duration_sec,
+      first_text_sec: isPositiveDuration(firstTextSec) ? firstTextSec : log.first_text_sec,
     }
   })
   lastLogsSignature = logsSignature(logs.value)
+}
+
+const retryRejectedMessage = (status?: string) => {
+  switch (status) {
+    case 'ignored_finished':
+      return t('components.logs.retry.finished')
+    case 'ignored_first_text':
+    case 'ignored_response_started':
+      return t('components.logs.retry.responseStarted')
+    case 'ignored_unauthorized':
+      return t('components.logs.retry.unauthorized')
+    case 'ignored_queued':
+      return t('components.logs.retry.queued')
+    case 'ignored_transition':
+      return t('components.logs.retry.transition')
+    default:
+      return t('components.logs.retry.rejected', { status: status || t('components.logs.retry.unknownStatus') })
+  }
 }
 
 const handleRetryLog = async (item: RequestLog) => {
@@ -770,15 +849,27 @@ const handleRetryLog = async (item: RequestLog) => {
   try {
     const result = await retryActiveRequest(item.id)
     if (result?.status !== 'retried') {
-      clearRetryingLog(item.id)
       if (result?.status === 'ignored_first_text' || result?.status === 'ignored_response_started') {
         markLogFirstTokenSeen(item.id, result.first_token_duration_sec, result.first_text_sec)
       }
+      showToast(retryRejectedMessage(result?.status), 'warning')
+      await refreshLogsIfChanged(true)
+      if (result?.status === 'ignored_transition') {
+        clearRetryingLog(item.id)
+      } else {
+        clearRetryingLogIfSettled(item.id)
+      }
+      return
     }
-    await refreshLogsIfChanged()
+    await refreshLogsIfChanged(true)
   } catch (error) {
     console.error('failed to retry active request', error)
     clearRetryingLog(item.id)
+    const message = error instanceof Error && error.message
+      ? error.message
+      : t('components.logs.retry.failed')
+    showToast(message, 'error')
+    await refreshLogsIfChanged(true)
   }
 }
 
@@ -846,7 +937,6 @@ const formatTokenNumber = (value?: number) => {
 
 const formatLogTokenNumber = (item: RequestLog, value?: number) => {
   if (isQueuedLog(item)) return formatQueueStatus(item)
-  if (isRetryLog(item)) return '0'
   if (isProcessingLog(item)) return '—'
   return formatTokenNumber(value)
 }

@@ -1,10 +1,12 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +17,70 @@ import (
 	"github.com/daodao97/xgo/xrequest"
 	"github.com/tidwall/gjson"
 )
+
+func TestCodexEmptyStreamRetryDelayCanBeCancelledByUserRetry(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	requestLog := &ReqeustLog{Platform: "openai-responses", Provider: "provider-a"}
+	requestLog.startedAt = time.Now()
+	requestLog.ActiveRequestID = defaultActiveRequestTracker.Start(requestLog, requestLog.startedAt)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- waitBeforeCodexEmptyStreamRetryForRequest(context.Background(), requestLog)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		result := defaultActiveRequestTracker.Retry(-requestLog.ActiveRequestID, "")
+		if result.Status == activeRequestRetryTriggered {
+			break
+		}
+		if result.Status != activeRequestRetryIgnoredTransition || time.Now().After(deadline) {
+			t.Fatalf("retry delay status = %q, want eventual %q", result.Status, activeRequestRetryTriggered)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errActiveRequestRetryRequested) {
+			t.Fatalf("retry delay error = %v, want %v", err, errActiveRequestRetryRequested)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("user retry did not interrupt the empty-stream retry delay")
+	}
+}
+
+func TestStreamingLineDoesNotWriteAfterUserRetryWins(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	requestLog := &ReqeustLog{Platform: "openai-responses", Provider: "provider-a"}
+	requestLog.startedAt = time.Now()
+	requestLog.ActiveRequestID = defaultActiveRequestTracker.Start(requestLog, requestLog.startedAt)
+	defaultActiveRequestTracker.RegisterCancel(requestLog.ActiveRequestID, func() {})
+	if result := defaultActiveRequestTracker.Retry(-requestLog.ActiveRequestID, ""); result.Status != activeRequestRetryTriggered {
+		t.Fatalf("retry status = %q, want %q", result.Status, activeRequestRetryTriggered)
+	}
+
+	w := httptest.NewRecorder()
+	line := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"old attempt\"}\n")
+	_, err := writeStreamingLine(w, line, requestLog, ReqeustLogHook(nil, "openai-responses", requestLog))
+	if !errors.Is(err, errActiveRequestRetryRequested) {
+		t.Fatalf("stream write error = %v, want %v", err, errActiveRequestRetryRequested)
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("old attempt wrote data after retry: %q", w.Body.String())
+	}
+}
 
 func TestResolveRelayEndpointUsesProtocolSpecificEndpoint(t *testing.T) {
 	relay := &ProviderRelayService{}
@@ -359,6 +425,9 @@ func TestShouldUseCodexStreamGuardOnlyForResponses(t *testing.T) {
 	}
 	if relay.shouldUseCodexStreamGuard("codex", "/chat/completions") {
 		t.Fatalf("expected Codex Chat Completions to bypass stream guard")
+	}
+	if !relay.shouldUseCodexStreamGuard("openai-responses", "/custom/codex") {
+		t.Fatalf("expected OpenAI Responses custom endpoints to use the stream guard")
 	}
 	if relay.shouldUseCodexStreamGuard("claude", "/v1/responses") {
 		t.Fatalf("expected non-Codex streams to bypass Codex stream guard")

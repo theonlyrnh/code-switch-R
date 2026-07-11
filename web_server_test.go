@@ -80,3 +80,26 @@ func TestFetchProviderFaviconSkipsHTMLFaviconICO(t *testing.T) {
 		t.Fatal("favicon data mismatch")
 	}
 }
+
+func TestEventVisibleToUser(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload any
+		userID  string
+		want    bool
+	}{
+		{name: "matching user", payload: map[string]interface{}{"userID": "user-a"}, userID: "user-a", want: true},
+		{name: "different user", payload: map[string]interface{}{"userID": "user-b"}, userID: "user-a", want: false},
+		{name: "global event", payload: map[string]interface{}{"userID": ""}, userID: "user-a", want: true},
+		{name: "legacy event", payload: map[string]interface{}{"platform": "openai-responses"}, userID: "user-a", want: true},
+		{name: "non-map event", payload: "ready", userID: "user-a", want: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := eventVisibleToUser(test.payload, test.userID); got != test.want {
+				t.Fatalf("eventVisibleToUser() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}

@@ -318,7 +318,7 @@ func (prs *ProviderRelayService) shouldUseCodexStreamGuard(kind, endpoint string
 	// openai-responses 走 stream guard（Codex 客户端走这个端点）
 	// openai-chat 不走 stream guard
 	if kind == "openai-responses" {
-		return isResponsesEndpoint(endpoint) && prs.isCodexStreamGuardEnabled()
+		return prs.isCodexStreamGuardEnabled()
 	}
 	return strings.EqualFold(kind, "codex") && isResponsesEndpoint(endpoint) && prs.isCodexStreamGuardEnabled()
 }
@@ -500,16 +500,21 @@ func (prs *ProviderRelayService) recordProviderFailureForUser(userID, platform, 
 	if pool.Mode != ProviderPoolModeManaged {
 		return false
 	}
-	if !pool.AutoBlacklistEnabled {
+	isAccountPool := normalizedProviderPoolType(pool.PoolType) == ProviderPoolTypeAccount
+	if !isAccountPool && !pool.AutoBlacklistEnabled {
 		return false
 	}
 	threshold := pool.AutoBlacklistThreshold
 	if threshold <= 0 {
 		threshold = 3
+	} else if isAccountPool && threshold > maxAccountPoolBlacklistThreshold {
+		threshold = maxAccountPoolBlacklistThreshold
 	}
 	durationMinutes := pool.AutoBlacklistDurationMinutes
 	if durationMinutes <= 0 {
 		durationMinutes = 10
+	} else if isAccountPool && durationMinutes > maxAccountPoolBlacklistDurationMinutes {
+		durationMinutes = maxAccountPoolBlacklistDurationMinutes
 	}
 
 	key := penaltyKey(userID, platform, poolID, provider.ID)
@@ -592,6 +597,8 @@ func (prs *ProviderRelayService) clearProviderBlacklist(platform, poolID string,
 // listProviderBlacklistStatusForUser returns penalty entries for providers that are
 // currently blacklisted (BlacklistedUntil non-zero and not expired).
 func (prs *ProviderRelayService) listProviderBlacklistStatusForUser(userID, platform, poolID string) []ProviderPoolProviderPenalty {
+	validProviderIDs, filterStale := prs.providerIDsInPoolForUser(userID, platform, poolID)
+
 	prs.poolPenaltyMu.Lock()
 	defer prs.poolPenaltyMu.Unlock()
 	now := time.Now()
@@ -602,12 +609,61 @@ func (prs *ProviderRelayService) listProviderBlacklistStatusForUser(userID, plat
 		if !strings.HasPrefix(key, prefix) {
 			continue
 		}
-		if p.BlacklistedUntil.IsZero() || now.After(p.BlacklistedUntil) {
+		if filterStale {
+			if _, ok := validProviderIDs[p.ProviderID]; !ok {
+				delete(prs.poolPenalties, key)
+				continue
+			}
+		}
+		if p.BlacklistedUntil.IsZero() {
+			continue
+		}
+		if now.After(p.BlacklistedUntil) {
+			delete(prs.poolPenalties, key)
 			continue
 		}
 		result = append(result, *p)
 	}
 	return result
+}
+
+// providerIDsInPoolForUser returns every provider identity still owned by the
+// pool. SelectProvidersFromPool also supplies runtime-only providers, such as
+// account-pool keys, while Members preserves disabled normal-pool members.
+func (prs *ProviderRelayService) providerIDsInPoolForUser(userID, platform, poolID string) (map[int64]struct{}, bool) {
+	if prs == nil || prs.poolService == nil {
+		return nil, false
+	}
+
+	var (
+		pool *ProviderPool
+		err  error
+	)
+	if strings.TrimSpace(userID) != "" {
+		pool, err = prs.poolService.ResolvePoolByIDForUser(userID, poolID)
+	} else {
+		pool, err = prs.poolService.ResolvePoolByID(poolID)
+	}
+	if err != nil || pool == nil || pool.Platform != platform {
+		return nil, false
+	}
+
+	valid := make(map[int64]struct{}, len(pool.Members))
+	for _, member := range pool.Members {
+		valid[member.ProviderID] = struct{}{}
+	}
+	if normalizedProviderPoolType(pool.PoolType) != ProviderPoolTypeAccount {
+		return valid, true
+	}
+
+	selected, err := SelectProvidersFromPool(pool, nil)
+	if err != nil {
+		return nil, false
+	}
+	for _, provider := range selected {
+		valid[provider.ID] = struct{}{}
+	}
+	return valid, true
 }
 
 // listProviderBlacklistStatus returns penalty entries for providers that are
@@ -984,6 +1040,7 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 		}()
 
 		totalAttempts := 0
+		var retryTargetProviderID int64
 		for selectionRound := 0; ; selectionRound++ {
 			if selectionRound > 0 {
 				fmt.Printf("[INFO] 重新读取当前池子和 provider 配置\n")
@@ -1026,6 +1083,16 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 			pool := plan.pool
 			poolID := plan.poolID
 			userID := plan.userID
+			if retryTargetProviderID != 0 && !providerIDInProviders(plan.active, retryTargetProviderID) {
+				currentLog := ensureRequestLog()
+				currentLog.HttpCode = http.StatusServiceUnavailable
+				currentLog.ErrorMessage = "重试目标 provider 当前不可用"
+				if queueItem != nil && prs.concurrencyLimiter != nil {
+					prs.completeQueueWakeAndReserveNext(queueItem.UserID, queueItem.Platform, providerQueueKey(queueItem.UserID, queueItem.Platform, queueItem.PoolID), queueItem.RequestID)
+				}
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": currentLog.ErrorMessage})
+				return
+			}
 
 			fmt.Printf("[INFO] 池子模式: %s/%s (模式: %s, 成员: %d)\n", kind, pool.Name, pool.Mode, len(pool.Members))
 
@@ -1061,6 +1128,14 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 			currentLog := ensureRequestLog()
 			queueKey := providerQueueKey(userID, kind, poolID)
 			candidateProviders := providersFromAttemptPlan(plan)
+			if retryTargetProviderID != 0 {
+				for _, candidate := range candidateProviders {
+					if candidate.ID == retryTargetProviderID {
+						candidateProviders = []Provider{candidate}
+						break
+					}
+				}
+			}
 			candidateProviderIDs := providerIDsFromProviders(candidateProviders)
 			if queueItem != nil && queueItem.FlexibleProvider {
 				prs.refreshFlexibleQueueReservation(userID, kind, currentLog.ActiveRequestID, candidateProviders)
@@ -1122,6 +1197,9 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 				fmt.Printf("[INFO] === 尝试 Level %d（%d 个 provider）===\n", level, len(providersInLevel))
 
 				for i, provider := range providersInLevel {
+					if retryTargetProviderID != 0 && provider.ID != retryTargetProviderID {
+						continue
+					}
 					if reservedProviderID != 0 && provider.ID != reservedProviderID {
 						continue
 					}
@@ -1170,12 +1248,15 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 					// 尝试发送请求
 					// 获取有效的端点（用户配置优先）
 					effectiveEndpoint := prs.resolveRelayEndpoint(kind, provider, endpoint)
+					retryTargetProviderID = 0
 					startTime := time.Now()
 					ok, err := prs.forwardRequestWithLog(c, kind, provider, effectiveEndpoint, query, clientHeaders, currentBodyBytes, isStream, effectiveModel, currentLog)
 					duration := time.Since(startTime)
 					if errors.Is(err, errActiveRequestRetryRequested) {
-						fmt.Printf("[INFO] 用户触发重试，放弃当前 provider 并重新选择: Provider=%s | Model=%s\n", provider.Name, effectiveModel)
+						fmt.Printf("[INFO] 用户触发重试，重新请求当前 provider: Provider=%s | Model=%s\n", provider.Name, effectiveModel)
 						releaseProviderSlot(false)
+						retryProviders := []Provider{provider}
+						retryProviderIDs := []int64{provider.ID}
 						if queueItem == nil {
 							queueItem = &ProviderQueueItem{
 								RequestID:   currentLog.ActiveRequestID,
@@ -1183,16 +1264,16 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 								Platform:    kind,
 								PoolID:      poolID,
 								Model:       requestedModel,
-								Providers:   candidateProviders,
-								ProviderIDs: candidateProviderIDs,
+								Providers:   retryProviders,
+								ProviderIDs: retryProviderIDs,
 							}
 						}
-						retryProviders, retryProviderIDs := prs.currentProviderQueueCandidates(c, kind, requestedModel, candidateProviders)
 						refreshProviderQueueItem(queueItem, userID, kind, poolID, requestedModel, retryProviders, retryProviderIDs)
-						queueItem.FlexibleProvider = true
-						if !prs.waitForProviderQueueTurn(c, queueItem, currentLog, false, nil, true) {
+						queueItem.FlexibleProvider = false
+						if !prs.waitForProviderQueueTurn(c, queueItem, currentLog, false, retryProviders, false) {
 							return
 						}
+						retryTargetProviderID = provider.ID
 						retryRequested = true
 						break
 					}
@@ -1205,8 +1286,10 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 						totalAttempts += retryAttempts
 						duration += retryDuration
 						if errors.Is(err, errActiveRequestRetryRequested) {
-							fmt.Printf("[INFO] 用户在空流保护重试期间触发重试，放弃当前 provider 并重新选择: Provider=%s\n", provider.Name)
+							fmt.Printf("[INFO] 用户在空流保护重试期间触发重试，重新请求当前 provider: Provider=%s\n", provider.Name)
 							releaseProviderSlot(false)
+							retryProviders := []Provider{provider}
+							retryProviderIDs := []int64{provider.ID}
 							if queueItem == nil {
 								queueItem = &ProviderQueueItem{
 									RequestID:   currentLog.ActiveRequestID,
@@ -1214,16 +1297,16 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 									Platform:    kind,
 									PoolID:      poolID,
 									Model:       requestedModel,
-									Providers:   candidateProviders,
-									ProviderIDs: candidateProviderIDs,
+									Providers:   retryProviders,
+									ProviderIDs: retryProviderIDs,
 								}
 							}
-							retryProviders, retryProviderIDs := prs.currentProviderQueueCandidates(c, kind, requestedModel, candidateProviders)
 							refreshProviderQueueItem(queueItem, userID, kind, poolID, requestedModel, retryProviders, retryProviderIDs)
-							queueItem.FlexibleProvider = true
-							if !prs.waitForProviderQueueTurn(c, queueItem, currentLog, false, nil, true) {
+							queueItem.FlexibleProvider = false
+							if !prs.waitForProviderQueueTurn(c, queueItem, currentLog, false, retryProviders, false) {
 								return
 							}
+							retryTargetProviderID = provider.ID
 							retryRequested = true
 							break
 						}
@@ -1242,13 +1325,20 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 					}
 
 					// 失败：记录错误并尝试下一个
-					lastError = err
 					lastProvider = provider.Name
 					lastDuration = duration
 
 					errorMsg := "未知错误"
 					if err != nil {
-						errorMsg = err.Error()
+						errorMsg = redactProviderSecret(err.Error(), provider)
+						if errorMsg == err.Error() {
+							lastError = err
+						} else {
+							lastError = errors.New(errorMsg)
+						}
+					}
+					if currentLog != nil {
+						currentLog.ErrorMessage = redactProviderSecret(currentLog.ErrorMessage, provider)
 					}
 					fmt.Printf("[WARN]   ✗ Level %d 失败: %s | 错误: %s | 耗时: %.2fs\n",
 						level, provider.Name, errorMsg, duration.Seconds())
@@ -1279,6 +1369,7 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 						nextProvider := nextProviderNameAfterIndex(plan.levels, plan.levelGroups, level, i)
 						if nextProvider != "" {
 							prs.notificationService.NotifyProviderSwitch(SwitchNotification{
+								UserID:       userID,
 								FromProvider: provider.Name,
 								ToProvider:   nextProvider,
 								Reason:       errorMsg,
@@ -1524,16 +1615,6 @@ func (prs *ProviderRelayService) refreshFlexibleQueueReservation(userID, platfor
 	}
 }
 
-func (prs *ProviderRelayService) currentProviderQueueCandidates(c *gin.Context, kind, requestedModel string, fallback []Provider) ([]Provider, []int64) {
-	providers := fallback
-	if currentPlan, _, err := prs.buildProviderAttemptPlan(c, kind, requestedModel); err == nil {
-		if currentProviders := providersFromAttemptPlan(currentPlan); len(currentProviders) > 0 {
-			providers = currentProviders
-		}
-	}
-	return providers, providerIDsFromProviders(providers)
-}
-
 func refreshProviderQueueItem(item *ProviderQueueItem, userID, platform, poolID, model string, providers []Provider, providerIDs []int64) {
 	if item == nil {
 		return
@@ -1620,7 +1701,7 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 	isStream bool,
 	model string,
 	requestLog *ReqeustLog,
-) (bool, error) {
+) (ok bool, err error) {
 	targetURL := joinURL(provider.APIURL, endpoint)
 	headers := cloneMap(clientHeaders)
 
@@ -1681,9 +1762,15 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 	}
 	requestLog.prepareProviderAttempt(c, kind, provider, model, isStream)
 	activeRequestID := requestLog.ActiveRequestID
-	defaultActiveRequestTracker.RegisterCancel(activeRequestID, requestCancel)
+	cancelGeneration := defaultActiveRequestTracker.RegisterCancel(activeRequestID, requestCancel)
 	defer func() {
+		retryRequested := defaultActiveRequestTracker.UnregisterCancel(activeRequestID, cancelGeneration)
 		requestCancel()
+		if retryRequested && !errors.Is(err, errActiveRequestRetryRequested) {
+			requestLog.markRetryRequested()
+			ok = false
+			err = errActiveRequestRetryRequested
+		}
 	}()
 	defaultActiveRequestTracker.Update(requestLog.ActiveRequestID, requestLog)
 
@@ -1714,11 +1801,12 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 		// 尝试从响应体提取供应商原始错误信息
 		if resp != nil {
 			if upstreamBody := extractUpstreamError(resp); upstreamBody != "" {
+				upstreamBody = redactProviderSecret(upstreamBody, provider)
 				requestLog.ErrorMessage = summarizeBodyForError(upstreamBody, 1000)
 				return false, fmt.Errorf("upstream status %d: %s", resp.StatusCode(), upstreamBody)
 			}
 		}
-		requestLog.ErrorMessage = summarizeBodyForError(err.Error(), 1000)
+		requestLog.ErrorMessage = summarizeBodyForError(redactProviderSecret(err.Error(), provider), 1000)
 		return false, err
 	}
 
@@ -1741,6 +1829,7 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 				errMsg = upstreamBody
 			}
 		}
+		errMsg = redactProviderSecret(errMsg, provider)
 		if errMsg != "" {
 			requestLog.ErrorMessage = summarizeBodyForError(errMsg, 1000)
 			return false, fmt.Errorf("upstream status %d: %s", status, errMsg)
@@ -1999,6 +2088,23 @@ func waitBeforeCodexEmptyStreamRetry(ctx context.Context) error {
 	}
 }
 
+func waitBeforeCodexEmptyStreamRetryForRequest(ctx context.Context, requestLog *ReqeustLog) error {
+	waitCtx, cancel := context.WithCancel(ctx)
+	activeRequestID := int64(0)
+	if requestLog != nil {
+		activeRequestID = requestLog.ActiveRequestID
+	}
+	generation := defaultActiveRequestTracker.RegisterCancel(activeRequestID, cancel)
+	waitErr := waitBeforeCodexEmptyStreamRetry(waitCtx)
+	retryRequested := defaultActiveRequestTracker.UnregisterCancel(activeRequestID, generation)
+	cancel()
+	if retryRequested {
+		requestLog.markRetryRequested()
+		return errActiveRequestRetryRequested
+	}
+	return waitErr
+}
+
 func (prs *ProviderRelayService) retryCodexEmptyStreamSameProvider(
 	c *gin.Context,
 	kind string,
@@ -2026,7 +2132,10 @@ func (prs *ProviderRelayService) retryCodexEmptyStreamSameProvider(
 	}
 
 	for {
-		if err := waitBeforeCodexEmptyStreamRetry(c.Request.Context()); err != nil {
+		if err := waitBeforeCodexEmptyStreamRetryForRequest(c.Request.Context(), requestLog); err != nil {
+			if errors.Is(err, errActiveRequestRetryRequested) {
+				return false, provider, err, attempts, totalDuration, false
+			}
 			return false, provider, fmt.Errorf("%w: %v", errClientAbort, err), attempts, totalDuration, false
 		}
 
@@ -2173,6 +2282,20 @@ func summarizeBodyForError(body string, maxLen int) string {
 		return body
 	}
 	return body[:maxLen] + "..."
+}
+
+func redactProviderSecret(value string, provider Provider) string {
+	if !isValidAccountPoolKeyID(provider.ID) {
+		return value
+	}
+	secrets := []string{provider.APIKey, strings.TrimSpace(provider.APIKey)}
+	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
+		value = strings.ReplaceAll(value, secret, "[REDACTED]")
+	}
+	return value
 }
 
 func writeStreamingResponse(w http.ResponseWriter, resp *xrequest.Response, requestLog *ReqeustLog, hooks ...xrequest.ResponseHook) (int64, error) {
@@ -2497,6 +2620,10 @@ func writeStreamingLine(w http.ResponseWriter, line []byte, requestLog *ReqeustL
 			processedLine = append(processedLine, '\n')
 		}
 		outputLine = processedLine
+	}
+	if requestLog != nil && defaultActiveRequestTracker.IsRetryRequested(requestLog.ActiveRequestID) {
+		requestLog.markRetryRequested()
+		return 0, errActiveRequestRetryRequested
 	}
 
 	n, err := w.Write(outputLine)
@@ -3323,13 +3450,17 @@ func (prs *ProviderRelayService) customCliProxyHandler() gin.HandlerFunc {
 					return
 				}
 
-				lastError = err
 				lastProvider = provider.Name
 				lastDuration = duration
 
 				errorMsg := "未知错误"
 				if err != nil {
-					errorMsg = err.Error()
+					errorMsg = redactProviderSecret(err.Error(), provider)
+					if errorMsg == err.Error() {
+						lastError = err
+					} else {
+						lastError = errors.New(errorMsg)
+					}
 				}
 				fmt.Printf("[CustomCLI][WARN]   ✗ Level %d 失败: %s | 错误: %s | 耗时: %.2fs\n",
 					level, provider.Name, errorMsg, duration.Seconds())
@@ -3354,6 +3485,7 @@ func (prs *ProviderRelayService) customCliProxyHandler() gin.HandlerFunc {
 					}
 					if nextProvider != "" {
 						prs.notificationService.NotifyProviderSwitch(SwitchNotification{
+							UserID:       relayUserIDFromContext(c),
 							FromProvider: provider.Name,
 							ToProvider:   nextProvider,
 							Reason:       errorMsg,
@@ -3652,7 +3784,18 @@ func (prs *ProviderRelayService) forwardModelsRequest(
 			}
 
 			if fetchErr == nil && response != nil {
-				bodySummary := summarizeBodyForError(string(response.body), 1000)
+				redactedBody := redactProviderSecret(string(response.body), provider)
+				if redactedBody != string(response.body) {
+					response.body = []byte(redactedBody)
+					response.header.Del("Content-Length")
+				}
+				for headerName, values := range response.header {
+					for valueIndex, value := range values {
+						values[valueIndex] = redactProviderSecret(value, provider)
+					}
+					response.header[headerName] = values
+				}
+				bodySummary := summarizeBodyForError(redactedBody, 1000)
 				fetchErr = fmt.Errorf("upstream status %d: %s", response.statusCode, bodySummary)
 			}
 			if fetchErr == nil {
@@ -3660,6 +3803,10 @@ func (prs *ProviderRelayService) forwardModelsRequest(
 			}
 			if errors.Is(fetchErr, errClientAbort) {
 				return fetchErr
+			}
+			redactedFetchError := redactProviderSecret(fetchErr.Error(), provider)
+			if redactedFetchError != fetchErr.Error() {
+				fetchErr = errors.New(redactedFetchError)
 			}
 			lastErr = fetchErr
 			fmt.Printf("[%s][WARN] Provider %s 模型列表失败: %v\n", logPrefix, provider.Name, fetchErr)
@@ -3676,6 +3823,7 @@ func (prs *ProviderRelayService) forwardModelsRequest(
 
 			if prs.notificationService != nil && i+1 < len(providers) {
 				prs.notificationService.NotifyProviderSwitch(SwitchNotification{
+					UserID:       plan.userID,
 					FromProvider: provider.Name,
 					ToProvider:   providers[i+1].Name,
 					Reason:       fetchErr.Error(),

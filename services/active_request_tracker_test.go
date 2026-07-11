@@ -133,6 +133,74 @@ func TestActiveRequestTrackerRetryCancelsAndMarksLog(t *testing.T) {
 	}
 }
 
+func TestActiveRequestTrackerRetryIsIdempotentForCurrentAttempt(t *testing.T) {
+	tracker := newActiveRequestTracker()
+	activeID := tracker.Start(&ReqeustLog{UserID: "user-a", Provider: "provider-a"}, time.Now())
+	cancelCalls := 0
+	tracker.RegisterCancel(activeID, func() { cancelCalls++ })
+
+	for i := 0; i < 2; i++ {
+		if result := tracker.Retry(-activeID, "user-a"); result.Status != activeRequestRetryTriggered {
+			t.Fatalf("retry %d status = %q, want %q", i+1, result.Status, activeRequestRetryTriggered)
+		}
+	}
+	if cancelCalls != 1 {
+		t.Fatalf("cancel calls = %d, want one for repeated retry", cancelCalls)
+	}
+}
+
+func TestActiveRequestTrackerCancelRegistrationGeneration(t *testing.T) {
+	tracker := newActiveRequestTracker()
+	activeID := tracker.Start(&ReqeustLog{UserID: "user-a", Provider: "provider-a"}, time.Now())
+	firstCancelCalls := 0
+	secondCancelCalls := 0
+	firstGeneration := tracker.RegisterCancel(activeID, func() { firstCancelCalls++ })
+	secondGeneration := tracker.RegisterCancel(activeID, func() { secondCancelCalls++ })
+
+	tracker.UnregisterCancel(activeID, firstGeneration)
+	if result := tracker.Retry(-activeID, "user-a"); result.Status != activeRequestRetryTriggered {
+		t.Fatalf("retry status = %q, want %q", result.Status, activeRequestRetryTriggered)
+	}
+	if firstCancelCalls != 0 || secondCancelCalls != 1 {
+		t.Fatalf("cancel calls = (%d, %d), want (0, 1)", firstCancelCalls, secondCancelCalls)
+	}
+
+	tracker.UnregisterCancel(activeID, secondGeneration)
+}
+
+func TestActiveRequestTrackerRetryDuringAttemptGapIsRejected(t *testing.T) {
+	tracker := newActiveRequestTracker()
+	activeID := tracker.Start(&ReqeustLog{UserID: "user-a", Provider: "provider-a"}, time.Now())
+	staleCancelCalls := 0
+	staleGeneration := tracker.RegisterCancel(activeID, func() { staleCancelCalls++ })
+	tracker.UnregisterCancel(activeID, staleGeneration)
+
+	if result := tracker.Retry(-activeID, "user-a"); result.Status != activeRequestRetryIgnoredTransition {
+		t.Fatalf("gap retry status = %q, want %q", result.Status, activeRequestRetryIgnoredTransition)
+	}
+	if staleCancelCalls != 0 {
+		t.Fatalf("gap retry called stale cancel %d times, want 0", staleCancelCalls)
+	}
+	if tracker.IsRetryRequested(activeID) {
+		t.Fatal("rejected transition retry left a pending retry")
+	}
+}
+
+func TestActiveRequestTrackerUnregisterReportsPendingRetry(t *testing.T) {
+	tracker := newActiveRequestTracker()
+	activeID := tracker.Start(&ReqeustLog{UserID: "user-a", Provider: "provider-a"}, time.Now())
+	generation := tracker.RegisterCancel(activeID, func() {})
+	if result := tracker.Retry(-activeID, "user-a"); result.Status != activeRequestRetryTriggered {
+		t.Fatalf("retry status = %q, want %q", result.Status, activeRequestRetryTriggered)
+	}
+	if !tracker.UnregisterCancel(activeID, generation) {
+		t.Fatal("unregister did not report a pending retry")
+	}
+	if result := tracker.Retry(-activeID, "user-a"); result.Status != activeRequestRetryTriggered {
+		t.Fatalf("idempotent pending retry status = %q, want %q", result.Status, activeRequestRetryTriggered)
+	}
+}
+
 func TestActiveRequestTrackerQueuedStateAndRetryNoop(t *testing.T) {
 	tracker := newActiveRequestTracker()
 	firstID := tracker.Start(&ReqeustLog{UserID: "user-a", Platform: "openai-chat", Provider: "provider-a"}, time.Now())
@@ -179,6 +247,7 @@ func TestActiveRequestTrackerRetryIgnoresFinishedFirstTextAndWrongUser(t *testin
 
 	startedID := tracker.Start(&ReqeustLog{UserID: "user-a"}, time.Now())
 	tracker.MarkResponseStarted(startedID)
+	tracker.RegisterCancel(startedID, func() {})
 	if result := tracker.Retry(-startedID, "user-a"); result.Status != activeRequestRetryTriggered {
 		t.Fatalf("response-started retry status = %q, want %q", result.Status, activeRequestRetryTriggered)
 	}

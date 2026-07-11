@@ -29,6 +29,7 @@ type NotificationService struct {
 
 // SwitchNotification 切换通知的详细信息
 type SwitchNotification struct {
+	UserID       string // 用户 ID；为空表示全局/旧兼容事件
 	FromProvider string // 原供应商
 	ToProvider   string // 新供应商
 	Reason       string // 切换原因
@@ -173,6 +174,7 @@ func (ns *NotificationService) emitSwitchEvent(info SwitchNotification) {
 		return
 	}
 	ns.emitter.Emit("provider:switched", map[string]interface{}{
+		"userID":       info.UserID,
 		"platform":     info.Platform,
 		"fromProvider": info.FromProvider,
 		"toProvider":   info.ToProvider,

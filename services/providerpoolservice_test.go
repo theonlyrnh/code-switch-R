@@ -350,6 +350,222 @@ func TestProviderPoolServiceValidation(t *testing.T) {
 	}
 }
 
+func TestProviderPoolServiceNormalizesLegacyAndNormalPools(t *testing.T) {
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+
+	service := NewProviderPoolService()
+	store := &providerPoolStore{
+		Version: providerPoolsBindingMigrationVersion,
+		Pools: []ProviderPool{{
+			ID:       "pool_openai-responses_legacy",
+			Platform: "openai-responses",
+			Name:     "legacy",
+			Mode:     ProviderPoolModeManaged,
+			AccountPoolConfig: &AccountPoolConfig{
+				APIURL:            "https://ignored.example.com",
+				ResponsesEndpoint: "/responses",
+				Keys:              []AccountPoolKey{{ID: -1, APIKey: "ignored"}},
+			},
+		}},
+	}
+	if err := os.MkdirAll(filepath.Dir(service.path), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := AtomicWriteJSON(service.path, store); err != nil {
+		t.Fatalf("write legacy store: %v", err)
+	}
+
+	pool, err := service.GetPool("pool_openai-responses_legacy")
+	if err != nil {
+		t.Fatalf("GetPool failed: %v", err)
+	}
+	if pool == nil || pool.PoolType != ProviderPoolTypeNormal {
+		t.Fatalf("legacy pool type = %v, want normal", pool)
+	}
+	if pool.AccountPoolConfig != nil {
+		t.Fatal("normal pool should discard irrelevant account config")
+	}
+
+	pool.AccountPoolConfig = &AccountPoolConfig{APIURL: "https://still-ignored.example.com"}
+	if _, err := service.SavePool(pool); err != nil {
+		t.Fatalf("SavePool failed: %v", err)
+	}
+	if pool.AccountPoolConfig != nil {
+		t.Fatal("saving a normal pool should clear account config")
+	}
+}
+
+func TestProviderPoolServiceSaveAccountPoolNormalizesConfiguration(t *testing.T) {
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+
+	service := NewProviderPoolService()
+	pool := &ProviderPool{
+		Platform: "openai-responses",
+		Name:     "account pool",
+		PoolType: ProviderPoolTypeAccount,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            "  https://api.example.com/v1/  ",
+			ResponsesEndpoint: " responses ",
+			Keys: []AccountPoolKey{
+				{ID: 123, APIKey: "  sk-first-secret-value  "},
+				{ID: -99, APIKey: ""},
+				{ID: -100, APIKey: "sk-first-secret-value"},
+				{ID: -101, APIKey: "\t sk-second-secret-value \t"},
+			},
+		},
+		AutoBlacklistEnabled:         false,
+		AutoBlacklistThreshold:       0,
+		AutoBlacklistDurationMinutes: -1,
+	}
+
+	id, err := service.SavePool(pool)
+	if err != nil {
+		t.Fatalf("SavePool failed: %v", err)
+	}
+	if id == "" {
+		t.Fatal("expected generated pool ID")
+	}
+	if pool.Mode != ProviderPoolModeManaged || !pool.AutoBlacklistEnabled {
+		t.Fatalf("account pool mode/blacklist = %q/%v", pool.Mode, pool.AutoBlacklistEnabled)
+	}
+	if pool.AutoBlacklistThreshold != defaultAccountPoolBlacklistThreshold || pool.AutoBlacklistDurationMinutes != defaultAccountPoolBlacklistDurationMinutes {
+		t.Fatalf("blacklist defaults = %d/%d", pool.AutoBlacklistThreshold, pool.AutoBlacklistDurationMinutes)
+	}
+	if len(pool.Members) != 0 || pool.ManualProviderID != nil {
+		t.Fatalf("account pool should not retain normal members/manual provider: %#v", pool)
+	}
+	if pool.AccountPoolConfig.APIURL != "https://api.example.com/v1" || pool.AccountPoolConfig.ResponsesEndpoint != "/responses" {
+		t.Fatalf("normalized config = %#v", pool.AccountPoolConfig)
+	}
+	if len(pool.AccountPoolConfig.Keys) != 2 {
+		t.Fatalf("normalized keys = %#v, want two", pool.AccountPoolConfig.Keys)
+	}
+	if pool.AccountPoolConfig.Keys[0].APIKey != "sk-first-secret-value" || pool.AccountPoolConfig.Keys[1].APIKey != "sk-second-secret-value" {
+		t.Fatalf("key order/normalization = %#v", pool.AccountPoolConfig.Keys)
+	}
+	seenIDs := make(map[int64]bool)
+	for _, key := range pool.AccountPoolConfig.Keys {
+		if !isValidAccountPoolKeyID(key.ID) {
+			t.Fatalf("key ID %d is not a negative JavaScript-safe ID", key.ID)
+		}
+		if seenIDs[key.ID] {
+			t.Fatalf("duplicate generated key ID: %d", key.ID)
+		}
+		seenIDs[key.ID] = true
+		if key.ID == -100 || key.ID == -101 || key.ID == 123 {
+			t.Fatalf("new account pool trusted client key ID %d", key.ID)
+		}
+	}
+
+	data, err := os.ReadFile(service.path)
+	if err != nil {
+		t.Fatalf("read store: %v", err)
+	}
+	var persisted providerPoolStore
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatalf("decode store: %v", err)
+	}
+	if persisted.Version != providerPoolsStoreVersion {
+		t.Fatalf("store version = %d, want %d", persisted.Version, providerPoolsStoreVersion)
+	}
+}
+
+func TestProviderPoolServiceUpdateAccountPoolPreservesKeyIDs(t *testing.T) {
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+
+	service := NewProviderPoolService()
+	pool := validAccountPoolForTest()
+	if _, err := service.SavePool(pool); err != nil {
+		t.Fatalf("create account pool: %v", err)
+	}
+	firstID := pool.AccountPoolConfig.Keys[0].ID
+	secondID := pool.AccountPoolConfig.Keys[1].ID
+
+	pool.AccountPoolConfig.Keys = []AccountPoolKey{
+		{ID: -1, APIKey: "sk-second-secret-value"},
+		{ID: secondID, APIKey: "sk-new-secret-value"},
+		{ID: -2, APIKey: "sk-first-secret-value"},
+	}
+	if _, err := service.SavePool(pool); err != nil {
+		t.Fatalf("update account pool: %v", err)
+	}
+	keys := pool.AccountPoolConfig.Keys
+	if len(keys) != 3 || keys[0].ID != secondID || keys[2].ID != firstID {
+		t.Fatalf("existing key IDs were not preserved by secret: %#v", keys)
+	}
+	if !isValidAccountPoolKeyID(keys[1].ID) || keys[1].ID == firstID || keys[1].ID == secondID {
+		t.Fatalf("new key ID was not freshly allocated: %#v", keys[1])
+	}
+
+	pool.PoolType = ProviderPoolTypeNormal
+	if _, err := service.SavePool(pool); err == nil {
+		t.Fatal("expected pool type mutation to be rejected")
+	}
+}
+
+func TestProviderPoolServiceRejectsInvalidAccountPools(t *testing.T) {
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+
+	tests := []struct {
+		name   string
+		mutate func(*ProviderPool)
+	}{
+		{name: "unknown pool type", mutate: func(pool *ProviderPool) { pool.PoolType = "unknown" }},
+		{name: "wrong platform", mutate: func(pool *ProviderPool) { pool.Platform = "openai-chat" }},
+		{name: "manual mode", mutate: func(pool *ProviderPool) { pool.Mode = ProviderPoolModeManual }},
+		{name: "normal member", mutate: func(pool *ProviderPool) { pool.Members = []ProviderPoolMember{{ProviderID: 1, Enabled: true}} }},
+		{name: "manual provider", mutate: func(pool *ProviderPool) { pool.ManualProviderID = int64Ptr(1) }},
+		{name: "missing config", mutate: func(pool *ProviderPool) { pool.AccountPoolConfig = nil }},
+		{name: "relative base URL", mutate: func(pool *ProviderPool) { pool.AccountPoolConfig.APIURL = "/v1" }},
+		{name: "unsupported base URL scheme", mutate: func(pool *ProviderPool) { pool.AccountPoolConfig.APIURL = "ftp://api.example.com" }},
+		{name: "base URL query", mutate: func(pool *ProviderPool) { pool.AccountPoolConfig.APIURL = "https://api.example.com/v1?tenant=a" }},
+		{name: "base URL fragment", mutate: func(pool *ProviderPool) { pool.AccountPoolConfig.APIURL = "https://api.example.com/v1#responses" }},
+		{name: "absolute responses endpoint", mutate: func(pool *ProviderPool) {
+			pool.AccountPoolConfig.ResponsesEndpoint = "https://api.example.com/responses"
+		}},
+		{name: "network path responses endpoint", mutate: func(pool *ProviderPool) { pool.AccountPoolConfig.ResponsesEndpoint = "//other.example.com/responses" }},
+		{name: "fragment responses endpoint", mutate: func(pool *ProviderPool) { pool.AccountPoolConfig.ResponsesEndpoint = "/responses#ignored" }},
+		{name: "empty responses endpoint", mutate: func(pool *ProviderPool) { pool.AccountPoolConfig.ResponsesEndpoint = " " }},
+		{name: "empty keys", mutate: func(pool *ProviderPool) { pool.AccountPoolConfig.Keys = []AccountPoolKey{{APIKey: " \t "}} }},
+		{name: "blacklist threshold too large", mutate: func(pool *ProviderPool) { pool.AutoBlacklistThreshold = maxAccountPoolBlacklistThreshold + 1 }},
+		{name: "blacklist duration too large", mutate: func(pool *ProviderPool) {
+			pool.AutoBlacklistDurationMinutes = maxAccountPoolBlacklistDurationMinutes + 1
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := NewProviderPoolService()
+			pool := validAccountPoolForTest()
+			test.mutate(pool)
+			if _, err := service.SavePool(pool); err == nil {
+				t.Fatalf("expected invalid account pool to be rejected: %#v", pool)
+			}
+		})
+	}
+}
+
+func validAccountPoolForTest() *ProviderPool {
+	return &ProviderPool{
+		Platform: "openai-responses",
+		Name:     "account pool",
+		PoolType: ProviderPoolTypeAccount,
+		Mode:     ProviderPoolModeManaged,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            "https://api.example.com",
+			ResponsesEndpoint: "/v1/responses",
+			Keys: []AccountPoolKey{
+				{APIKey: "sk-first-secret-value"},
+				{APIKey: "sk-second-secret-value"},
+			},
+		},
+	}
+}
+
 // ========== SelectProvidersFromPool 测试 ==========
 
 func TestSelectProvidersFromPoolManagedMode(t *testing.T) {
@@ -530,6 +746,59 @@ func TestSelectProvidersFromPoolTwoPoolsSameProvider(t *testing.T) {
 	}
 	if selectedB[0].Name != "provider-c" {
 		t.Fatalf("pool B: expected provider-c, got %q", selectedB[0].Name)
+	}
+}
+
+func TestSelectProvidersFromAccountPoolSynthesizesProviders(t *testing.T) {
+	pool := validAccountPoolForTest()
+	pool.AccountPoolConfig.Keys = []AccountPoolKey{
+		{ID: -101, APIKey: "sk-first-shared-suffix"},
+		{ID: -202, APIKey: "sk-second-shared-suffix"},
+	}
+
+	selected, err := SelectProvidersFromPool(pool, []Provider{{ID: 1, Name: "ignored"}})
+	if err != nil {
+		t.Fatalf("SelectProvidersFromPool failed: %v", err)
+	}
+	if len(selected) != 2 {
+		t.Fatalf("selected providers = %#v, want two", selected)
+	}
+	if selected[0].ID != -101 || selected[1].ID != -202 {
+		t.Fatalf("provider order/IDs = %#v", selected)
+	}
+	if selected[0].Name == selected[1].Name {
+		t.Fatalf("account provider names must be unique: %q", selected[0].Name)
+	}
+	for i, provider := range selected {
+		key := pool.AccountPoolConfig.Keys[i]
+		if provider.APIURL != pool.AccountPoolConfig.APIURL || provider.ResponsesEndpoint != pool.AccountPoolConfig.ResponsesEndpoint || provider.APIKey != key.APIKey {
+			t.Fatalf("provider %d config = %#v", i, provider)
+		}
+		if !provider.Enabled || provider.Level != 1 || provider.MaxConcurrency != defaultProviderMaxConcurrency {
+			t.Fatalf("provider %d runtime defaults = %#v", i, provider)
+		}
+		if provider.ModelsEndpoint != "/v1/models" {
+			t.Fatalf("provider %d models endpoint = %q, want /v1/models", i, provider.ModelsEndpoint)
+		}
+		if strings.Contains(provider.Name, key.APIKey) {
+			t.Fatalf("provider name leaks full API key: %q", provider.Name)
+		}
+		if strings.Contains(provider.Name, key.APIKey[:len(key.APIKey)-4]) {
+			t.Fatalf("provider name exposes API key prefix: %q", provider.Name)
+		}
+	}
+
+	pool.AccountPoolConfig.APIURL = "https://api.example.com/openai/v1"
+	pool.AccountPoolConfig.ResponsesEndpoint = "/responses"
+	selected, err = SelectProvidersFromPool(pool, nil)
+	if err != nil || len(selected) != 2 || selected[0].ModelsEndpoint != "/models" {
+		t.Fatalf("root Responses sibling models endpoint = providers=%#v err=%v", selected, err)
+	}
+	if got := accountPoolModelsEndpoint("/custom/responses?tenant=a"); got != "/custom/models" {
+		t.Fatalf("custom Responses sibling models endpoint = %q, want /custom/models", got)
+	}
+	if got := accountPoolModelsEndpoint("/v1/responses/"); got != "/v1/models" {
+		t.Fatalf("trailing-slash Responses sibling models endpoint = %q, want /v1/models", got)
 	}
 }
 
@@ -862,7 +1131,7 @@ func TestDeletePoolFailsClosedWhenBindingCheckFails(t *testing.T) {
 	}
 }
 
-// TestMigrationOnlyRunsOnce 验证迁移只在 version < current 时执行
+// TestMigrationOnlyRunsOnce 验证 relay key 绑定迁移只在 version < 2 时执行
 func TestMigrationOnlyRunsOnce(t *testing.T) {
 	testHome := t.TempDir()
 	t.Setenv("HOME", testHome)
@@ -889,6 +1158,9 @@ func TestMigrationOnlyRunsOnce(t *testing.T) {
 	_, _ = poolService.EnsureDefaultPool("openai-chat", []Provider{
 		{ID: 1, Name: "a", Enabled: true},
 	}, DefaultPoolSeed{Mode: ProviderPoolModeManaged})
+	if !poolService.NeedsMigration() {
+		t.Fatal("routine pool save must not suppress the pending version 1 binding migration")
+	}
 
 	platformDefaults := map[string]string{"openai-chat": "pool_openai-chat_default"}
 	_ = keyService.EnsureDefaultPoolBindings(platformDefaults)
@@ -914,5 +1186,53 @@ func TestMigrationOnlyRunsOnce(t *testing.T) {
 	binding2, ok2, _ := keyService.GetPoolBinding(key2.ID, "openai-chat")
 	if ok2 {
 		t.Fatalf("new key should NOT have binding, got %q", binding2)
+	}
+}
+
+func TestProviderPoolStoreVersionTwoDoesNotRepeatBindingMigration(t *testing.T) {
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+
+	service := NewProviderPoolService()
+	store := &providerPoolStore{Version: providerPoolsBindingMigrationVersion, Pools: []ProviderPool{}}
+	if err := os.MkdirAll(filepath.Dir(service.path), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := AtomicWriteJSON(service.path, store); err != nil {
+		t.Fatalf("write store: %v", err)
+	}
+	if service.NeedsMigration() {
+		t.Fatal("version 2 store must not repeat the relay-key binding migration")
+	}
+
+	pool := validAccountPoolForTest()
+	if _, err := service.SavePool(pool); err != nil {
+		t.Fatalf("save account pool: %v", err)
+	}
+	if service.NeedsMigration() {
+		t.Fatal("version 3 store must not need the version 2 binding migration")
+	}
+
+	futureVersion := providerPoolsStoreVersion + 1
+	store = &providerPoolStore{Version: futureVersion, Pools: []ProviderPool{}}
+	if err := AtomicWriteJSON(service.path, store); err != nil {
+		t.Fatalf("write future-version store: %v", err)
+	}
+	originalData, err := os.ReadFile(service.path)
+	if err != nil {
+		t.Fatalf("read initial future-version store: %v", err)
+	}
+	if _, err := service.SavePool(validAccountPoolForTest()); err == nil {
+		t.Fatal("expected writes to a future-version store to be rejected")
+	}
+	if err := service.MarkMigrationCompleted(); err == nil {
+		t.Fatal("expected migration marking on a future-version store to be rejected")
+	}
+	data, err := os.ReadFile(service.path)
+	if err != nil {
+		t.Fatalf("read future-version store: %v", err)
+	}
+	if string(data) != string(originalData) {
+		t.Fatal("rejected future-version write changed the store")
 	}
 }

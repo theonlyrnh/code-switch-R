@@ -230,7 +230,7 @@ func newAdminServer(rt *appRuntime) *http.Server {
 	})
 
 	router.GET("/api/wails/events", authRequired, func(c *gin.Context) {
-		streamEvents(c, rt.eventHub)
+		streamEvents(c, rt.eventHub, adminUserIDFromContext(c))
 	})
 	router.GET("/provider-favicon", authRequired, serveProviderFavicon)
 
@@ -497,7 +497,7 @@ func isICOData(data []byte) bool {
 	return len(data) >= 4 && data[0] == 0x00 && data[1] == 0x00 && (data[2] == 0x01 || data[2] == 0x02) && data[3] == 0x00
 }
 
-func streamEvents(c *gin.Context, hub *services.EventHub) {
+func streamEvents(c *gin.Context, hub *services.EventHub, userID string) {
 	if hub == nil {
 		c.JSON(http.StatusServiceUnavailable, apiErrorResponse{
 			Error: apiError{Code: "events_unavailable", Message: "event hub is not initialized"},
@@ -538,6 +538,9 @@ func streamEvents(c *gin.Context, hub *services.EventHub) {
 			if !ok {
 				return
 			}
+			if !eventVisibleToUser(event.Data, userID) {
+				continue
+			}
 			payload, err := json.Marshal(event.Data)
 			if err != nil {
 				payload = []byte(`{"error":"failed to encode event payload"}`)
@@ -547,6 +550,16 @@ func streamEvents(c *gin.Context, hub *services.EventHub) {
 			flusher.Flush()
 		}
 	}
+}
+
+func eventVisibleToUser(payload any, userID string) bool {
+	data, ok := payload.(map[string]interface{})
+	if !ok {
+		return true
+	}
+	eventUserID, _ := data["userID"].(string)
+	eventUserID = strings.TrimSpace(eventUserID)
+	return eventUserID == "" || eventUserID == strings.TrimSpace(userID)
 }
 
 func registerStaticRoutes(router *gin.Engine, staticDir string) {

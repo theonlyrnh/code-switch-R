@@ -4,6 +4,18 @@
 import { Call } from '../wails-runtime'
 
 export type ProviderPoolMode = 'managed' | 'manual'
+export type ProviderPoolType = 'normal' | 'account'
+
+export interface AccountPoolKey {
+  id: number
+  apiKey: string
+}
+
+export interface AccountPoolConfig {
+  apiUrl: string
+  responsesEndpoint: string
+  keys: AccountPoolKey[]
+}
 
 export interface ProviderPoolMember {
   providerId: number
@@ -17,9 +29,11 @@ export interface ProviderPool {
   id: string
   platform: string
   name: string
+  poolType: ProviderPoolType
   mode: ProviderPoolMode
   manualProviderId?: number | null
   members: ProviderPoolMember[]
+  accountPoolConfig?: AccountPoolConfig
   createdAt: string
   updatedAt: string
   /** 自动拉黑配置（仅 managed 模式生效） */

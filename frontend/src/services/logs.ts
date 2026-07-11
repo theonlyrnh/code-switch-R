@@ -51,6 +51,7 @@ export type RetryActiveRequestResult = {
     | 'ignored_response_started'
     | 'ignored_unauthorized'
     | 'ignored_queued'
+    | 'ignored_transition'
     | string
   first_token_duration_sec?: number
   first_text_sec?: number

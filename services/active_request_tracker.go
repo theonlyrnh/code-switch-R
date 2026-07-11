@@ -24,6 +24,7 @@ const (
 	activeRequestRetryIgnoredResponseStarted = "ignored_response_started"
 	activeRequestRetryIgnoredUnauthorized    = "ignored_unauthorized"
 	activeRequestRetryIgnoredQueued          = "ignored_queued"
+	activeRequestRetryIgnoredTransition      = "ignored_transition"
 )
 
 type activeRequestTracker struct {
@@ -33,11 +34,12 @@ type activeRequestTracker struct {
 }
 
 type activeRequestSnapshot struct {
-	startedAt       time.Time
-	log             ReqeustLog
-	cancel          context.CancelFunc
-	retryRequested  bool
-	responseStarted bool
+	startedAt        time.Time
+	log              ReqeustLog
+	cancel           context.CancelFunc
+	cancelGeneration uint64
+	retryRequested   bool
+	responseStarted  bool
 }
 
 type ActiveRequestRetryResult struct {
@@ -83,6 +85,7 @@ func (t *activeRequestTracker) Update(id int64, logEntry *ReqeustLog) {
 	}
 	next := snapshotActiveRequest(id, logEntry, existing.startedAt)
 	next.cancel = existing.cancel
+	next.cancelGeneration = existing.cancelGeneration
 	next.retryRequested = existing.retryRequested
 	next.responseStarted = existing.responseStarted
 	if next.retryRequested && next.log.Status != requestLogStatusQueued {
@@ -102,20 +105,40 @@ func (t *activeRequestTracker) Finish(id int64) {
 	delete(t.requests, id)
 }
 
-func (t *activeRequestTracker) RegisterCancel(id int64, cancel context.CancelFunc) {
-	if t == nil || id == 0 {
-		return
+func (t *activeRequestTracker) RegisterCancel(id int64, cancel context.CancelFunc) uint64 {
+	if t == nil || id == 0 || cancel == nil {
+		return 0
+	}
+
+	t.mu.Lock()
+	existing, ok := t.requests[id]
+	if !ok {
+		t.mu.Unlock()
+		return 0
+	}
+	existing.cancelGeneration++
+	generation := existing.cancelGeneration
+	existing.cancel = cancel
+	t.requests[id] = existing
+	t.mu.Unlock()
+	return generation
+}
+
+func (t *activeRequestTracker) UnregisterCancel(id int64, generation uint64) bool {
+	if t == nil || id == 0 || generation == 0 {
+		return false
 	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	existing, ok := t.requests[id]
-	if !ok {
-		return
+	if !ok || existing.cancelGeneration != generation {
+		return false
 	}
-	existing.cancel = cancel
+	existing.cancel = nil
 	t.requests[id] = existing
+	return existing.retryRequested
 }
 
 func (t *activeRequestTracker) MarkResponseStarted(id int64) {
@@ -250,6 +273,14 @@ func (t *activeRequestTracker) Retry(id int64, userID string) ActiveRequestRetry
 		t.mu.Unlock()
 		return ActiveRequestRetryResult{Status: activeRequestRetryIgnoredQueued}
 	}
+	if existing.retryRequested {
+		t.mu.Unlock()
+		return ActiveRequestRetryResult{Status: activeRequestRetryTriggered}
+	}
+	if existing.cancel == nil {
+		t.mu.Unlock()
+		return ActiveRequestRetryResult{Status: activeRequestRetryIgnoredTransition}
+	}
 	existing.retryRequested = true
 	existing.log.RetryRequested = true
 	existing.log.Status = requestLogStatusRetrying
@@ -257,9 +288,7 @@ func (t *activeRequestTracker) Retry(id int64, userID string) ActiveRequestRetry
 	t.requests[id] = existing
 	t.mu.Unlock()
 
-	if cancel != nil {
-		cancel()
-	}
+	cancel()
 	return ActiveRequestRetryResult{Status: activeRequestRetryTriggered}
 }
 
