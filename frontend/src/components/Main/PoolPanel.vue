@@ -247,13 +247,32 @@
                 <span class="account-key-count">{{ t('components.main.pool.accountKeyCount', { count: pool.accountPoolConfig?.keys?.length || 0 }) }}</span>
               </div>
               <div class="account-key-list">
-                <span
-                  v-for="key in pool.accountPoolConfig?.keys || []"
+                <div
+                  v-for="key in getAvailableAccountKeys(pool)"
                   :key="key.id"
-                  class="account-key-chip"
+                  class="account-key-row"
                 >
-                  {{ maskAccountKey(key.apiKey) }}
-                </span>
+                  <span class="account-key-chip">{{ maskAccountKey(key.apiKey) }}</span>
+                </div>
+                <div
+                  v-for="key in getBlacklistedAccountKeys(pool)"
+                  :key="key.id"
+                  class="account-key-row account-key-row-blacklisted"
+                  :title="getBlacklistPenalty(pool, key.id)?.lastReason || ''"
+                >
+                  <svg viewBox="0 0 24 24" class="blacklist-key-icon" aria-hidden="true">
+                    <path d="M12 2 2 21h20L12 2Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+                    <path d="M12 9v5m0 3h.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                  </svg>
+                  <span class="account-key-chip">{{ maskAccountKey(key.apiKey) }}</span>
+                  <span class="blacklist-reason-prefix">{{ t('components.main.pool.blacklistReasonPrefix') }}</span>
+                  <span class="blacklist-reason">{{ getBlacklistReason(pool, key.id) }}</span>
+                  <span class="blacklist-reason-suffix">{{ t('components.main.pool.blacklistReasonSuffix') }}</span>
+                  <span class="blacklist-time"><span class="blacklist-minutes">{{ getBlacklistRemainingMinutes(getBlacklistPenalty(pool, key.id)!) }}</span> {{ t('components.main.pool.blacklistMinutes') }}</span>
+                  <button class="ghost-icon key-unbind-btn" :data-tooltip="t('components.main.pool.unblacklist')" @click.stop="unblacklistProvider(pool.id, key.id)">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18 18 6M6 6l12 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none" /></svg>
+                  </button>
+                </div>
                 <span v-if="!(pool.accountPoolConfig?.keys?.length)" class="pool-no-keys">
                   {{ t('components.main.pool.noAccountKeys') }}
                 </span>
@@ -262,7 +281,7 @@
           </div>
 
           <!-- 拉黑状态 -->
-          <div v-if="(blacklistStatus.get(pool.id) || []).length > 0" class="pool-blacklist-section">
+          <div v-if="!isAccountPool(pool) && (blacklistStatus.get(pool.id) || []).length > 0" class="pool-blacklist-section">
             <div class="pool-keys-header">
               {{ isAccountPool(pool) ? t('components.main.pool.blacklistedKeys') : t('components.main.pool.blacklistedProviders') }}
             </div>
@@ -278,7 +297,10 @@
                     <path d="M12 10v4m0 4h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                   </svg>
                   <span class="pool-key-name">{{ getBlacklistSubjectName(pool, penalty.providerID) }}</span>
-                  <span class="blacklist-time">{{ t('components.main.pool.blacklistRemaining', { minutes: getBlacklistRemainingMinutes(penalty) }) }}</span>
+                  <span class="blacklist-reason-prefix">{{ t('components.main.pool.blacklistReasonPrefix') }}</span>
+                  <span class="blacklist-reason">{{ getPenaltyReason(pool, penalty) }}</span>
+                  <span class="blacklist-reason-suffix">{{ t('components.main.pool.blacklistReasonSuffix') }}</span>
+                  <span class="blacklist-time"><span class="blacklist-minutes">{{ getBlacklistRemainingMinutes(penalty) }}</span> {{ t('components.main.pool.blacklistMinutes') }}</span>
                   <button class="ghost-icon key-unbind-btn" :data-tooltip="t('components.main.pool.unblacklist')" @click.stop="unblacklistProvider(pool.id, penalty.providerID)">
                     <svg viewBox="0 0 24 24" aria-hidden="true">
                       <path d="M6 18L18 6M6 6l12 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none" />
@@ -351,9 +373,10 @@
       <BaseModal
         :open="poolModalState.open"
         :title="poolModalState.editingId ? t('components.main.pool.editPoolTitle') : t('components.main.pool.createPoolTitle')"
-        @close="closePoolModal"
+        :size="poolModalState.form.poolType === 'account' ? 'wide' : 'default'"
+        @close="closePoolModal()"
       >
-        <form class="vendor-form pool-form" @submit.prevent="submitPoolModal">
+        <form class="vendor-form pool-form" @submit.prevent="submitPoolModal()">
           <label class="form-field">
             <span>{{ t('components.main.pool.poolName') }}</span>
             <BaseInput
@@ -490,6 +513,232 @@
               <span class="form-field-hint">{{ t('components.main.pool.accountPoolKeysHint') }}</span>
             </label>
 
+            <div class="form-field pool-proxy-section">
+              <label class="pool-member-checkbox">
+                <input
+                  v-model="poolModalState.form.proxyEnabled"
+                  type="checkbox"
+                  @change="toggleProxyEnabled"
+                />
+                <span class="member-checkbox-label">{{ t('components.main.pool.useProxy') }}</span>
+              </label>
+              <span class="form-field-hint">{{ t('components.main.pool.proxySharedHint') }}</span>
+
+              <div v-if="poolModalState.form.proxyEnabled" class="pool-proxy-config">
+                <span v-if="!proxyConfigsLoading && !hasProxyNodes" class="form-field-hint pool-proxy-error">
+                  {{ t('components.main.pool.proxyConfigRequired') }}
+                </span>
+
+                <section class="proxy-strategy-group" :aria-label="t('components.main.pool.proxySelection')">
+                  <div class="proxy-strategy-group-heading">
+                    <span>{{ t('components.main.pool.proxySelection') }}</span>
+                    <span v-if="proxyLastTestedLabel" class="proxy-last-tested">{{ proxyLastTestedLabel }}</span>
+                    <button
+                      type="button"
+                      class="sub-tab-action-btn proxy-bulk-test-button"
+                      :disabled="proxyBulkTestLoading || proxyConfigsLoading || proxyUploadLoading || proxyConfigActionLoading !== null || !hasProxyNodes"
+                      @click="testAllProxyLatencies"
+                    >
+                      {{ proxyBulkTestLoading ? t('components.main.pool.proxyBulkTesting') : t('components.main.pool.testAllProxyLatencies') }}
+                    </button>
+                  </div>
+
+                  <div
+                    class="proxy-strategy-board"
+                    role="radiogroup"
+                    :aria-label="t('components.main.pool.proxySelection')"
+                    :aria-busy="proxyBulkTestLoading"
+                  >
+                    <label
+                      class="proxy-strategy-card proxy-auto-card"
+                      :class="{ selected: poolModalState.form.proxySelection === 'auto', disabled: proxyConfigsLoading || !hasProxyNodes }"
+                    >
+                      <input
+                        class="proxy-strategy-radio"
+                        type="radio"
+                        name="pool-proxy-selection"
+                        :checked="poolModalState.form.proxySelection === 'auto'"
+                        :disabled="proxyConfigsLoading || !hasProxyNodes"
+                        @change="selectAutoProxy"
+                      />
+                      <span class="proxy-strategy-card-content">
+                        <span class="proxy-strategy-card-name">{{ t('components.main.pool.proxyAuto') }}</span>
+                        <span class="proxy-auto-selection">
+                          <span class="proxy-auto-selected-node" :title="proxyAutoSelectedNode?.name || ''">
+                            {{ proxyAutoSelectedNode?.name || '-' }}
+                          </span>
+                          <span
+                            class="proxy-strategy-latency"
+                            :class="proxyAutoLatencyClass"
+                            :title="proxyAutoLatencyTooltip"
+                          >
+                            {{ proxyAutoLatencyLabel }}
+                          </span>
+                        </span>
+                      </span>
+                    </label>
+
+                    <section
+                      v-for="config in proxyConfigs"
+                      :key="config.id"
+                      class="proxy-config-section"
+                    >
+                      <button
+                        type="button"
+                        class="proxy-config-disclosure"
+                        :aria-expanded="isProxyConfigExpanded(config.id)"
+                        :aria-controls="isProxyConfigExpanded(config.id) ? proxyConfigNodesRegionID(config.id) : undefined"
+                        @click="toggleProxyConfigExpanded(config.id)"
+                      >
+                        <span class="proxy-config-disclosure-copy">
+                          <span class="proxy-config-disclosure-name">{{ proxyConfigFileName(config) }}</span>
+                          <span class="proxy-config-disclosure-meta">
+                            {{ t('components.main.pool.proxyConfigNodeCount', { count: config.nodes.length }) }}
+                          </span>
+                        </span>
+                        <span
+                          class="proxy-config-disclosure-indicator"
+                          :class="{ expanded: isProxyConfigExpanded(config.id) }"
+                          aria-hidden="true"
+                        ></span>
+                      </button>
+
+                      <div
+                        v-if="isProxyConfigExpanded(config.id)"
+                        :id="proxyConfigNodesRegionID(config.id)"
+                        class="proxy-node-grid"
+                      >
+                        <label
+                          v-for="node in config.nodes"
+                          :key="node.id"
+                          class="proxy-strategy-card proxy-node-card"
+                          :class="{ selected: isSelectedProxyNode(node.id), disabled: proxyConfigsLoading }"
+                          @click="selectProxyNodeIfAvailable(node.id)"
+                        >
+                          <input
+                            class="proxy-strategy-radio"
+                            type="radio"
+                            name="pool-proxy-selection"
+                            :checked="isSelectedProxyNode(node.id)"
+                            :disabled="proxyConfigsLoading"
+                            @change="selectProxyNode(node.id)"
+                          />
+                          <span class="proxy-strategy-card-content">
+                            <span class="proxy-strategy-card-name">{{ node.originalName || node.name }}</span>
+                            <span class="proxy-node-metrics">
+                              <span class="proxy-node-metric">
+                                <span class="proxy-node-metric-label">{{ t('components.main.pool.localProxyLatency') }}</span>
+                                <span class="proxy-strategy-latency" :class="proxyNodeLatencyClass(node.id)" :title="proxyNodeLatencyTooltip(node.id)">
+                                  {{ proxyNodeLatencyLabel(node.id) }}
+                                </span>
+                              </span>
+                              <span class="proxy-node-metric">
+                                <span class="proxy-node-metric-label">{{ t('components.main.pool.proxiedBaseLatency') }}</span>
+                                <span class="proxy-strategy-latency" :class="proxyNodeResponsesClass(node.id)" :title="proxyNodeResponsesTooltip(node.id)">
+                                  {{ proxyNodeResponsesLabel(node.id) }}
+                                </span>
+                              </span>
+                            </span>
+                          </span>
+                        </label>
+                      </div>
+                    </section>
+                  </div>
+
+                  <span v-if="proxyNodeSelectionRequired" class="form-field-hint pool-proxy-error" role="alert">
+                    {{ selectedProxyNodeHidden ? t('components.main.pool.proxyNodeHidden') : t('components.main.pool.proxyNodeRequired') }}
+                  </span>
+                  <label v-if="poolModalState.form.proxySelection === 'auto'" class="pool-member-checkbox proxy-auto-disable-toggle">
+                    <input v-model="poolModalState.form.autoDisableProxyWhenNoAvailable" type="checkbox" />
+                    <span class="member-checkbox-label">{{ t('components.main.pool.autoDisableProxyWhenNoAvailable') }}</span>
+                    <span class="form-field-hint">{{ t('components.main.pool.autoDisableProxyWhenNoAvailableHint') }}</span>
+                  </label>
+                  <span class="sr-only" aria-live="polite">
+                    {{ proxyBulkTestLoading ? t('components.main.pool.proxyBulkTesting') : '' }}
+                  </span>
+                </section>
+
+                <div class="proxy-upload-row">
+                  <label :class="['sub-tab-action-btn', 'proxy-upload-button', proxyUploadLoading || proxyBulkTestLoading ? 'disabled' : '']">
+                    {{ proxyUploadLoading ? t('components.main.pool.proxyUploading') : t('components.main.pool.uploadProxyConfig') }}
+                    <input type="file" accept=".yaml,.yml" :disabled="proxyUploadLoading || proxyBulkTestLoading" @change="uploadProxyConfig" />
+                  </label>
+                  <button type="button" class="sub-tab-action-btn" :disabled="proxyConfigsLoading || proxyUploadLoading || proxyBulkTestLoading || proxyConfigActionLoading !== null" @click="loadProxyConfigs">
+                    {{ proxyConfigsLoading ? t('components.main.pool.proxyRefreshing') : t('components.main.pool.refreshProxyConfigs') }}
+                  </button>
+                </div>
+
+                <div class="proxy-config-list">
+                  <div v-for="config in proxyConfigs" :key="config.id" class="proxy-config-item">
+                    <div class="proxy-config-details">
+                      <span class="proxy-config-name">{{ proxyConfigFileName(config) }}</span>
+                      <span class="proxy-config-meta">
+                        {{ t('components.main.pool.proxyConfigUploadedBy', { uploader: config.uploader }) }}
+                        <span aria-hidden="true">&middot;</span>
+                        {{ t('components.main.pool.proxyConfigNodeCount', { count: config.nodes.length }) }}
+                      </span>
+                    </div>
+                    <button
+                      v-if="config.isOwner"
+                      class="proxy-config-action is-danger"
+                      type="button"
+                      :data-tooltip="t('components.main.pool.deleteProxyConfig')"
+                      :aria-label="t('components.main.pool.deleteProxyConfig')"
+                      :disabled="proxyConfigsLoading || proxyUploadLoading || proxyBulkTestLoading || proxyConfigActionLoading !== null"
+                      @click="deleteProxyConfig(config)"
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M9 3h6m-7 4h8m-6 0v11m4-11v11M5 7h14l-.867 12.138A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.862L5 7z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                    </button>
+                    <button
+                      v-else
+                      class="proxy-config-action"
+                      type="button"
+                      :data-tooltip="t('components.main.pool.hideProxyConfig')"
+                      :aria-label="t('components.main.pool.hideProxyConfig')"
+                      :disabled="proxyConfigsLoading || proxyUploadLoading || proxyBulkTestLoading || proxyConfigActionLoading !== null"
+                      @click="hideProxyConfig(config)"
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M3 3l18 18M10.584 10.587a2 2 0 002.829 2.829M9.88 4.24A10.94 10.94 0 0112 4c5.5 0 9.27 4.11 10 8-.33 1.76-1.32 3.42-2.82 4.75M6.61 6.61C4.5 8.03 3.3 10.06 2 12c.73 3.89 4.5 8 10 8 1.82 0 3.42-.45 4.75-1.22" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                    </button>
+                  </div>
+                  <span v-if="!proxyConfigsLoading && proxyConfigs.length === 0" class="form-field-hint">
+                    {{ t('components.main.pool.noProxyConfigs') }}
+                  </span>
+                </div>
+
+                <div v-if="hiddenProxyConfigs.length > 0" class="proxy-hidden-configs">
+                  <span class="proxy-hidden-configs-heading">{{ t('components.main.pool.hiddenProxyConfigs') }}</span>
+                  <div v-for="config in hiddenProxyConfigs" :key="config.id" class="proxy-config-item">
+                    <div class="proxy-config-details">
+                      <span class="proxy-config-name">{{ proxyConfigFileName(config) }}</span>
+                      <span class="proxy-config-meta">
+                        {{ t('components.main.pool.proxyConfigUploadedBy', { uploader: config.uploader }) }}
+                        <span aria-hidden="true">&middot;</span>
+                        {{ t('components.main.pool.proxyConfigNodeCount', { count: config.nodes.length }) }}
+                      </span>
+                    </div>
+                    <button
+                      class="proxy-config-action"
+                      type="button"
+                      :data-tooltip="t('components.main.pool.unhideProxyConfig')"
+                      :aria-label="t('components.main.pool.unhideProxyConfig')"
+                      :disabled="proxyConfigsLoading || proxyUploadLoading || proxyBulkTestLoading || proxyConfigActionLoading !== null"
+                      @click="unhideProxyConfig(config)"
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12zM12 15a3 3 0 100-6 3 3 0 000 6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+
+              </div>
+            </div>
+
             <div class="form-field">
               <span>{{ t('components.main.pool.autoBlacklist') }}</span>
               <div class="blacklist-config-inputs account-blacklist-inputs">
@@ -519,8 +768,65 @@
             </div>
           </template>
 
+          <div
+            v-if="poolModalState.form.poolType === 'account' || poolModalState.form.mode === 'managed'"
+            class="form-field special-blacklist-rules"
+          >
+            <div class="special-rules-heading">
+              <span>{{ t('components.main.pool.specialBlacklistRules') }}</span>
+              <button class="ghost-icon" type="button" :data-tooltip="t('components.main.pool.addSpecialBlacklistRule')" @click="addSpecialBlacklistRule">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14m-7-7h14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
+              </button>
+            </div>
+            <p class="form-field-hint">{{ t('components.main.pool.specialBlacklistRulesHint') }}</p>
+            <div v-for="(rule, index) in poolModalState.form.specialBlacklistRules" :key="rule.id || index" class="special-rule-row">
+              <label class="form-field"><span>{{ t('components.main.pool.specialRuleName') }}</span><input v-model="rule.name" class="mac-input" type="text" required /></label>
+              <label class="form-field"><span>{{ t('components.main.pool.specialRuleHttpStatus') }}</span><input v-model.number="rule.httpStatus" class="mac-input" type="number" min="100" max="599" required /></label>
+              <label class="form-field"><span>{{ t('components.main.pool.specialRuleJsonPath') }}</span><input v-model="rule.jsonPath" class="mac-input" type="text" placeholder="error.code" /></label>
+              <label class="form-field"><span>{{ t('components.main.pool.specialRuleJsonValue') }}</span><input v-model="rule.expectedJsonValue" class="mac-input" type="text" placeholder='"rate_limit"' /></label>
+              <label class="form-field"><span>{{ t('components.main.pool.blacklistThreshold') }}</span><input v-model.number="rule.threshold" class="mac-input" type="number" min="1" max="100" required /></label>
+              <label class="form-field"><span>{{ t('components.main.pool.blacklistDuration') }}</span><input v-model.number="rule.durationMinutes" class="mac-input" type="number" min="1" max="1440" required /></label>
+              <div class="special-rule-actions">
+                <button class="ghost-icon" type="button" :disabled="index === 0" :data-tooltip="t('components.main.pool.moveRuleUp')" @click="moveSpecialBlacklistRule(index, -1)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 6-6 6 6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg></button>
+                <button class="ghost-icon" type="button" :disabled="index === poolModalState.form.specialBlacklistRules.length - 1" :data-tooltip="t('components.main.pool.moveRuleDown')" @click="moveSpecialBlacklistRule(index, 1)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 10 6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg></button>
+                <button class="ghost-icon" type="button" :data-tooltip="t('components.main.pool.deleteSpecialBlacklistRule')" @click="removeSpecialBlacklistRule(index)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18 18 6M6 6l12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg></button>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-field">
+            <span>{{ t('components.main.pool.firstTextRetry') }}</span>
+            <div class="blacklist-config">
+              <label class="pool-member-checkbox">
+                <input v-model="poolModalState.form.firstTextRetryEnabled" type="checkbox" />
+                <span class="member-checkbox-label">{{ t('components.main.pool.firstTextRetryEnable') }}</span>
+              </label>
+              <div v-if="poolModalState.form.firstTextRetryEnabled" class="blacklist-config-inputs">
+                <label class="form-field" style="margin-top: 8px;">
+                  <span>{{ t('components.main.pool.firstTextRetryTimeoutSeconds') }}</span>
+                  <input
+                    v-model.number="poolModalState.form.firstTextRetryTimeoutSeconds"
+                    type="number"
+                    min="5"
+                    max="240"
+                    step="1"
+                    class="mac-input"
+                    required
+                  />
+                  <span class="form-field-hint">{{ t('components.main.pool.firstTextRetryHint') }}</span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <label v-if="poolModalState.form.poolType === 'account'" class="pool-member-checkbox account-traffic-toggle">
+            <input v-model="poolModalState.form.excludeFromTotalTraffic" type="checkbox" />
+            <span class="member-checkbox-label">{{ t('components.main.pool.excludeFromTotalTraffic') }}</span>
+            <span class="form-field-hint">{{ t('components.main.pool.excludeFromTotalTrafficHint') }}</span>
+          </label>
+
           <!-- 普通池成员供应商 -->
-          <div v-else class="form-field">
+          <div v-if="poolModalState.form.poolType === 'normal'" class="form-field">
             <span>{{ t('components.main.pool.selectMembers') }}</span>
             <div class="pool-member-selector">
               <div
@@ -545,10 +851,10 @@
           </div>
 
           <footer class="form-actions">
-            <BaseButton variant="outline" type="button" @click="closePoolModal">
+            <BaseButton variant="outline" type="button" @click="closePoolModal()">
               {{ t('components.main.form.actions.cancel') }}
             </BaseButton>
-            <BaseButton type="submit">
+            <BaseButton type="submit" :disabled="poolSaveLoading || proxyConfigRequired || proxyNodeSelectionRequired">
               {{ t('components.main.form.actions.save') }}
             </BaseButton>
           </footer>
@@ -592,12 +898,28 @@ import {
   SetPoolBinding,
   ListProviderBlacklistStatus,
   ClearProviderBlacklist,
+  ListProxyConfigs,
+  RefreshProxyConfigs,
+  UploadProxyConfig,
+  DeleteProxyConfig,
+  HideProxyConfig,
+  ListHiddenProxyConfigs,
+  UnhideProxyConfig,
+  TestProxy,
+  GetProxySpeedTests,
   type AccountPoolKey,
+  type AccountPoolProxySelection,
+  type ProxyConfigSummary,
+  type ProxyNode,
+  type ProxyNodeLatencyResult,
+  type ProxySpeedTestSnapshot,
   type ProviderPool,
   type ProviderPoolMode,
   type ProviderPoolProviderPenalty,
   type ProviderPoolType,
+  type SpecialBlacklistRule,
 } from '../../services/providerPool'
+import { fetchAppSettings } from '../../services/appSettings'
 import type { AutomationCard } from '../../data/cards'
 import { showToast } from '../../utils/toast'
 
@@ -626,6 +948,7 @@ const emit = defineEmits<{
 
 const subTab = ref<'providers' | 'pools'>('providers')
 const pools = ref<ProviderPool[]>([])
+let poolLoadGeneration = 0
 let unsubscribeBlacklistChanged: (() => void) | undefined
 
 // favicon 缓存
@@ -642,9 +965,17 @@ interface PoolFormState {
   accountApiUrl: string
   accountResponsesEndpoint: string
   accountKeysText: string
+  proxyEnabled: boolean
+  proxySelection: AccountPoolProxySelection
+  proxyNodeId: string
+  autoDisableProxyWhenNoAvailable: boolean
   autoBlacklistEnabled: boolean
   autoBlacklistThreshold: number
   autoBlacklistDurationMinutes: number
+  specialBlacklistRules: SpecialBlacklistRule[]
+  firstTextRetryEnabled: boolean
+  firstTextRetryTimeoutSeconds: number
+  excludeFromTotalTraffic: boolean
 }
 
 const createEmptyPoolForm = (): PoolFormState => ({
@@ -657,9 +988,17 @@ const createEmptyPoolForm = (): PoolFormState => ({
   accountApiUrl: '',
   accountResponsesEndpoint: '/responses',
   accountKeysText: '',
+  proxyEnabled: false,
+  proxySelection: 'none',
+  proxyNodeId: '',
+  autoDisableProxyWhenNoAvailable: false,
   autoBlacklistEnabled: false,
   autoBlacklistThreshold: 3,
   autoBlacklistDurationMinutes: 10,
+  specialBlacklistRules: [],
+  firstTextRetryEnabled: false,
+  firstTextRetryTimeoutSeconds: 100,
+  excludeFromTotalTraffic: false,
 })
 
 const poolModalState = reactive<{
@@ -672,6 +1011,455 @@ const poolModalState = reactive<{
   form: createEmptyPoolForm(),
 })
 
+const proxyConfigs = ref<ProxyConfigSummary[]>([])
+const hiddenProxyConfigs = ref<ProxyConfigSummary[]>([])
+const proxyConfigsLoading = ref(false)
+const proxyUploadLoading = ref(false)
+const proxyBulkTestLoading = ref(false)
+const proxyBulkTestCompleted = ref(false)
+const proxyNodeLatencyResults = ref<Record<string, ProxyNodeLatencyResult>>({})
+const proxyLastTestedAt = ref('')
+const proxyBulkTestPoolID = ref('')
+const proxyBulkTestTargetURL = ref('')
+const proxyConfigExpanded = ref<Record<string, boolean>>({})
+const proxyConfigActionLoading = ref<string | null>(null)
+const poolSaveLoading = ref(false)
+const maxProxyConfigSize = 4 * 1024 * 1024
+let proxyBulkTestGeneration = 0
+let proxyBulkTestAbortController: AbortController | null = null
+let proxyConfigLoadGeneration = 0
+let poolModalGeneration = 0
+const proxyNodes = computed(() => proxyConfigs.value.flatMap((config) => config.nodes))
+const hasProxyNodes = computed(() => proxyNodes.value.length > 0)
+const proxyConfigRequired = computed(() =>
+  poolModalState.form.poolType === 'account' && poolModalState.form.proxyEnabled && !hasProxyNodes.value
+)
+const proxyNodeSelectionRequired = computed(() =>
+  poolModalState.form.poolType === 'account'
+  && poolModalState.form.proxyEnabled
+  && poolModalState.form.proxySelection === 'node'
+  && !proxyNodes.value.some((node) => node.id === poolModalState.form.proxyNodeId)
+)
+
+const proxyConfigFileName = (config: ProxyConfigSummary) => config.fileName || config.name
+const selectedProxyNodeHidden = computed(() =>
+  poolModalState.form.proxySelection === 'node'
+  && hiddenProxyConfigs.value.some((config) => config.nodes.some((node) => node.id === poolModalState.form.proxyNodeId))
+)
+const proxyBulkTestAllVisibleNodesTested = computed(() =>
+  proxyBulkTestCompleted.value
+  && proxyNodes.value.length > 0
+  && proxyNodes.value.every((node) => proxyNodeLatencyResults.value[node.id]?.tested === true)
+)
+const proxyBulkTestIncomplete = computed(() =>
+  proxyBulkTestCompleted.value && !proxyBulkTestAllVisibleNodesTested.value
+)
+const proxyAutoSelectedNode = computed(() => {
+  let selected: ProxyNode | undefined
+  let lowest: number | undefined
+  for (const node of proxyNodes.value) {
+    const result = proxyNodeLatencyResults.value[node.id]
+    const latency = result?.tested ? result.responsesLatencyMs : undefined
+    if (latency == null || latency <= 0 || (lowest != null && latency >= lowest)) continue
+    lowest = latency
+    selected = node
+  }
+  return selected
+})
+const autoProxyLatency = computed(() => {
+  const selected = proxyAutoSelectedNode.value
+  return selected ? proxyNodeLatencyResults.value[selected.id]?.responsesLatencyMs : undefined
+})
+const proxyAutoLatencyLabel = computed(() => {
+  if (!proxyBulkTestCompleted.value) return t('components.main.pool.proxyNotTested')
+  if (autoProxyLatency.value != null) return `${autoProxyLatency.value} ms`
+  return proxyBulkTestAllVisibleNodesTested.value
+    ? t('components.main.pool.proxyAllUnavailable')
+    : t('components.main.pool.proxyBulkTestIncomplete')
+})
+const proxyAutoLatencyClass = computed(() => ({
+  available: autoProxyLatency.value != null,
+  unavailable: proxyBulkTestAllVisibleNodesTested.value && autoProxyLatency.value == null,
+  unknown: !proxyBulkTestCompleted.value || proxyBulkTestIncomplete.value,
+}))
+const proxyAutoLatencyTooltip = computed(() => {
+  if (!proxyBulkTestCompleted.value) return t('components.main.pool.proxyNotTested')
+  if (autoProxyLatency.value != null) {
+    return proxyBulkTestAllVisibleNodesTested.value
+      ? t('components.main.pool.proxyAutoLowestLatency', { latency: autoProxyLatency.value })
+      : t('components.main.pool.proxyAutoPartialFastestLatency', { latency: autoProxyLatency.value })
+  }
+  return proxyBulkTestAllVisibleNodesTested.value
+    ? t('components.main.pool.proxyAllUnavailable')
+    : t('components.main.pool.proxyBulkTestIncomplete')
+})
+const proxyLastTestedLabel = computed(() => {
+  if (!proxyLastTestedAt.value) return ''
+  const testedAt = Date.parse(proxyLastTestedAt.value)
+  if (Number.isNaN(testedAt)) return ''
+  const minutes = Math.max(0, Math.floor((Date.now() - testedAt) / 60_000))
+  return t('components.main.pool.proxyLastTested', { minutes })
+})
+
+const proxyNodeWasTested = (nodeID: string) => proxyNodeLatencyResults.value[nodeID]?.tested === true
+
+const proxyTestFailureLabel = (error?: string) => {
+  const normalized = String(error || '').toLowerCase()
+  if (normalized.includes('cloudflare')) {
+    return t('components.main.pool.proxyCloudflareBlocked')
+  }
+  if (normalized.includes('timeout') || normalized.includes('deadline') || normalized.includes('超时')) {
+    return t('components.main.pool.proxyTimeout')
+  }
+  return t('components.main.pool.proxyUnavailable')
+}
+
+const proxyNodeLatencyLabel = (nodeID: string) => {
+  if (!proxyNodeWasTested(nodeID)) return t('components.main.pool.proxyNotTested')
+  const latency = proxyNodeLatencyResults.value[nodeID]?.proxyLatencyMs
+  return latency != null && latency > 0
+    ? `${latency} ms`
+    : proxyTestFailureLabel(proxyNodeLatencyResults.value[nodeID]?.proxyError)
+}
+
+const proxyNodeLatencyClass = (nodeID: string) => {
+  const tested = proxyNodeWasTested(nodeID)
+  const latency = tested ? proxyNodeLatencyResults.value[nodeID]?.proxyLatencyMs : undefined
+  return {
+    available: latency != null && latency > 0,
+    unavailable: tested && (latency == null || latency <= 0),
+    unknown: !tested,
+  }
+}
+
+const proxyNodeLatencyDetail = (nodeID: string) => {
+  const result = proxyNodeLatencyResults.value[nodeID]
+  if (!result?.tested) return t('components.main.pool.proxyNotTested')
+  if (result?.proxyLatencyMs != null && result.proxyLatencyMs > 0) return ''
+  return proxyTestFailureLabel(result?.proxyError)
+}
+
+const proxyNodeLatencyTooltip = (nodeID: string) => {
+  if (!proxyNodeWasTested(nodeID)) return t('components.main.pool.proxyNotTested')
+  const detail = proxyNodeLatencyDetail(nodeID)
+  return detail || `${proxyNodeLatencyResults.value[nodeID]?.proxyLatencyMs} ms`
+}
+
+const proxyNodeResponsesLabel = (nodeID: string) => {
+  const result = proxyNodeLatencyResults.value[nodeID]
+  if (!result?.tested) return t('components.main.pool.proxyNotTested')
+  return result.responsesLatencyMs != null
+    ? `${result.responsesLatencyMs} ms`
+    : proxyTestFailureLabel(result.responsesError || result.proxyError)
+}
+
+const proxyNodeResponsesClass = (nodeID: string) => {
+  const result = proxyNodeLatencyResults.value[nodeID]
+  return {
+    available: result?.responsesLatencyMs != null,
+    unavailable: result?.tested === true && result.responsesLatencyMs == null,
+    unknown: result?.tested !== true,
+  }
+}
+
+const proxyNodeResponsesTooltip = (nodeID: string) => {
+  const result = proxyNodeLatencyResults.value[nodeID]
+  if (!result?.tested) return t('components.main.pool.proxyNotTested')
+  if (result.responsesLatencyMs == null) return proxyTestFailureLabel(result.responsesError || result.proxyError)
+  return result.responsesStatus ? `HTTP ${result.responsesStatus} - ${result.responsesLatencyMs} ms` : `${result.responsesLatencyMs} ms`
+}
+
+const isSelectedProxyNode = (nodeID: string) =>
+  poolModalState.form.proxySelection === 'node' && poolModalState.form.proxyNodeId === nodeID
+
+const proxyConfigNodesRegionID = (configID: string) => `proxy-config-nodes-${configID}`
+const isProxyConfigExpanded = (configID: string) => proxyConfigExpanded.value[configID] === true
+const toggleProxyConfigExpanded = (configID: string) => {
+  proxyConfigExpanded.value = {
+    ...proxyConfigExpanded.value,
+    [configID]: !isProxyConfigExpanded(configID),
+  }
+}
+
+const syncProxyConfigExpanded = (configs: ProxyConfigSummary[]) => {
+  const next: Record<string, boolean> = {}
+  for (const config of configs) {
+    const includesCurrentSelection = poolModalState.form.proxySelection === 'node'
+      && config.nodes.some((node) => node.id === poolModalState.form.proxyNodeId)
+    next[config.id] = includesCurrentSelection || proxyConfigExpanded.value[config.id] === true
+  }
+  proxyConfigExpanded.value = next
+}
+
+const invalidateProxyBulkTest = () => {
+  proxyBulkTestGeneration += 1
+  proxyBulkTestAbortController?.abort()
+  proxyBulkTestAbortController = null
+  proxyBulkTestLoading.value = false
+  proxyBulkTestCompleted.value = false
+  proxyNodeLatencyResults.value = {}
+  proxyLastTestedAt.value = ''
+  proxyBulkTestPoolID.value = ''
+  proxyBulkTestTargetURL.value = ''
+}
+
+const invalidateAllProxyTests = () => {
+  invalidateProxyBulkTest()
+}
+
+const selectAutoProxy = () => {
+  poolModalState.form.proxySelection = 'auto'
+  poolModalState.form.proxyNodeId = ''
+}
+
+const selectProxyNode = (nodeID: string) => {
+  poolModalState.form.proxySelection = 'node'
+  poolModalState.form.proxyNodeId = nodeID
+}
+
+const selectProxyNodeIfAvailable = (nodeID: string) => {
+  if (proxyConfigsLoading.value) return
+  selectProxyNode(nodeID)
+}
+
+const toggleProxyEnabled = () => {
+  if (poolModalState.form.proxyEnabled && poolModalState.form.proxySelection === 'none') {
+    poolModalState.form.proxySelection = 'auto'
+  }
+  if (!poolModalState.form.proxyEnabled) {
+    invalidateProxyBulkTest()
+    poolModalState.form.proxySelection = 'none'
+    poolModalState.form.proxyNodeId = ''
+  }
+}
+
+const updateProxyConfigLists = async (loadVisibleConfigs: () => Promise<ProxyConfigSummary[]>) => {
+  const generation = ++proxyConfigLoadGeneration
+  proxyConfigsLoading.value = true
+  try {
+    const nextConfigs = await loadVisibleConfigs()
+    const nextHiddenConfigs = await ListHiddenProxyConfigs()
+    if (generation === proxyConfigLoadGeneration) {
+      proxyConfigs.value = nextConfigs
+      hiddenProxyConfigs.value = nextHiddenConfigs
+      syncProxyConfigExpanded(nextConfigs)
+      void loadSharedProxySpeedTests()
+    }
+  } catch (error) {
+    console.error('Failed to load proxy configs:', error)
+    if (generation === proxyConfigLoadGeneration) {
+      showToast(t('components.main.pool.proxyLoadFailed'), 'error')
+    }
+  } finally {
+    if (generation === proxyConfigLoadGeneration) {
+      proxyConfigsLoading.value = false
+    }
+  }
+}
+
+const loadProxyConfigs = () => {
+  if (proxyBulkTestLoading.value || proxyUploadLoading.value || proxyConfigActionLoading.value !== null) return
+  invalidateAllProxyTests()
+  return updateProxyConfigLists(RefreshProxyConfigs)
+}
+const listProxyConfigs = () => updateProxyConfigLists(ListProxyConfigs)
+
+const responsesProbeURL = () => {
+  const baseURL = poolModalState.form.accountApiUrl.trim()
+  const endpoint = poolModalState.form.accountResponsesEndpoint.trim()
+  if (!baseURL || !endpoint) return ''
+  return `${baseURL.replace(/\/+$/, '')}/${endpoint.replace(/^\/+/, '')}`
+}
+
+const loadSharedProxySpeedTests = async (isCurrent = () => true) => {
+  const targetURL = responsesProbeURL()
+  if (!targetURL) return
+  try {
+    const snapshot: ProxySpeedTestSnapshot = await GetProxySpeedTests(poolModalState.editingId, targetURL)
+    if (!isCurrent() || !poolModalState.open || responsesProbeURL() !== targetURL) return
+    const results: Record<string, ProxyNodeLatencyResult> = {}
+    for (const result of snapshot.results) {
+      results[result.nodeId] = result
+    }
+    proxyNodeLatencyResults.value = results
+    proxyLastTestedAt.value = snapshot.testedAt || ''
+    proxyBulkTestCompleted.value = snapshot.results.length > 0
+  } catch (error) {
+    console.error('Failed to load shared proxy speed tests:', error)
+  }
+}
+
+const uploadProxyConfig = async (event: Event) => {
+  if (proxyBulkTestLoading.value) return
+  const input = event.target as HTMLInputElement
+	const file = input.files?.[0]
+	input.value = ''
+	if (!file) return
+	if (file.size === 0 || file.size > maxProxyConfigSize) {
+		showToast(t('components.main.pool.proxyUploadTooLarge', { size: 4 }), 'error')
+		return
+	}
+	if (!window.confirm(t('components.main.pool.proxyUploadWarning'))) return
+	invalidateAllProxyTests()
+	proxyUploadLoading.value = true
+	try {
+		const content = await file.text()
+		await UploadProxyConfig(file.name, content)
+		showToast(t('components.main.pool.proxyUploadSuccess'), 'success')
+			await listProxyConfigs()
+	} catch (error: any) {
+    console.error('Failed to upload proxy config:', error)
+    showToast(error?.message || t('components.main.pool.proxyUploadFailed'), 'error')
+  } finally {
+    proxyUploadLoading.value = false
+  }
+}
+
+const deleteProxyConfig = async (config: ProxyConfigSummary) => {
+  if (proxyBulkTestLoading.value || proxyUploadLoading.value) return
+  const name = proxyConfigFileName(config)
+  if (!window.confirm(t('components.main.pool.deleteProxyConfigConfirm', { name }))) return
+
+  invalidateAllProxyTests()
+  proxyConfigActionLoading.value = config.id
+  try {
+    await DeleteProxyConfig(config.id)
+    showToast(t('components.main.pool.proxyConfigDeleted'), 'success')
+    await listProxyConfigs()
+  } catch (error: any) {
+    console.error('Failed to delete proxy config:', error)
+    showToast(error?.message || t('components.main.pool.proxyConfigDeleteFailed'), 'error')
+  } finally {
+    proxyConfigActionLoading.value = null
+  }
+}
+
+const hideProxyConfig = async (config: ProxyConfigSummary) => {
+  if (proxyBulkTestLoading.value || proxyUploadLoading.value) return
+  const name = proxyConfigFileName(config)
+  if (!window.confirm(t('components.main.pool.hideProxyConfigConfirm', { name }))) return
+
+  invalidateAllProxyTests()
+  proxyConfigActionLoading.value = config.id
+  try {
+    await HideProxyConfig(config.id)
+    showToast(t('components.main.pool.proxyConfigHidden'), 'success')
+    await listProxyConfigs()
+  } catch (error: any) {
+    console.error('Failed to hide proxy config:', error)
+    showToast(error?.message || t('components.main.pool.proxyConfigHideFailed'), 'error')
+  } finally {
+    proxyConfigActionLoading.value = null
+  }
+}
+
+const unhideProxyConfig = async (config: ProxyConfigSummary) => {
+  if (proxyBulkTestLoading.value || proxyUploadLoading.value) return
+  invalidateAllProxyTests()
+  proxyConfigActionLoading.value = config.id
+  try {
+    await UnhideProxyConfig(config.id)
+    showToast(t('components.main.pool.proxyConfigUnhidden'), 'success')
+    await listProxyConfigs()
+  } catch (error: any) {
+    console.error('Failed to unhide proxy config:', error)
+    showToast(error?.message || t('components.main.pool.proxyConfigUnhideFailed'), 'error')
+  } finally {
+    proxyConfigActionLoading.value = null
+  }
+}
+
+const testAllProxyLatencies = async () => {
+  if (proxyBulkTestLoading.value || !hasProxyNodes.value) return
+  const targetURL = responsesProbeURL()
+  if (!targetURL) {
+    showToast(t('components.main.pool.proxyBaseUrlRequired'), 'warning')
+    return
+  }
+  const poolID = poolModalState.editingId
+  const generation = ++proxyBulkTestGeneration
+  const controller = new AbortController()
+  proxyBulkTestAbortController = controller
+  proxyBulkTestLoading.value = true
+  proxyBulkTestCompleted.value = false
+  proxyNodeLatencyResults.value = {}
+  proxyLastTestedAt.value = ''
+  proxyBulkTestPoolID.value = poolID
+  proxyBulkTestTargetURL.value = targetURL
+  try {
+    const groups = proxyConfigs.value
+      .map((config) => [...config.nodes])
+      .filter((nodes) => nodes.length > 0)
+    let maxWorkers = 1
+    try {
+      const settings = await fetchAppSettings()
+      if (!controller.signal.aborted && settings.enable_proxy_latency_multithreading) {
+        maxWorkers = Math.min(4, Math.max(1, Math.trunc(settings.proxy_latency_max_concurrency || 1)))
+      }
+    } catch (error) {
+      console.warn('Failed to load proxy latency test settings; using one worker:', error)
+    }
+    let nextGroupIndex = 0
+    const workerCount = Math.min(maxWorkers, groups.length)
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (!controller.signal.aborted && generation === proxyBulkTestGeneration && nextGroupIndex < groups.length) {
+        const nodes = groups[nextGroupIndex++]
+        for (const node of nodes) {
+          if (controller.signal.aborted || generation !== proxyBulkTestGeneration) return
+          let result: ProxyNodeLatencyResult
+          try {
+            const speed = await TestProxy(poolID, node.id, targetURL, controller.signal)
+            result = {
+              nodeId: node.id,
+              tested: true,
+              proxyLatencyMs: speed.proxyLatencyMs,
+              proxyError: speed.proxyError,
+              responsesLatencyMs: speed.responsesLatencyMs,
+              responsesStatus: speed.responsesStatus,
+              responsesError: speed.responsesError,
+              responsesCloudflareBlocked: speed.responsesCloudflareBlocked,
+            }
+          } catch (error: any) {
+            if (controller.signal.aborted || generation !== proxyBulkTestGeneration) return
+            result = { nodeId: node.id, tested: true, proxyError: error?.message || t('components.main.pool.proxyUnavailable') }
+          }
+          if (!controller.signal.aborted
+            && generation === proxyBulkTestGeneration
+            && poolModalState.open
+            && poolModalState.editingId === poolID
+            && responsesProbeURL() === targetURL) {
+            proxyNodeLatencyResults.value = { ...proxyNodeLatencyResults.value, [node.id]: result }
+          }
+        }
+      }
+    })
+    await Promise.all(workers)
+    if (!controller.signal.aborted
+      && generation === proxyBulkTestGeneration
+      && poolModalState.open
+      && poolModalState.editingId === poolID
+      && responsesProbeURL() === targetURL) {
+      proxyBulkTestCompleted.value = true
+      // The latency probes are done. Do not leave the action disabled while
+      // the separate shared-cache refresh is still waiting on the server.
+      if (proxyBulkTestAbortController === controller) {
+        proxyBulkTestAbortController = null
+        proxyBulkTestLoading.value = false
+        proxyBulkTestPoolID.value = ''
+        proxyBulkTestTargetURL.value = ''
+      }
+      await loadSharedProxySpeedTests(() => !controller.signal.aborted && generation === proxyBulkTestGeneration && responsesProbeURL() === targetURL)
+    }
+  } finally {
+    if (generation === proxyBulkTestGeneration && proxyBulkTestAbortController === controller) {
+      proxyBulkTestAbortController = null
+      proxyBulkTestLoading.value = false
+      proxyBulkTestPoolID.value = ''
+      proxyBulkTestTargetURL.value = ''
+    }
+  }
+}
+
 // 删除确认状态
 const deleteConfirmState = reactive({
   open: false,
@@ -680,8 +1468,19 @@ const deleteConfirmState = reactive({
 
 // 拉黑状态缓存
 const blacklistStatus = ref<Map<string, ProviderPoolProviderPenalty[]>>(new Map())
+const blacklistPoolGenerations = new Map<string, number>()
 
-const loadBlacklistStatus = async () => {
+const nextBlacklistGeneration = (poolID: string) => {
+  const next = (blacklistPoolGenerations.get(poolID) || 0) + 1
+  blacklistPoolGenerations.set(poolID, next)
+  return next
+}
+
+const loadBlacklistStatus = async (generation = poolLoadGeneration) => {
+  const requestGenerations = new Map<string, number>()
+  for (const pool of pools.value) {
+    requestGenerations.set(pool.id, nextBlacklistGeneration(pool.id))
+  }
   const statusMap = new Map<string, ProviderPoolProviderPenalty[]>()
   for (const pool of pools.value) {
     try {
@@ -690,8 +1489,16 @@ const loadBlacklistStatus = async () => {
     } catch (error) {
       console.error('Failed to load blacklist status:', error)
     }
+    if (generation !== poolLoadGeneration || requestGenerations.get(pool.id) !== blacklistPoolGenerations.get(pool.id)) continue
   }
-  blacklistStatus.value = statusMap
+  if (generation !== poolLoadGeneration) return
+  const nextStatus = new Map(blacklistStatus.value)
+  for (const [poolID, statuses] of statusMap) {
+    if (requestGenerations.get(poolID) === blacklistPoolGenerations.get(poolID)) {
+      nextStatus.set(poolID, statuses)
+    }
+  }
+  blacklistStatus.value = nextStatus
 }
 
 type ProviderBlacklistChangedEvent = {
@@ -699,12 +1506,14 @@ type ProviderBlacklistChangedEvent = {
   poolID?: string
 }
 
-const loadBlacklistStatusForPool = async (poolID: string) => {
+const loadBlacklistStatusForPool = async (poolID: string, generation = poolLoadGeneration) => {
+  const requestGeneration = nextBlacklistGeneration(poolID)
   if (!pools.value.some((pool) => pool.id === poolID)) {
     return
   }
   try {
     const statuses = await ListProviderBlacklistStatus(props.platform, poolID)
+    if (generation !== poolLoadGeneration || requestGeneration !== blacklistPoolGenerations.get(poolID)) return
     const next = new Map(blacklistStatus.value)
     next.set(poolID, statuses)
     blacklistStatus.value = next
@@ -719,19 +1528,24 @@ const handleProviderBlacklistChanged = (event: { data: ProviderBlacklistChangedE
     return
   }
   if (poolID) {
-    void loadBlacklistStatusForPool(poolID)
+    void loadBlacklistStatusForPool(poolID, poolLoadGeneration)
     return
   }
   void loadBlacklistStatus()
 }
 
 const loadPools = async () => {
+  const generation = ++poolLoadGeneration
   try {
-    pools.value = await ListPools(props.platform)
-    await loadBlacklistStatus()
+    const nextPools = await ListPools(props.platform)
+    if (generation !== poolLoadGeneration) return
+    pools.value = nextPools
+    await loadBlacklistStatus(generation)
   } catch (error) {
     console.error('Failed to load pools:', error)
-    showToast(t('components.main.pool.loadFailed'), 'error')
+    if (generation === poolLoadGeneration) {
+      showToast(t('components.main.pool.loadFailed'), 'error')
+    }
   }
 }
 
@@ -889,12 +1703,22 @@ const updateMemberLevel = async (poolID: string, providerId: number, level: numb
 }
 
 const openCreatePool = () => {
+	poolModalGeneration += 1
+  invalidateAllProxyTests()
   poolModalState.editingId = ''
   poolModalState.form = createEmptyPoolForm()
   poolModalState.open = true
 }
 
 const openEditPool = (pool: ProviderPool) => {
+	poolModalGeneration += 1
+  const targetURL = pool.accountPoolConfig
+    ? `${pool.accountPoolConfig.apiUrl.trim().replace(/\/+$/, '')}/${pool.accountPoolConfig.responsesEndpoint.trim().replace(/^\/+/, '')}`
+    : ''
+  const resumeBulkTest = proxyBulkTestLoading.value
+    && proxyBulkTestPoolID.value === pool.id
+    && proxyBulkTestTargetURL.value === targetURL
+  if (!resumeBulkTest) invalidateAllProxyTests()
   poolModalState.editingId = pool.id
   const levels: Record<number, number> = {}
   for (const m of pool.members ?? []) {
@@ -910,11 +1734,20 @@ const openEditPool = (pool: ProviderPool) => {
     accountApiUrl: pool.accountPoolConfig?.apiUrl ?? '',
     accountResponsesEndpoint: pool.accountPoolConfig?.responsesEndpoint || '/responses',
     accountKeysText: (pool.accountPoolConfig?.keys ?? []).map((key) => key.apiKey).join('\n'),
+    proxyEnabled: pool.proxyConfig?.enabled ?? false,
+    proxySelection: pool.proxyConfig?.selection === 'node' ? 'node' : pool.proxyConfig?.enabled ? 'auto' : 'none',
+    proxyNodeId: pool.proxyConfig?.proxyNodeId ?? '',
+    autoDisableProxyWhenNoAvailable: pool.proxyConfig?.autoDisableWhenNoAvailable ?? false,
     autoBlacklistEnabled: pool.autoBlacklistEnabled ?? false,
     autoBlacklistThreshold: pool.autoBlacklistThreshold || 3,
     autoBlacklistDurationMinutes: pool.autoBlacklistDurationMinutes || 10,
+    specialBlacklistRules: (pool.specialBlacklistRules ?? []).map((rule) => ({ ...rule })),
+    firstTextRetryEnabled: pool.firstTextRetryEnabled ?? false,
+    firstTextRetryTimeoutSeconds: pool.firstTextRetryTimeoutSeconds || 100,
+    excludeFromTotalTraffic: pool.excludeFromTotalTraffic ?? false,
   }
   poolModalState.open = true
+  if (resumeBulkTest) void loadSharedProxySpeedTests()
 }
 
 const isMemberSelected = (providerId: number | string): boolean =>
@@ -923,7 +1756,12 @@ const isMemberSelected = (providerId: number | string): boolean =>
 const getMemberLevel = (providerId: number | string): number =>
   poolModalState.form.memberLevels[normalizeProviderId(providerId)] ?? 1
 
-const closePoolModal = () => {
+const closePoolModal = async (force = false) => {
+	if (!force && poolModalState.editingId) {
+		const saved = await submitPoolModal(false)
+		if (!saved) return
+	}
+	poolModalGeneration += 1
   poolModalState.open = false
 }
 
@@ -958,7 +1796,91 @@ const parseAccountKeys = (text: string): string[] => {
   return keys
 }
 
-const submitPoolModal = async () => {
+const addSpecialBlacklistRule = () => {
+  const id = typeof crypto?.randomUUID === 'function'
+    ? `rule_${crypto.randomUUID()}`
+    : `rule_${Date.now()}_${Math.random().toString(36).slice(2)}`
+  poolModalState.form.specialBlacklistRules.push({
+    id,
+    name: '',
+    httpStatus: 429,
+    jsonPath: '',
+    expectedJsonValue: '',
+    threshold: 1,
+    durationMinutes: 10,
+  })
+}
+
+const removeSpecialBlacklistRule = (index: number) => {
+  poolModalState.form.specialBlacklistRules.splice(index, 1)
+}
+
+const moveSpecialBlacklistRule = (index: number, direction: -1 | 1) => {
+  const destination = index + direction
+  const rules = poolModalState.form.specialBlacklistRules
+  if (destination < 0 || destination >= rules.length) return
+  const [rule] = rules.splice(index, 1)
+  rules.splice(destination, 0, rule)
+}
+
+const poolConfigSignature = (pool: Partial<ProviderPool>) => {
+  const poolType = pool.poolType ?? 'normal'
+  const members = (pool.members ?? [])
+    .map((member) => ({
+      providerId: normalizeProviderId(member.providerId),
+      enabled: member.enabled !== false,
+      level: member.level ?? 1,
+    }))
+    .sort((left, right) => left.providerId - right.providerId)
+  const specialBlacklistRules = (pool.specialBlacklistRules ?? []).map((rule) => ({
+    id: rule.id,
+    name: rule.name.trim(),
+    httpStatus: rule.httpStatus,
+    jsonPath: rule.jsonPath ?? '',
+    expectedJsonValue: rule.expectedJsonValue ?? '',
+    threshold: rule.threshold,
+    durationMinutes: rule.durationMinutes,
+  }))
+  const accountPoolConfig = pool.accountPoolConfig
+
+  return JSON.stringify({
+    platform: pool.platform,
+    name: pool.name?.trim() ?? '',
+    poolType,
+    mode: poolType === 'account' ? 'managed' : pool.mode,
+    manualProviderId: poolType === 'account' ? null : pool.manualProviderId ?? null,
+    members: poolType === 'account' ? [] : members,
+    autoBlacklistEnabled: poolType === 'account' ? true : pool.autoBlacklistEnabled ?? false,
+    autoBlacklistThreshold: pool.autoBlacklistThreshold ?? 3,
+    autoBlacklistDurationMinutes: pool.autoBlacklistDurationMinutes ?? 10,
+    specialBlacklistRules,
+    firstTextRetryEnabled: pool.firstTextRetryEnabled === true,
+    firstTextRetryTimeoutSeconds: pool.firstTextRetryTimeoutSeconds ?? 100,
+    excludeFromTotalTraffic: poolType === 'account' ? pool.excludeFromTotalTraffic === true : false,
+    proxyConfig: poolType === 'account'
+      ? {
+          enabled: pool.proxyConfig?.enabled === true,
+          selection: pool.proxyConfig?.enabled ? (pool.proxyConfig.selection || 'auto') : 'none',
+          proxyNodeId: pool.proxyConfig?.enabled && pool.proxyConfig.selection === 'node'
+            ? pool.proxyConfig.proxyNodeId ?? ''
+            : '',
+          autoDisableWhenNoAvailable: pool.proxyConfig?.enabled && pool.proxyConfig.selection !== 'node'
+            ? pool.proxyConfig.autoDisableWhenNoAvailable === true
+            : false,
+        }
+      : undefined,
+    accountPoolConfig: poolType === 'account'
+      ? {
+          apiUrl: accountPoolConfig?.apiUrl.trim() ?? '',
+          responsesEndpoint: accountPoolConfig?.responsesEndpoint.trim() ?? '',
+          keys: (accountPoolConfig?.keys ?? []).map((key) => key.apiKey),
+        }
+      : undefined,
+  })
+}
+
+const submitPoolModal = async (closeAfterSave = true): Promise<boolean> => {
+	if (poolSaveLoading.value) return false
   const { name, memberProviderIds } = poolModalState.form
   const existingPool = poolModalState.editingId
     ? pools.value.find((pool) => pool.id === poolModalState.editingId)
@@ -967,19 +1889,36 @@ const submitPoolModal = async () => {
     ? poolModalState.form.poolType
     : 'normal'
 
+  if (poolType === 'account' && poolModalState.form.proxyEnabled && !hasProxyNodes.value) {
+    showToast(t('components.main.pool.proxyConfigRequired'), 'error')
+    return false
+  }
+  if (poolType === 'account' && proxyNodeSelectionRequired.value) {
+    showToast(
+      selectedProxyNodeHidden.value
+        ? t('components.main.pool.proxyNodeHidden')
+        : t('components.main.pool.proxyNodeRequired'),
+      'error',
+    )
+    return false
+  }
+
   const poolData: any = {
     platform: props.platform,
     name,
     poolType,
     autoBlacklistThreshold: poolModalState.form.autoBlacklistThreshold,
     autoBlacklistDurationMinutes: poolModalState.form.autoBlacklistDurationMinutes,
+    specialBlacklistRules: poolModalState.form.specialBlacklistRules.map((rule) => ({ ...rule })),
+    firstTextRetryEnabled: poolModalState.form.firstTextRetryEnabled,
+    firstTextRetryTimeoutSeconds: Math.min(240, Math.max(5, Math.trunc(poolModalState.form.firstTextRetryTimeoutSeconds || 100))),
   }
 
   if (poolType === 'account') {
     const parsedKeys = parseAccountKeys(poolModalState.form.accountKeysText)
     if (parsedKeys.length === 0) {
       showToast(t('components.main.pool.accountPoolKeysRequired'), 'error')
-      return
+      return false
     }
 
     const existingKeysBySecret = new Map<string, AccountPoolKey>(
@@ -989,6 +1928,17 @@ const submitPoolModal = async () => {
     poolData.manualProviderId = null
     poolData.members = []
     poolData.autoBlacklistEnabled = true
+    poolData.excludeFromTotalTraffic = poolModalState.form.excludeFromTotalTraffic
+    poolData.proxyConfig = poolModalState.form.proxyEnabled
+      ? {
+          enabled: true,
+          selection: poolModalState.form.proxySelection,
+          proxyNodeId: poolModalState.form.proxySelection === 'node' ? poolModalState.form.proxyNodeId : '',
+          autoDisableWhenNoAvailable: poolModalState.form.proxySelection === 'auto'
+            ? poolModalState.form.autoDisableProxyWhenNoAvailable
+            : false,
+        }
+      : { enabled: false, selection: 'none', proxyNodeId: '', autoDisableWhenNoAvailable: false }
     poolData.accountPoolConfig = {
       apiUrl: poolModalState.form.accountApiUrl.trim(),
       responsesEndpoint: poolModalState.form.accountResponsesEndpoint.trim(),
@@ -1019,25 +1969,42 @@ const submitPoolModal = async () => {
     poolData.autoBlacklistEnabled = poolModalState.form.autoBlacklistEnabled
   }
 
-  if (poolModalState.editingId) {
-    poolData.id = poolModalState.editingId
+	if (poolModalState.editingId) {
+		poolData.id = poolModalState.editingId
+	}
+	if (existingPool && poolConfigSignature(existingPool) === poolConfigSignature(poolData)) {
+    if (closeAfterSave) await closePoolModal(true)
+    return true
   }
 
-  try {
-    await SavePool(poolData)
-    showToast(
-      poolModalState.editingId
+	const generation = poolModalGeneration
+	const wasEditing = Boolean(poolModalState.editingId)
+	poolSaveLoading.value = true
+	try {
+		await SavePool(poolData)
+		if (generation !== poolModalGeneration) {
+			await loadPools()
+			return false
+		}
+		showToast(
+			wasEditing
         ? t('components.main.pool.poolUpdated')
         : t('components.main.pool.poolCreated'),
       'success'
     )
-    closePoolModal()
+    if (closeAfterSave) await closePoolModal(true)
     await loadPools()
     emit('refresh')
-  } catch (error: any) {
-    console.error('Failed to save pool:', error)
-    showToast(error?.message || t('components.main.pool.saveFailed'), 'error')
-  }
+		return true
+	} catch (error: any) {
+		console.error('Failed to save pool:', error)
+		if (generation === poolModalGeneration) {
+			showToast(error?.message || t('components.main.pool.saveFailed'), 'error')
+		}
+		return false
+	} finally {
+		poolSaveLoading.value = false
+	}
 }
 
 const requestDeletePool = (pool: ProviderPool) => {
@@ -1065,6 +2032,28 @@ const getBlacklistRemainingMinutes = (penalty: ProviderPoolProviderPenalty): num
   const remaining = Math.ceil((until - now) / 60000)
   return Math.max(0, remaining)
 }
+
+const getBlacklistPenalty = (pool: ProviderPool, providerID: number): ProviderPoolProviderPenalty | undefined =>
+  (blacklistStatus.value.get(pool.id) ?? []).find((penalty) => sameProviderId(penalty.providerID, providerID))
+
+const getBlacklistReason = (pool: ProviderPool, providerID: number): string => {
+  return getPenaltyReason(pool, getBlacklistPenalty(pool, providerID))
+}
+
+const getPenaltyReason = (pool: ProviderPool, penalty?: ProviderPoolProviderPenalty): string => {
+  const reason = penalty?.lastReason?.trim()
+  if (!reason) return 'HTTP error'
+  if (!isAccountPool(pool)) return reason.match(/HTTP\s+\d{3}/i)?.[0]?.toUpperCase() ?? reason
+  const specialRule = (pool.specialBlacklistRules ?? []).find((rule) => rule.name === reason)
+  if (specialRule) return specialRule.name
+  return reason.match(/HTTP\s+\d{3}/i)?.[0]?.toUpperCase() ?? reason
+}
+
+const getAvailableAccountKeys = (pool: ProviderPool): AccountPoolKey[] =>
+  (pool.accountPoolConfig?.keys ?? []).filter((key) => !getBlacklistPenalty(pool, key.id))
+
+const getBlacklistedAccountKeys = (pool: ProviderPool): AccountPoolKey[] =>
+  (pool.accountPoolConfig?.keys ?? []).filter((key) => getBlacklistPenalty(pool, key.id))
 
 // 根据 provider ID 获取 provider 名称
 const getProviderNameById = (providerID: number): string => {
@@ -1099,7 +2088,7 @@ const confirmDeletePool = async () => {
 }
 
 onMounted(() => {
-  loadPools()
+  void loadPools()
   unsubscribeBlacklistChanged = Events.On('provider:blacklist:changed', handleProviderBlacklistChanged)
 })
 
@@ -1113,14 +2102,441 @@ onUnmounted(() => {
 watch(
   () => props.platform,
   () => {
-    loadPools()
+    closePoolModal(true)
+    void loadPools()
   }
+)
+
+watch(
+	() => [poolModalState.open, poolModalState.form.poolType] as const,
+	([open, poolType], [previousOpen, previousPoolType]) => {
+		if (poolType !== previousPoolType) {
+			invalidateAllProxyTests()
+		}
+		if (open && poolType === 'account' && (!previousOpen || previousPoolType !== 'account')) {
+			void loadProxyConfigs()
+		}
+	}
+)
+
+watch(
+  () => [poolModalState.form.accountApiUrl, poolModalState.form.accountResponsesEndpoint] as const,
+  () => {
+    invalidateProxyBulkTest()
+  },
 )
 </script>
 
 <style scoped>
 .pool-panel {
   width: 100%;
+}
+
+.pool-proxy-section {
+  border-top: 1px solid var(--color-border, #e5e7eb);
+  padding-top: 12px;
+}
+
+.pool-proxy-config {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.pool-proxy-error {
+  color: var(--color-danger, #b91c1c);
+}
+
+.proxy-strategy-group {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.proxy-strategy-group-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--color-text, #1f2937);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.proxy-last-tested {
+  margin-left: auto;
+  color: var(--color-text-muted, #6b7280);
+  font-size: 12px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.proxy-bulk-test-button {
+  flex: 0 0 auto;
+}
+
+.proxy-strategy-board {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.proxy-strategy-card {
+  position: relative;
+  display: block;
+  min-width: 0;
+  border: 1px solid var(--color-border, #d1d5db);
+  border-radius: 6px;
+  background: var(--color-bg, #ffffff);
+  color: var(--color-text, #1f2937);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.proxy-strategy-card:hover:not(.disabled) {
+  border-color: var(--color-primary, #3b82f6);
+  background: var(--color-bg-hover, rgba(0, 0, 0, 0.04));
+}
+
+.proxy-strategy-card.selected {
+  border-color: var(--color-primary, #3b82f6);
+  box-shadow: inset 3px 0 0 var(--color-primary, #3b82f6);
+}
+
+.proxy-strategy-card.disabled {
+  cursor: default;
+  opacity: 0.56;
+}
+
+.proxy-strategy-radio {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.proxy-strategy-card-content {
+  display: grid;
+  grid-template-areas:
+    'name latency'
+    'meta latency';
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 10px;
+  min-height: 58px;
+  padding: 9px 10px;
+}
+
+.proxy-node-card .proxy-strategy-card-content {
+  grid-template-areas: 'name metrics';
+  grid-template-columns: minmax(0, 1fr) minmax(168px, auto);
+  align-items: center;
+}
+
+.proxy-auto-card .proxy-strategy-card-content {
+  grid-template-areas: 'name selection';
+  grid-template-columns: minmax(0, 1fr) minmax(0, 58%);
+  align-items: center;
+}
+
+.proxy-auto-selection {
+  grid-area: selection;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: end;
+  gap: 8px;
+}
+
+.proxy-auto-selected-node {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 12px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proxy-node-metrics {
+  grid-area: metrics;
+  display: grid;
+  gap: 4px;
+}
+
+.proxy-node-metric {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: end;
+  gap: 6px;
+}
+
+.proxy-node-metric-label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 11px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proxy-strategy-radio:focus-visible + .proxy-strategy-card-content {
+  outline: 2px solid var(--color-primary, #3b82f6);
+  outline-offset: -2px;
+}
+
+.proxy-strategy-card-name {
+  grid-area: name;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.proxy-strategy-card-meta {
+  grid-area: meta;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 12px;
+}
+
+.proxy-strategy-card-meta.is-error {
+  color: var(--color-danger, #b91c1c);
+}
+
+.proxy-strategy-latency {
+  grid-area: latency;
+  align-self: center;
+  min-width: 54px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--color-bg-header, rgba(0, 0, 0, 0.04));
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 12px;
+  line-height: 1.2;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.proxy-strategy-latency.available {
+  color: var(--color-success, #059669);
+}
+
+.proxy-strategy-latency.unavailable {
+  color: var(--color-danger, #b91c1c);
+}
+
+.proxy-strategy-latency.unknown {
+  border: 1px dashed var(--color-border, #d1d5db);
+  background: transparent;
+}
+
+.proxy-auto-card .proxy-strategy-latency {
+  flex: none;
+}
+
+.proxy-config-section {
+  min-width: 0;
+  border: 1px solid var(--color-border, #d1d5db);
+  border-radius: 6px;
+  background: var(--color-bg, #ffffff);
+  overflow: hidden;
+}
+
+.proxy-config-disclosure {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text, #1f2937);
+  cursor: pointer;
+  text-align: left;
+}
+
+.proxy-config-disclosure:hover {
+  background: var(--color-bg-hover, rgba(0, 0, 0, 0.04));
+}
+
+.proxy-config-disclosure:focus-visible {
+  outline: 2px solid var(--color-primary, #3b82f6);
+  outline-offset: -2px;
+}
+
+.proxy-config-disclosure-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.proxy-config-disclosure-name {
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.proxy-config-disclosure-meta {
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 12px;
+}
+
+.proxy-config-disclosure-indicator {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg) translate(-2px, -2px);
+  transition: transform 0.15s ease;
+}
+
+.proxy-config-disclosure-indicator.expanded {
+  transform: rotate(225deg) translate(-1px, -1px);
+}
+
+.proxy-node-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 6px;
+  max-block-size: 360px;
+  overflow: auto;
+  padding: 8px 8px 14px;
+  box-sizing: border-box;
+  border-top: 1px solid var(--color-border, #e5e7eb);
+  background: var(--color-bg-header, rgba(0, 0, 0, 0.02));
+}
+
+.proxy-test-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.proxy-upload-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.proxy-upload-button {
+  position: relative;
+  overflow: hidden;
+}
+
+.proxy-upload-button input[type='file'] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.proxy-upload-button.disabled {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.proxy-config-list {
+  display: grid;
+  gap: 6px;
+}
+
+.proxy-hidden-configs {
+  display: grid;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--color-border, #e5e7eb);
+}
+
+.proxy-hidden-configs-heading {
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.proxy-config-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 6px;
+  background: var(--color-bg, #ffffff);
+}
+
+.proxy-config-details {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.proxy-config-name {
+  overflow-wrap: anywhere;
+  color: var(--color-text, #1f2937);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.proxy-config-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 12px;
+}
+
+.proxy-config-action {
+  display: inline-flex;
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-text-secondary, #6b7280);
+  cursor: pointer;
+}
+
+.proxy-config-action:hover:not(:disabled) {
+  border-color: var(--color-border, #d1d5db);
+  color: var(--color-primary, #3b82f6);
+  background: var(--color-bg-hover, rgba(0, 0, 0, 0.04));
+}
+
+.proxy-config-action.is-danger:hover:not(:disabled) {
+  color: var(--color-danger, #b91c1c);
+}
+
+.proxy-config-action:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.proxy-config-action svg {
+  width: 16px;
+  height: 16px;
+}
+
+.proxy-test-result {
+  display: grid;
+  gap: 4px;
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 12px;
+}
+
+.proxy-auto-no-available-nodes {
+  color: var(--color-primary, #3b82f6);
 }
 
 /* 子标签页 */
@@ -1514,7 +2930,51 @@ watch(
 .account-key-list {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 6px;
+}
+
+.account-key-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.account-key-row-blacklisted {
+  flex: 0 0 auto;
+  gap: 5px;
+  padding: 4px 7px;
+  border: 1px solid color-mix(in srgb, var(--color-danger, #ef4444) 30%, var(--color-border, #e5e7eb));
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--color-danger, #ef4444) 5%, transparent);
+}
+
+.blacklist-key-icon {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  color: var(--color-danger, #ef4444);
+}
+
+.account-key-row-blacklisted .account-key-chip {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.account-key-row-blacklisted .blacklist-time {
+  white-space: nowrap;
+  color: var(--color-text-secondary, #4b5563);
+  font-size: 10px;
+}
+
+.blacklist-minutes {
+  color: var(--color-danger, #ef4444);
+}
+
+.account-key-row-blacklisted .key-unbind-btn {
+  flex: 0 0 auto;
+  margin-left: 2px;
 }
 
 .account-key-chip {
@@ -1530,6 +2990,49 @@ watch(
 .pool-blacklist-section {
   padding: 8px 16px;
   border-top: 1px solid var(--color-border, #e5e7eb);
+}
+
+.blacklist-reason {
+  color: var(--color-danger, #ef4444);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.blacklist-reason-prefix,
+.blacklist-reason-suffix {
+  color: var(--color-text, #1f2937);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.special-blacklist-rules {
+  gap: 8px;
+}
+
+.special-rules-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.special-rule-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 6px;
+}
+
+.special-rule-row .form-field {
+  margin: 0;
+}
+
+.special-rule-actions {
+  display: flex;
+  align-items: end;
+  justify-content: end;
+  gap: 4px;
 }
 
 /* 池子内密钥区域 */
@@ -1559,6 +3062,31 @@ watch(
   border-radius: 6px;
   background: var(--color-bg-key, rgba(59, 130, 246, 0.06));
   font-size: 12px;
+}
+
+.pool-key-card.blacklisted {
+  border-color: color-mix(in srgb, var(--color-danger, #ef4444) 30%, var(--color-border, #e5e7eb));
+  background: color-mix(in srgb, var(--color-danger, #ef4444) 5%, transparent);
+}
+
+.pool-key-card.blacklisted .key-icon {
+  color: var(--color-danger, #ef4444) !important;
+}
+
+.pool-key-card.blacklisted .pool-key-name,
+.pool-key-card.blacklisted .blacklist-reason-prefix,
+.pool-key-card.blacklisted .blacklist-reason-suffix {
+  color: var(--color-text, #1f2937);
+}
+
+.pool-key-card.blacklisted .blacklist-reason,
+.pool-key-card.blacklisted .blacklist-minutes {
+  color: var(--color-danger, #ef4444);
+}
+
+.pool-key-card.blacklisted .blacklist-time {
+  color: var(--color-text-secondary, #4b5563);
+  font-size: 10px;
 }
 
 .pool-key-info {
@@ -1736,6 +3264,16 @@ watch(
   margin: 0;
 }
 
+.account-traffic-toggle {
+  align-items: flex-start;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border, #e5e7eb);
+}
+
+.account-traffic-toggle .form-field-hint {
+  margin-top: 2px;
+}
+
 .pool-mode-selector {
   display: flex;
   gap: 8px;
@@ -1818,6 +3356,16 @@ watch(
   accent-color: var(--color-primary, #3b82f6);
 }
 
+.proxy-auto-disable-toggle {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.proxy-auto-disable-toggle .form-field-hint {
+  flex-basis: 100%;
+  padding-left: 26px;
+}
+
 .member-checkbox-label {
   font-size: 13px;
   color: var(--color-text, #1f2937);
@@ -1839,7 +3387,24 @@ watch(
   gap: 2px;
 }
 
+@media (max-width: 1100px) {
+}
+
 @media (max-width: 760px) {
+  .proxy-strategy-group-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .proxy-bulk-test-button {
+    width: 100%;
+    white-space: normal;
+  }
+
+  .proxy-node-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .pool-sub-tabs {
     align-items: stretch;
     gap: 8px;
@@ -1857,6 +3422,10 @@ watch(
     flex: 0 0 auto;
     min-height: 36px;
     white-space: nowrap;
+  }
+
+  .proxy-bulk-test-button {
+    white-space: normal;
   }
 
   .sub-tab-actions {
@@ -1910,13 +3479,20 @@ watch(
   }
 
   .account-key-list {
-    display: grid;
-    grid-template-columns: 1fr;
+    align-items: stretch;
   }
 
   .account-key-chip {
     min-width: 0;
     overflow-wrap: anywhere;
+  }
+
+  .account-key-row {
+    align-items: flex-start;
+  }
+
+  .account-key-row-blacklisted {
+    flex-basis: 100%;
   }
 
   .pool-member-card {
@@ -1968,6 +3544,10 @@ watch(
   }
 
   .account-blacklist-inputs {
+    grid-template-columns: 1fr;
+  }
+
+  .special-rule-row {
     grid-template-columns: 1fr;
   }
 

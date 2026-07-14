@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func setupProviderPoolHTTPTest(t *testing.T, platform string, providers []Provider, pool *ProviderPool) (*ProviderRelayService, *gin.Engine, string, string) {
@@ -576,27 +578,27 @@ func TestHTTPAccountPoolStickyKeysBearerEndpointAndStaleBlacklist(t *testing.T) 
 		}
 	}
 
-	// A failure below threshold is sticky: the same request must not fall through.
+	// A stays selected through the threshold. Once it is blacklisted, B is
+	// selected in the next round and its success remains internal to the pool.
 	w1 := request()
-	if w1.Code != http.StatusBadGateway {
-		t.Fatalf("first account request status = %d, want 502: %s", w1.Code, w1.Body.String())
-	}
-	if firstHits != 1 || secondHits != 0 {
-		t.Fatalf("first account request hits = (%d, %d), want (1, 0)", firstHits, secondHits)
-	}
-	assertNoRawKey("first error response", w1.Body.String())
-	if statuses := relay.ListProviderBlacklistStatus("openai-responses", poolID); len(statuses) != 0 {
-		t.Fatalf("below-threshold account failure should not be listed as blacklisted: %+v", statuses)
-	}
-
-	// Listing status must preserve A's below-threshold failure count. The next
-	// failure blacklists A and falls through to B in the same request.
-	w2 := request()
-	if w2.Code != http.StatusOK || !strings.Contains(w2.Body.String(), "from-second-key") {
-		t.Fatalf("second account request should switch to key B, got %d: %s", w2.Code, w2.Body.String())
+	if w1.Code != http.StatusOK || !strings.Contains(w1.Body.String(), "from-second-key") {
+		t.Fatalf("first account request status = %d, want fallback success: %s", w1.Code, w1.Body.String())
 	}
 	if firstHits != 2 || secondHits != 1 {
-		t.Fatalf("second account request hits = (%d, %d), want (2, 1)", firstHits, secondHits)
+		t.Fatalf("first account request hits = (%d, %d), want (2, 1)", firstHits, secondHits)
+	}
+	assertNoRawKey("first fallback response", w1.Body.String())
+	if statuses := relay.ListProviderBlacklistStatus("openai-responses", poolID); len(statuses) != 1 || statuses[0].ProviderID != selected[0].ID {
+		t.Fatalf("first request should blacklist the selected key: %+v", statuses)
+	}
+
+	// While A is blacklisted, later requests start directly with B.
+	w2 := request()
+	if w2.Code != http.StatusOK || !strings.Contains(w2.Body.String(), "from-second-key") {
+		t.Fatalf("second account request should use key B, got %d: %s", w2.Code, w2.Body.String())
+	}
+	if firstHits != 2 || secondHits != 2 {
+		t.Fatalf("second account request hits = (%d, %d), want (2, 2)", firstHits, secondHits)
 	}
 	assertNoRawKey("successful response", w2.Body.String())
 
@@ -619,13 +621,13 @@ func TestHTTPAccountPoolStickyKeysBearerEndpointAndStaleBlacklist(t *testing.T) 
 		t.Fatal("account blacklist event was not emitted")
 	}
 
-	// While A is blacklisted, later requests start directly with B.
+	// The blacklisted key remains excluded from subsequent requests.
 	w3 := request()
 	if w3.Code != http.StatusOK {
 		t.Fatalf("third account request status = %d, want 200: %s", w3.Code, w3.Body.String())
 	}
-	if firstHits != 2 || secondHits != 2 {
-		t.Fatalf("third account request hits = (%d, %d), want (2, 2)", firstHits, secondHits)
+	if firstHits != 2 || secondHits != 3 {
+		t.Fatalf("third account request hits = (%d, %d), want (2, 3)", firstHits, secondHits)
 	}
 	lastUsed := relay.GetLastUsedProviderByPool("openai-responses", poolID)
 	if lastUsed == nil {
@@ -633,21 +635,19 @@ func TestHTTPAccountPoolStickyKeysBearerEndpointAndStaleBlacklist(t *testing.T) 
 	}
 	assertNoRawKey("last-used provider name", lastUsed.ProviderName)
 
-	// Manual clearing restores A and resets its consecutive failure count.
+	// Manual clearing restores A. It is retried to the threshold before B is
+	// eligible again, then can be removed while blacklisted.
 	relay.ClearProviderBlacklist("openai-responses", poolID, selected[0].ID)
 	w4 := request()
-	if w4.Code != http.StatusBadGateway {
-		t.Fatalf("request after unblacklist status = %d, want sticky 502: %s", w4.Code, w4.Body.String())
+	if w4.Code != http.StatusOK || !strings.Contains(w4.Body.String(), "from-second-key") {
+		t.Fatalf("request after unblacklist should silently fall back, got %d: %s", w4.Code, w4.Body.String())
 	}
-	if firstHits != 3 || secondHits != 2 {
-		t.Fatalf("request after unblacklist hits = (%d, %d), want (3, 2)", firstHits, secondHits)
+	if firstHits != 4 || secondHits != 4 {
+		t.Fatalf("request after unblacklist hits = (%d, %d), want (4, 4)", firstHits, secondHits)
 	}
 
-	// Blacklist A again, then remove it from the pool. Status listing must prune it.
-	w5 := request()
-	if w5.Code != http.StatusOK {
-		t.Fatalf("request re-blacklisting first key status = %d, want 200: %s", w5.Code, w5.Body.String())
-	}
+	// The strict retries above have blacklisted A again; removing it must prune
+	// that stale status from the persisted pool view.
 	if statuses = relay.ListProviderBlacklistStatus("openai-responses", poolID); len(statuses) != 1 {
 		t.Fatalf("first key should be blacklisted again, got %+v", statuses)
 	}
@@ -664,7 +664,7 @@ func TestHTTPAccountPoolStickyKeysBearerEndpointAndStaleBlacklist(t *testing.T) 
 	}
 }
 
-func TestHTTPAccountPoolRetryKeepsCurrentKeyAfterReorder(t *testing.T) {
+func TestHTTPAccountPoolRetryUsesHighestPriorityKeyAfterReorder(t *testing.T) {
 	oldTracker := defaultActiveRequestTracker
 	defaultActiveRequestTracker = newActiveRequestTracker()
 	t.Cleanup(func() {
@@ -764,11 +764,11 @@ func TestHTTPAccountPoolRetryKeepsCurrentKeyAfterReorder(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("account request did not finish after retry")
 	}
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "from-first-key") {
-		t.Fatalf("account retry should use the original key, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "from-second-key") {
+		t.Fatalf("account retry should use the highest-priority key, got %d: %s", w.Code, w.Body.String())
 	}
-	if atomic.LoadInt32(&firstHits) != 2 || atomic.LoadInt32(&secondHits) != 0 {
-		t.Fatalf("account retry hits = (%d, %d), want (2, 0)", firstHits, secondHits)
+	if atomic.LoadInt32(&firstHits) != 1 || atomic.LoadInt32(&secondHits) != 1 {
+		t.Fatalf("account retry hits = (%d, %d), want (1, 1)", firstHits, secondHits)
 	}
 	if atomic.LoadInt32(&firstCancelled) != 1 {
 		t.Fatal("account retry did not cancel the original upstream request")
@@ -829,8 +829,11 @@ func TestHTTPAccountPoolAllKeysBlacklistedReturnsServiceUnavailable(t *testing.T
 	}
 
 	w1 := request()
-	if w1.Code != http.StatusBadGateway {
-		t.Fatalf("first exhausted account request status = %d, want 502: %s", w1.Code, w1.Body.String())
+	if w1.Code != http.StatusServiceUnavailable {
+		t.Fatalf("first exhausted account request status = %d, want 503: %s", w1.Code, w1.Body.String())
+	}
+	if !strings.Contains(w1.Body.String(), "号池暂无可用账号") || strings.Contains(w1.Body.String(), "rate limited") {
+		t.Fatalf("first exhausted account response must be generic, got %s", w1.Body.String())
 	}
 	if firstHits != 1 || secondHits != 1 {
 		t.Fatalf("first exhausted account request hits = (%d, %d), want (1, 1)", firstHits, secondHits)
@@ -848,6 +851,121 @@ func TestHTTPAccountPoolAllKeysBlacklistedReturnsServiceUnavailable(t *testing.T
 	}
 	if strings.Contains(w2.Body.String(), firstKey) || strings.Contains(w2.Body.String(), secondKey) {
 		t.Fatalf("all-blacklisted response exposes a raw key: %s", w2.Body.String())
+	}
+	if !strings.Contains(w2.Body.String(), "号池暂无可用账号") {
+		t.Fatalf("all-blacklisted account response must be generic, got %s", w2.Body.String())
+	}
+}
+
+func TestHTTPAccountPoolClient4xxDoesNotFailOverOrBlacklist(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnprocessableEntity} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			const (
+				firstKey  = "sk-client-4xx-first"
+				secondKey = "sk-client-4xx-second"
+			)
+
+			var firstHits, secondHits int
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read request body: %v", err)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				var provider string
+				switch r.Header.Get("Authorization") {
+				case "Bearer " + firstKey:
+					firstHits++
+					provider = "first"
+				case "Bearer " + secondKey:
+					secondHits++
+					provider = "second"
+				default:
+					t.Errorf("unexpected account pool Authorization header %q", r.Header.Get("Authorization"))
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+
+				if gjson.GetBytes(body, "input").String() == "invalid" {
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("X-Upstream-Debug", "account="+r.Header.Get("Authorization"))
+					w.Header().Add("Set-Cookie", "provider_session=upstream-secret")
+					w.WriteHeader(status)
+					_, _ = w.Write([]byte(`{"error":{"message":"invalid request payload","type":"invalid_request_error"}}`))
+					return
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"id":"resp_%s","object":"response","output":[{"type":"message","content":[{"type":"output_text","text":"from-%s"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`, provider, provider)
+			}))
+			defer upstream.Close()
+
+			pool := &ProviderPool{
+				Platform:                     "openai-responses",
+				Name:                         "Client 4xx Account Pool",
+				PoolType:                     ProviderPoolTypeAccount,
+				Mode:                         ProviderPoolModeManaged,
+				AutoBlacklistEnabled:         true,
+				AutoBlacklistThreshold:       1,
+				AutoBlacklistDurationMinutes: 10,
+				AccountPoolConfig: &AccountPoolConfig{
+					APIURL:            upstream.URL,
+					ResponsesEndpoint: "/v1/responses",
+					Keys:              []AccountPoolKey{{APIKey: firstKey}, {APIKey: secondKey}},
+				},
+			}
+			relay, router, relayKey, poolID := setupProviderPoolHTTPTest(t, "openai-responses", nil, pool)
+
+			request := func(input string) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(fmt.Sprintf(`{"model":"gpt-5","input":%q,"conversation":"client-validation-session","stream":false}`, input)))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Authorization", "Bearer "+relayKey)
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, req)
+				return w
+			}
+
+			invalid := request("invalid")
+			if invalid.Code != status {
+				t.Fatalf("invalid request status = %d, want %d: %s", invalid.Code, status, invalid.Body.String())
+			}
+			if !strings.Contains(invalid.Body.String(), "invalid request payload") || strings.Contains(invalid.Body.String(), "号池中所有可用账号均请求失败") {
+				t.Fatalf("invalid request did not return the upstream client error: %s", invalid.Body.String())
+			}
+			if invalid.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("invalid request content type = %q, want application/json", invalid.Header().Get("Content-Type"))
+			}
+			if strings.Contains(invalid.Body.String(), firstKey) || strings.Contains(invalid.Body.String(), secondKey) {
+				t.Fatalf("invalid request leaked an account key: body=%q headers=%v", invalid.Body.String(), invalid.Header())
+			}
+			if debugHeader := invalid.Header().Get("X-Upstream-Debug"); debugHeader != "" {
+				t.Fatalf("invalid request forwarded a sensitive upstream header: %q", debugHeader)
+			}
+			if cookies := invalid.Header().Values("Set-Cookie"); len(cookies) != 0 {
+				t.Fatalf("invalid request forwarded upstream cookies: %v", cookies)
+			}
+			if firstHits+secondHits != 1 {
+				t.Fatalf("invalid request upstream attempts = (%d, %d), want exactly one", firstHits, secondHits)
+			}
+			if statuses := relay.ListProviderBlacklistStatus("openai-responses", poolID); len(statuses) != 0 {
+				t.Fatalf("client 4xx should not blacklist an account key: %+v", statuses)
+			}
+
+			valid := request("valid")
+			if valid.Code != http.StatusOK {
+				t.Fatalf("valid request after client 4xx status = %d, want 200: %s", valid.Code, valid.Body.String())
+			}
+			if firstHits+secondHits != 2 {
+				t.Fatalf("valid request upstream attempts = (%d, %d), want two total attempts", firstHits, secondHits)
+			}
+			if !((firstHits == 2 && secondHits == 0) || (firstHits == 0 && secondHits == 2)) {
+				t.Fatalf("client 4xx invalidated the sticky key binding: attempts = (%d, %d)", firstHits, secondHits)
+			}
+			if statuses := relay.ListProviderBlacklistStatus("openai-responses", poolID); len(statuses) != 0 {
+				t.Fatalf("valid request after client 4xx found unexpected blacklist: %+v", statuses)
+			}
+		})
 	}
 }
 
@@ -918,24 +1036,24 @@ func TestHTTPAccountPoolModelsUsesSiblingEndpointAndRedactsKey(t *testing.T) {
 	}
 
 	first := request()
-	if first.Code != http.StatusTooManyRequests {
-		t.Fatalf("first account models status = %d, want 429: %s", first.Code, first.Body.String())
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), "gpt-account-model") {
+		t.Fatalf("first account models should silently fall back, got %d: %s", first.Code, first.Body.String())
 	}
 	assertNoKey("first account models body", first.Body.String())
 	assertNoKey("first account models headers", fmt.Sprint(first.Header()))
-	if firstHits != 1 || secondHits != 0 {
-		t.Fatalf("first account models hits = (%d, %d), want (1, 0)", firstHits, secondHits)
+	if firstHits != 2 || secondHits != 1 {
+		t.Fatalf("first account models hits = (%d, %d), want (2, 1)", firstHits, secondHits)
 	}
-	if statuses := relay.ListProviderBlacklistStatus("openai-responses", poolID); len(statuses) != 0 {
-		t.Fatalf("below-threshold models failure should not be blacklisted: %+v", statuses)
+	if statuses := relay.ListProviderBlacklistStatus("openai-responses", poolID); len(statuses) != 1 {
+		t.Fatalf("first key should be blacklisted after strict retries: %+v", statuses)
 	}
 
 	second := request()
 	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), "gpt-account-model") {
 		t.Fatalf("second account models request should switch keys, got %d: %s", second.Code, second.Body.String())
 	}
-	if firstHits != 2 || secondHits != 1 {
-		t.Fatalf("second account models hits = (%d, %d), want (2, 1)", firstHits, secondHits)
+	if firstHits != 2 || secondHits != 2 {
+		t.Fatalf("second account models hits = (%d, %d), want (2, 2)", firstHits, secondHits)
 	}
 	statuses := relay.ListProviderBlacklistStatus("openai-responses", poolID)
 	if len(statuses) != 1 {
@@ -948,6 +1066,245 @@ func TestHTTPAccountPoolModelsUsesSiblingEndpointAndRedactsKey(t *testing.T) {
 		assertNoKey("account models event", fmt.Sprint(event.Data))
 	case <-time.After(time.Second):
 		t.Fatal("account models blacklist event was not emitted")
+	}
+}
+
+func TestHTTPAccountPoolModelsMigratesWhenFailedKeyDeleted(t *testing.T) {
+	const (
+		firstKey  = "sk-models-delete-first"
+		secondKey = "sk-models-delete-second"
+	)
+
+	var (
+		relay    *ProviderRelayService
+		poolID   string
+		mu       sync.Mutex
+		keyOrder []string
+		removed  bool
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var keyName string
+		switch r.Header.Get("Authorization") {
+		case "Bearer " + firstKey:
+			keyName = "first"
+		case "Bearer " + secondKey:
+			keyName = "second"
+		default:
+			t.Errorf("unexpected account models Authorization header %q", r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		keyOrder = append(keyOrder, keyName)
+		shouldRemove := keyName == "first" && !removed
+		if shouldRemove {
+			removed = true
+		}
+		mu.Unlock()
+
+		if shouldRemove {
+			updatedPool, err := relay.poolService.ResolvePoolByID(poolID)
+			if err != nil || updatedPool == nil {
+				t.Errorf("resolve pool for runtime key deletion: pool=%v err=%v", updatedPool, err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if len(updatedPool.AccountPoolConfig.Keys) != 2 {
+				t.Errorf("pool key count before runtime deletion = %d, want 2", len(updatedPool.AccountPoolConfig.Keys))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			updatedPool.AccountPoolConfig.Keys = []AccountPoolKey{updatedPool.AccountPoolConfig.Keys[1]}
+			if _, err := relay.poolService.SavePool(updatedPool); err != nil {
+				t.Errorf("persist runtime key deletion: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if keyName == "first" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"first account is rate limited"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-from-second"}]}`))
+	}))
+	defer upstream.Close()
+
+	pool := &ProviderPool{
+		Platform:                     "openai-responses",
+		Name:                         "Models Runtime Deletion Pool",
+		PoolType:                     ProviderPoolTypeAccount,
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       3,
+		AutoBlacklistDurationMinutes: 10,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            upstream.URL,
+			ResponsesEndpoint: "/responses",
+			Keys:              []AccountPoolKey{{APIKey: firstKey}, {APIKey: secondKey}},
+		},
+	}
+	relay, router, relayKey, poolID := setupProviderPoolHTTPTest(t, "openai-responses", nil, pool)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+relayKey)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "gpt-from-second") {
+		t.Fatalf("models request after runtime key deletion = %d: %s", w.Code, w.Body.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"first", "second"}; fmt.Sprint(keyOrder) != fmt.Sprint(want) {
+		t.Fatalf("models runtime deletion key order = %v, want %v", keyOrder, want)
+	}
+}
+
+func TestHTTPAccountPoolModelsClient4xxDoesNotFailOverOrBlacklist(t *testing.T) {
+	const (
+		firstKey  = "sk-models-client-4xx-first"
+		secondKey = "sk-models-client-4xx-second"
+	)
+
+	var firstHits, secondHits int
+	returnClientError := true
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var provider string
+		switch r.Header.Get("Authorization") {
+		case "Bearer " + firstKey:
+			firstHits++
+			provider = "first"
+		case "Bearer " + secondKey:
+			secondHits++
+			provider = "second"
+		default:
+			t.Errorf("unexpected account models Authorization header %q", r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if returnClientError {
+			w.Header().Set("X-Upstream-Debug", "account="+r.Header.Get("Authorization"))
+			w.Header().Add("Set-Cookie", "provider_session=upstream-secret")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"error":{"message":"invalid models request","type":"invalid_request_error"}}`))
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"object":"list","data":[{"id":"gpt-from-%s"}]}`, provider)
+	}))
+	defer upstream.Close()
+
+	pool := &ProviderPool{
+		Platform:                     "openai-responses",
+		Name:                         "Client 4xx Models Account Pool",
+		PoolType:                     ProviderPoolTypeAccount,
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       1,
+		AutoBlacklistDurationMinutes: 10,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            upstream.URL,
+			ResponsesEndpoint: "/v1/responses",
+			Keys:              []AccountPoolKey{{APIKey: firstKey}, {APIKey: secondKey}},
+		},
+	}
+	relay, router, relayKey, poolID := setupProviderPoolHTTPTest(t, "openai-responses", nil, pool)
+
+	request := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer "+relayKey)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	invalid := request()
+	if invalid.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid models status = %d, want 422: %s", invalid.Code, invalid.Body.String())
+	}
+	if !strings.Contains(invalid.Body.String(), "invalid models request") || strings.Contains(invalid.Body.String(), "号池中所有可用账号均请求失败") {
+		t.Fatalf("invalid models request did not return the upstream client error: %s", invalid.Body.String())
+	}
+	if firstHits+secondHits != 1 {
+		t.Fatalf("invalid models request upstream attempts = (%d, %d), want exactly one", firstHits, secondHits)
+	}
+	if statuses := relay.ListProviderBlacklistStatus("openai-responses", poolID); len(statuses) != 0 {
+		t.Fatalf("models client 4xx should not blacklist an account key: %+v", statuses)
+	}
+	if debugHeader := invalid.Header().Get("X-Upstream-Debug"); debugHeader != "" {
+		t.Fatalf("invalid models request forwarded a sensitive upstream header: %q", debugHeader)
+	}
+	if cookies := invalid.Header().Values("Set-Cookie"); len(cookies) != 0 {
+		t.Fatalf("invalid models request forwarded upstream cookies: %v", cookies)
+	}
+
+	returnClientError = false
+	valid := request()
+	if valid.Code != http.StatusOK {
+		t.Fatalf("valid models request after client 4xx status = %d, want 200: %s", valid.Code, valid.Body.String())
+	}
+	if firstHits+secondHits != 2 {
+		t.Fatalf("valid models request upstream attempts = (%d, %d), want two total attempts", firstHits, secondHits)
+	}
+	if statuses := relay.ListProviderBlacklistStatus("openai-responses", poolID); len(statuses) != 0 {
+		t.Fatalf("valid models request after client 4xx found unexpected blacklist: %+v", statuses)
+	}
+}
+
+func TestHTTPAccountPoolModelsAllFailuresReturnGenericError(t *testing.T) {
+	const (
+		firstKey  = "sk-models-generic-first"
+		secondKey = "sk-models-generic-second"
+	)
+	var firstHits, secondHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		switch r.Header.Get("Authorization") {
+		case "Bearer " + firstKey:
+			firstHits++
+			_, _ = fmt.Fprintf(w, `{"error":"first key %s rejected"}`, firstKey)
+		case "Bearer " + secondKey:
+			secondHits++
+			_, _ = fmt.Fprintf(w, `{"error":"second key %s rejected"}`, secondKey)
+		default:
+			t.Errorf("unexpected account pool Authorization header %q", r.Header.Get("Authorization"))
+		}
+	}))
+	defer upstream.Close()
+
+	pool := &ProviderPool{
+		Platform:                     "openai-responses",
+		Name:                         "Generic Models Account Pool",
+		PoolType:                     ProviderPoolTypeAccount,
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       3,
+		AutoBlacklistDurationMinutes: 10,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            upstream.URL,
+			ResponsesEndpoint: "/responses",
+			Keys:              []AccountPoolKey{{APIKey: firstKey}, {APIKey: secondKey}},
+		},
+	}
+	_, router, relayKey, _ := setupProviderPoolHTTPTest(t, "openai-responses", nil, pool)
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+relayKey)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("all-failed account models status = %d, want 502: %s", w.Code, w.Body.String())
+	}
+	if firstHits != 3 || secondHits != 3 {
+		t.Fatalf("all-failed account models hits = (%d,%d), want (3,3)", firstHits, secondHits)
+	}
+	if !strings.Contains(w.Body.String(), "号池中所有可用账号均请求失败") || strings.Contains(w.Body.String(), firstKey) || strings.Contains(w.Body.String(), secondKey) || strings.Contains(w.Body.String(), "rejected") {
+		t.Fatalf("all-failed account models response leaked details: %s", w.Body.String())
 	}
 }
 
@@ -1017,6 +1374,674 @@ func TestHTTPAccountPoolEmptyStreamBlacklistsAndSwitchesKey(t *testing.T) {
 	if strings.Contains(w.Body.String(), firstKey) || strings.Contains(w.Body.String(), secondKey) {
 		t.Fatalf("empty-stream response exposes a raw key: %s", w.Body.String())
 	}
+}
+
+func TestHTTPAccountPoolFailedStreamFallsBackWhenNormalGuardDisabled(t *testing.T) {
+	const (
+		firstKey  = "sk-failed-stream-first"
+		secondKey = "sk-failed-stream-second"
+	)
+	var firstHits, secondHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch r.Header.Get("Authorization") {
+		case "Bearer " + firstKey:
+			firstHits++
+			_, _ = w.Write([]byte("data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed\"}}\n\ndata: [DONE]\n\n"))
+		case "Bearer " + secondKey:
+			secondHits++
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"from-second-key\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-success\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n"))
+		default:
+			t.Errorf("unexpected account pool Authorization header %q", r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer upstream.Close()
+
+	pool := &ProviderPool{
+		Platform:                     "openai-responses",
+		Name:                         "Failed Stream Account Pool",
+		PoolType:                     ProviderPoolTypeAccount,
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       2,
+		AutoBlacklistDurationMinutes: 10,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            upstream.URL,
+			ResponsesEndpoint: "/responses",
+			Keys:              []AccountPoolKey{{APIKey: firstKey}, {APIKey: secondKey}},
+		},
+	}
+	relay, router, relayKey, poolID := setupProviderPoolHTTPTest(t, "openai-responses", nil, pool)
+	settings, err := relay.appSettings.GetAppSettings()
+	if err != nil {
+		t.Fatalf("get app settings: %v", err)
+	}
+	settings.EnableCodexStreamGuard = false
+	if _, err := relay.appSettings.SaveAppSettings(settings); err != nil {
+		t.Fatalf("disable normal Codex stream guard: %v", err)
+	}
+	if relay.isCodexStreamGuardEnabled() {
+		t.Fatal("normal Codex stream guard remained enabled")
+	}
+	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5","input":"hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+relayKey)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "from-second-key") || strings.Contains(w.Body.String(), "response.failed") {
+		t.Fatalf("failed stream should silently fall back, got %d: %s", w.Code, w.Body.String())
+	}
+	if firstHits != 2 || secondHits != 1 {
+		t.Fatalf("failed stream hits = (%d,%d), want (2,1)", firstHits, secondHits)
+	}
+	if statuses := relay.ListProviderBlacklistStatus("openai-responses", poolID); len(statuses) != 1 {
+		t.Fatalf("terminal stream failures should blacklist the selected key: %+v", statuses)
+	}
+}
+
+func TestHTTPAccountPoolOversizedPreflightStreamFallsBackWithoutWriting(t *testing.T) {
+	const (
+		firstKey  = "sk-oversized-preflight-first"
+		secondKey = "sk-oversized-preflight-second"
+	)
+	var firstHits, secondHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch r.Header.Get("Authorization") {
+		case "Bearer " + firstKey:
+			firstHits++
+			line := []byte("data: {\"type\":\"response.created\"}\n")
+			for written := 0; written < codexStreamGuardMaxInitialBufferBytes+len(line); written += len(line) {
+				_, _ = w.Write(line)
+			}
+			_, _ = w.Write([]byte("data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-oversized-failed\"}}\n\n"))
+		case "Bearer " + secondKey:
+			secondHits++
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"from-second-key\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-oversized-success\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n"))
+		default:
+			t.Errorf("unexpected account pool Authorization header %q", r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer upstream.Close()
+
+	pool := &ProviderPool{
+		Platform:                     "openai-responses",
+		Name:                         "Oversized Preflight Account Pool",
+		PoolType:                     ProviderPoolTypeAccount,
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       2,
+		AutoBlacklistDurationMinutes: 10,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            upstream.URL,
+			ResponsesEndpoint: "/responses",
+			Keys:              []AccountPoolKey{{APIKey: firstKey}, {APIKey: secondKey}},
+		},
+	}
+	_, router, relayKey, _ := setupProviderPoolHTTPTest(t, "openai-responses", nil, pool)
+	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5","input":"hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+relayKey)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "from-second-key") || strings.Contains(w.Body.String(), "response.created") || strings.Contains(w.Body.String(), "resp-oversized-failed") {
+		t.Fatalf("oversized preflight should be hidden before fallback, got %d: %s", w.Code, w.Body.String())
+	}
+	if firstHits != 2 || secondHits != 1 {
+		t.Fatalf("oversized preflight hits = (%d,%d), want (2,1)", firstHits, secondHits)
+	}
+}
+
+func TestHTTPAccountPoolStrictStickinessRetriesBoundKeyUntilBlacklist(t *testing.T) {
+	const (
+		firstKey  = "sk-strict-sticky-first"
+		secondKey = "sk-strict-sticky-second"
+	)
+
+	var mu sync.Mutex
+	var keyOrder []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var keyName string
+		switch r.Header.Get("Authorization") {
+		case "Bearer " + firstKey:
+			keyName = "first"
+		case "Bearer " + secondKey:
+			keyName = "second"
+		default:
+			t.Errorf("unexpected account pool Authorization header %q", r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		keyOrder = append(keyOrder, keyName)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if keyName == "first" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"first account is rate limited"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-after-migration","object":"response","output":[{"type":"message","content":[{"type":"output_text","text":"from-second-key"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	pool := &ProviderPool{
+		Platform:                     "openai-responses",
+		Name:                         "Strict Sticky Account Pool",
+		PoolType:                     ProviderPoolTypeAccount,
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       2,
+		AutoBlacklistDurationMinutes: 10,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            upstream.URL,
+			ResponsesEndpoint: "/responses",
+			Keys:              []AccountPoolKey{{APIKey: firstKey}, {APIKey: secondKey}},
+		},
+	}
+	relay, router, relayKey, poolID := setupProviderPoolHTTPTest(t, "openai-responses", nil, pool)
+
+	request := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+relayKey)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	// A durable conversation binding starts on the first key. It must retry A
+	// until that key is blacklisted; B is eligible only after invalidation.
+	initial := request(`{"model":"gpt-5","conversation":"strict-session","input":"hello"}`)
+	if initial.Code != http.StatusOK || !strings.Contains(initial.Body.String(), "from-second-key") {
+		t.Fatalf("initial strict sticky request = %d: %s", initial.Code, initial.Body.String())
+	}
+	mu.Lock()
+	gotInitialOrder := append([]string(nil), keyOrder...)
+	mu.Unlock()
+	if want := []string{"first", "first", "second"}; fmt.Sprint(gotInitialOrder) != fmt.Sprint(want) {
+		t.Fatalf("strict retry key order = %v, want %v", gotInitialOrder, want)
+	}
+	if statuses := relay.ListProviderBlacklistStatus("openai-responses", poolID); len(statuses) != 1 {
+		t.Fatalf("first key should be blacklisted after two failures, got %+v", statuses)
+	}
+
+	// The successful fallback response is now a B-bound continuation. It must
+	// not resurrect A or distribute to another key.
+	continuation := request(`{"model":"gpt-5","previous_response_id":"resp-after-migration","input":"continue"}`)
+	if continuation.Code != http.StatusOK || !strings.Contains(continuation.Body.String(), "from-second-key") {
+		t.Fatalf("post-migration continuation = %d: %s", continuation.Code, continuation.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"first", "first", "second", "second"}; fmt.Sprint(keyOrder) != fmt.Sprint(want) {
+		t.Fatalf("post-migration response-id key order = %v, want %v", keyOrder, want)
+	}
+}
+
+func TestHTTPAccountPoolAnonymousFirstRequestRetriesSelectedKeyUntilBlacklist(t *testing.T) {
+	const (
+		firstKey  = "sk-anonymous-strict-first"
+		secondKey = "sk-anonymous-strict-second"
+	)
+
+	var mu sync.Mutex
+	var keyOrder []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var keyName string
+		switch r.Header.Get("Authorization") {
+		case "Bearer " + firstKey:
+			keyName = "first"
+		case "Bearer " + secondKey:
+			keyName = "second"
+		default:
+			t.Errorf("unexpected account pool Authorization header %q", r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		keyOrder = append(keyOrder, keyName)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if keyName == "first" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"first account is rate limited"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-anonymous-success","object":"response","output":[{"type":"message","content":[{"type":"output_text","text":"from-second-key"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	pool := &ProviderPool{
+		Platform:                     "openai-responses",
+		Name:                         "Anonymous Strict Account Pool",
+		PoolType:                     ProviderPoolTypeAccount,
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       2,
+		AutoBlacklistDurationMinutes: 10,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            upstream.URL,
+			ResponsesEndpoint: "/responses",
+			Keys:              []AccountPoolKey{{APIKey: firstKey}, {APIKey: secondKey}},
+		},
+	}
+	relay, router, relayKey, poolID := setupProviderPoolHTTPTest(t, "openai-responses", nil, pool)
+
+	// Deliberately omit conversation and previous_response_id: the initial
+	// request still must stay on A until A becomes unavailable.
+	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5","input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+relayKey)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "from-second-key") {
+		t.Fatalf("anonymous strict request = %d: %s", w.Code, w.Body.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"first", "first", "second"}; fmt.Sprint(keyOrder) != fmt.Sprint(want) {
+		t.Fatalf("anonymous strict key order = %v, want %v", keyOrder, want)
+	}
+	if statuses := relay.ListProviderBlacklistStatus("openai-responses", poolID); len(statuses) != 1 {
+		t.Fatalf("first key should be blacklisted after two anonymous retries: %+v", statuses)
+	}
+}
+
+func TestHTTPAccountPoolFirstTextTimeoutOnlyBlacklistsTimedOutKey(t *testing.T) {
+	const (
+		firstKey  = "sk-first-text-timeout-first"
+		secondKey = "sk-first-text-timeout-second"
+	)
+
+	var mu sync.Mutex
+	var keyOrder []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer " + firstKey:
+			mu.Lock()
+			keyOrder = append(keyOrder, "first")
+			mu.Unlock()
+			time.Sleep(6 * time.Second)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"too-late"}`))
+		case "Bearer " + secondKey:
+			mu.Lock()
+			keyOrder = append(keyOrder, "second")
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-after-timeout","object":"response","output":[{"type":"message","content":[{"type":"output_text","text":"fresh-second-key"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+		default:
+			t.Errorf("unexpected account pool Authorization header %q", r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer upstream.Close()
+
+	rule := SpecialBlacklistRule{
+		ID:                "first-text-timeout",
+		Name:              "First text timeout",
+		HTTPStatus:        http.StatusGatewayTimeout,
+		JSONPath:          "error.code",
+		ExpectedJSONValue: `"first_text_timeout"`,
+		Threshold:         1,
+		DurationMinutes:   5,
+	}
+	pool := &ProviderPool{
+		Platform:                     "openai-responses",
+		Name:                         "First Text Timeout Account Pool",
+		PoolType:                     ProviderPoolTypeAccount,
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       10,
+		AutoBlacklistDurationMinutes: 10,
+		SpecialBlacklistRules:        []SpecialBlacklistRule{rule},
+		FirstTextRetryEnabled:        true,
+		FirstTextRetryTimeoutSeconds: 5,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            upstream.URL,
+			ResponsesEndpoint: "/responses",
+			Keys:              []AccountPoolKey{{APIKey: firstKey}, {APIKey: secondKey}},
+		},
+	}
+	relay, router, relayKey, poolID := setupProviderPoolHTTPTest(t, "openai-responses", nil, pool)
+
+	request := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5","conversation":"timeout-session","input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+relayKey)
+	response := httptest.NewRecorder()
+	startedAt := time.Now()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "fresh-second-key") {
+		t.Fatalf("fallback response = %d: %s", response.Code, response.Body.String())
+	}
+	if elapsed := time.Since(startedAt); elapsed < 5*time.Second || elapsed > 7*time.Second {
+		t.Fatalf("two-key request duration = %s, want one five-second timeout plus prompt fallback", elapsed)
+	}
+	mu.Lock()
+	gotOrder := append([]string(nil), keyOrder...)
+	mu.Unlock()
+	if want := []string{"first", "second"}; fmt.Sprint(gotOrder) != fmt.Sprint(want) {
+		t.Fatalf("key attempts = %v, want %v", gotOrder, want)
+	}
+
+	statuses := relay.ListProviderBlacklistStatus("openai-responses", poolID)
+	if len(statuses) != 1 || statuses[0].RuleFailureCounts[rule.ID] != 1 || statuses[0].LastReason != rule.Name {
+		t.Fatalf("blacklist statuses = %+v, want only the timed-out key with one matched 504", statuses)
+	}
+}
+
+func TestHTTPAccountPoolStrictStickinessMigratesWhenBoundKeyDeleted(t *testing.T) {
+	const (
+		firstKey  = "sk-strict-delete-first"
+		secondKey = "sk-strict-delete-second"
+	)
+
+	var mu sync.Mutex
+	var keyOrder []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keyName := ""
+		switch r.Header.Get("Authorization") {
+		case "Bearer " + firstKey:
+			keyName = "first"
+		case "Bearer " + secondKey:
+			keyName = "second"
+		default:
+			t.Errorf("unexpected account pool Authorization header %q", r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		keyOrder = append(keyOrder, keyName)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"resp-from-%s","object":"response","output":[{"type":"message","content":[{"type":"output_text","text":"from-%s-key"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`, keyName, keyName)
+	}))
+	defer upstream.Close()
+
+	pool := &ProviderPool{
+		Platform:                     "openai-responses",
+		Name:                         "Strict Sticky Deletion Pool",
+		PoolType:                     ProviderPoolTypeAccount,
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       3,
+		AutoBlacklistDurationMinutes: 10,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            upstream.URL,
+			ResponsesEndpoint: "/responses",
+			Keys:              []AccountPoolKey{{APIKey: firstKey}, {APIKey: secondKey}},
+		},
+	}
+	relay, router, relayKey, poolID := setupProviderPoolHTTPTest(t, "openai-responses", nil, pool)
+	request := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+relayKey)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	initial := request(`{"model":"gpt-5","conversation":"delete-session","input":"hello"}`)
+	if initial.Code != http.StatusOK || !strings.Contains(initial.Body.String(), "from-first-key") {
+		t.Fatalf("initial strict sticky request = %d: %s", initial.Code, initial.Body.String())
+	}
+	updatedPool, err := relay.poolService.ResolvePoolByID(poolID)
+	if err != nil || updatedPool == nil {
+		t.Fatalf("resolve account pool for key deletion: pool=%v err=%v", updatedPool, err)
+	}
+	if len(updatedPool.AccountPoolConfig.Keys) != 2 {
+		t.Fatalf("saved key count = %d, want 2", len(updatedPool.AccountPoolConfig.Keys))
+	}
+	updatedPool.AccountPoolConfig.Keys = []AccountPoolKey{updatedPool.AccountPoolConfig.Keys[1]}
+	if _, err := relay.poolService.SavePool(updatedPool); err != nil {
+		t.Fatalf("delete bound account key: %v", err)
+	}
+
+	continuation := request(`{"model":"gpt-5","previous_response_id":"resp-from-first","input":"continue"}`)
+	if continuation.Code != http.StatusOK || !strings.Contains(continuation.Body.String(), "from-second-key") {
+		t.Fatalf("continuation after bound key deletion = %d: %s", continuation.Code, continuation.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"first", "second"}; fmt.Sprint(keyOrder) != fmt.Sprint(want) {
+		t.Fatalf("key deletion migration order = %v, want %v", keyOrder, want)
+	}
+}
+
+func TestHTTPAccountPoolConversationStickinessLinksResponseIDs(t *testing.T) {
+	const (
+		firstKey  = "sk-sticky-conversation-first"
+		secondKey = "sk-sticky-conversation-second"
+	)
+
+	var mu sync.Mutex
+	var keyOrder []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		keyName := ""
+		switch r.Header.Get("Authorization") {
+		case "Bearer " + firstKey:
+			keyName = "first"
+		case "Bearer " + secondKey:
+			keyName = "second"
+		default:
+			t.Errorf("unexpected account pool Authorization header %q", r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		keyOrder = append(keyOrder, keyName)
+		mu.Unlock()
+
+		requestBody := string(body)
+		if strings.Contains(requestBody, `"stream":true`) {
+			responseID := "resp-stream-a"
+			if strings.Contains(requestBody, "resp-stream-a") {
+				responseID = "resp-stream-b"
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"stream\"}\n\n")
+			_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":%q,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n", responseID)
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+
+		responseID := "resp-nonstream-a"
+		if strings.Contains(requestBody, "resp-nonstream-a") {
+			responseID = "resp-nonstream-b"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":%q,"object":"response","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`, responseID)
+	}))
+	defer upstream.Close()
+
+	pool := &ProviderPool{
+		Platform:                     "openai-responses",
+		Name:                         "Sticky Conversation Pool",
+		PoolType:                     ProviderPoolTypeAccount,
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       3,
+		AutoBlacklistDurationMinutes: 10,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            upstream.URL,
+			ResponsesEndpoint: "/responses",
+			Keys: []AccountPoolKey{
+				{APIKey: firstKey},
+				{APIKey: secondKey},
+			},
+		},
+	}
+	_, router, relayKey, _ := setupProviderPoolHTTPTest(t, "openai-responses", nil, pool)
+
+	request := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+relayKey)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	for _, body := range []string{
+		`{"model":"gpt-5","conversation":"conversation-nonstream","input":"hello"}`,
+		`{"model":"gpt-5","previous_response_id":"resp-nonstream-a","input":"continue"}`,
+		`{"model":"gpt-5","previous_response_id":"resp-nonstream-b","input":"continue"}`,
+		`{"model":"gpt-5","conversation":{"id":"conversation-stream"},"input":"hello","stream":true}`,
+		`{"model":"gpt-5","previous_response_id":"resp-stream-a","input":"continue","stream":true}`,
+		`{"model":"gpt-5","prompt_cache_key":"pi-session-1","input":"hello"}`,
+		`{"model":"gpt-5","prompt_cache_key":"pi-session-1","input":"continue"}`,
+	} {
+		response := request(body)
+		if response.Code != http.StatusOK {
+			t.Fatalf("sticky response status = %d, body=%s", response.Code, response.Body.String())
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"first", "first", "first", "second", "second", "first", "first"}
+	if fmt.Sprint(keyOrder) != fmt.Sprint(want) {
+		t.Fatalf("sticky key order = %v, want %v", keyOrder, want)
+	}
+}
+
+func TestHTTPAccountPoolStreamCompletionAliasIsAvailableBeforeEOF(t *testing.T) {
+	const (
+		firstKey  = "sk-stream-alias-first"
+		secondKey = "sk-stream-alias-second"
+	)
+	var mu sync.Mutex
+	var firstKeyHits, secondKeyHits int
+	releaseFirstStream := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseFirstStream) })
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		stream := strings.Contains(string(body), `"stream":true`)
+		writeContinuation := func(label string) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"resp_continuation","object":"response","output":[{"type":"message","content":[{"type":"output_text","text":%q}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`, label)
+		}
+
+		switch r.Header.Get("Authorization") {
+		case "Bearer " + firstKey:
+			mu.Lock()
+			firstKeyHits++
+			mu.Unlock()
+			if !stream {
+				writeContinuation("from-first-key")
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n"))
+			_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream_a\"}}\n\n"))
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			select {
+			case <-releaseFirstStream:
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			case <-r.Context().Done():
+			}
+		case "Bearer " + secondKey:
+			mu.Lock()
+			secondKeyHits++
+			mu.Unlock()
+			writeContinuation("from-second-key")
+		default:
+			t.Errorf("unexpected account pool Authorization header %q", r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer upstream.Close()
+
+	pool := &ProviderPool{
+		Platform:                     "openai-responses",
+		Name:                         "Open Stream Alias Pool",
+		PoolType:                     ProviderPoolTypeAccount,
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       3,
+		AutoBlacklistDurationMinutes: 10,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            upstream.URL,
+			ResponsesEndpoint: "/responses",
+			Keys:              []AccountPoolKey{{APIKey: firstKey}, {APIKey: secondKey}},
+		},
+	}
+	_, router, relayKey, _ := setupProviderPoolHTTPTest(t, "openai-responses", nil, pool)
+	relayServer := httptest.NewServer(router)
+	defer relayServer.Close()
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	firstRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, relayServer.URL+"/responses", strings.NewReader(`{"model":"gpt-5","input":"first","stream":true}`))
+	if err != nil {
+		t.Fatalf("create first request: %v", err)
+	}
+	firstRequest.Header.Set("Content-Type", "application/json")
+	firstRequest.Header.Set("Authorization", "Bearer "+relayKey)
+	firstResponse, err := http.DefaultClient.Do(firstRequest)
+	if err != nil {
+		t.Fatalf("start first stream: %v", err)
+	}
+	defer firstResponse.Body.Close()
+	if firstResponse.StatusCode != http.StatusOK {
+		t.Fatalf("first stream status = %d", firstResponse.StatusCode)
+	}
+
+	reader := bufio.NewReader(firstResponse.Body)
+	for {
+		line, readErr := reader.ReadString('\n')
+		if strings.Contains(line, `"type":"response.completed"`) {
+			break
+		}
+		if readErr != nil {
+			t.Fatalf("first stream ended before completed event: %v", readErr)
+		}
+	}
+
+	continuationRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, relayServer.URL+"/responses", strings.NewReader(`{"model":"gpt-5","previous_response_id":"resp_stream_a","input":"continue"}`))
+	if err != nil {
+		t.Fatalf("create continuation request: %v", err)
+	}
+	continuationRequest.Header.Set("Content-Type", "application/json")
+	continuationRequest.Header.Set("Authorization", "Bearer "+relayKey)
+	continuationResponse, err := http.DefaultClient.Do(continuationRequest)
+	if err != nil {
+		t.Fatalf("send continuation before EOF: %v", err)
+	}
+	continuationBody, _ := io.ReadAll(continuationResponse.Body)
+	_ = continuationResponse.Body.Close()
+	if continuationResponse.StatusCode != http.StatusOK || !strings.Contains(string(continuationBody), "from-first-key") {
+		t.Fatalf("continuation before EOF did not keep key A: %d %s", continuationResponse.StatusCode, continuationBody)
+	}
+
+	mu.Lock()
+	first, second := firstKeyHits, secondKeyHits
+	mu.Unlock()
+	if first != 2 || second != 0 {
+		t.Fatalf("continuation key hits = (%d,%d), want (2,0)", first, second)
+	}
+	release()
+	_, _ = io.Copy(io.Discard, reader)
 }
 
 func TestHTTPModelsSkipsBlacklistedProvider(t *testing.T) {
@@ -2068,7 +3093,7 @@ func TestHTTPProcessingRetryEnqueuesBehindExistingQueue(t *testing.T) {
 	}
 }
 
-func TestHTTPRetryKeepsCurrentProviderAfterPriorityChange(t *testing.T) {
+func TestHTTPRetryUsesHighestPriorityProviderAfterPriorityChange(t *testing.T) {
 	oldTracker := defaultActiveRequestTracker
 	defaultActiveRequestTracker = newActiveRequestTracker()
 	t.Cleanup(func() {
@@ -2199,21 +3224,21 @@ func TestHTTPRetryKeepsCurrentProviderAfterPriorityChange(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("retry request expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if atomic.LoadInt32(&providerAHits) != 2 {
-		t.Fatalf("provider-a hits = %d, want 2", providerAHits)
+	if atomic.LoadInt32(&providerAHits) != 1 {
+		t.Fatalf("provider-a hits = %d, want 1", providerAHits)
 	}
-	if atomic.LoadInt32(&providerBHits) != 0 {
-		t.Fatalf("provider-b hits = %d, want 0", providerBHits)
+	if atomic.LoadInt32(&providerBHits) != 1 {
+		t.Fatalf("provider-b hits = %d, want 1", providerBHits)
 	}
 	if atomic.LoadInt32(&providerACancelled) != 1 {
 		t.Fatal("retry did not cancel the original provider-a request")
 	}
-	if !strings.Contains(w.Body.String(), `"provider":"provider-a"`) {
-		t.Fatalf("retry should stay on provider-a, got: %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), `"provider":"provider-b"`) {
+		t.Fatalf("retry should use highest-priority provider-b, got: %s", w.Body.String())
 	}
 }
 
-func TestHTTPRetryRejectsUnavailableCurrentManualProvider(t *testing.T) {
+func TestHTTPRetryUsesCurrentManualPoolProvider(t *testing.T) {
 	oldTracker := defaultActiveRequestTracker
 	defaultActiveRequestTracker = newActiveRequestTracker()
 	t.Cleanup(func() {
@@ -2338,24 +3363,24 @@ func TestHTTPRetryRejectsUnavailableCurrentManualProvider(t *testing.T) {
 		t.Fatal("request did not finish after retry")
 	}
 
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("manual retry request expected 503, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("manual retry request expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 	if atomic.LoadInt32(&providerAHits) != 1 {
 		t.Fatalf("provider-a hits = %d, want 1", providerAHits)
 	}
-	if atomic.LoadInt32(&providerBHits) != 0 {
-		t.Fatalf("provider-b hits = %d, want 0", providerBHits)
+	if atomic.LoadInt32(&providerBHits) != 1 {
+		t.Fatalf("provider-b hits = %d, want 1", providerBHits)
 	}
 	if atomic.LoadInt32(&providerACancelled) != 1 {
 		t.Fatal("manual retry did not cancel the original provider-a request")
 	}
-	if !strings.Contains(w.Body.String(), "重试目标 provider 当前不可用") {
-		t.Fatalf("manual retry should report unavailable original provider, got: %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), `"provider":"provider-b"`) {
+		t.Fatalf("manual retry should use current pool provider-b, got: %s", w.Body.String())
 	}
 }
 
-func TestHTTPRetryDuringCodexEmptyStreamRetryKeepsCurrentProvider(t *testing.T) {
+func TestHTTPRetryDuringCodexEmptyStreamRetryUsesHighestPriorityProvider(t *testing.T) {
 	oldTracker := defaultActiveRequestTracker
 	defaultActiveRequestTracker = newActiveRequestTracker()
 	t.Cleanup(func() {
@@ -2496,17 +3521,17 @@ func TestHTTPRetryDuringCodexEmptyStreamRetryKeepsCurrentProvider(t *testing.T) 
 	if w.Code != http.StatusOK {
 		t.Fatalf("responses retry request expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if atomic.LoadInt32(&providerAHits) != 3 {
-		t.Fatalf("provider-a hits = %d, want 3", providerAHits)
+	if atomic.LoadInt32(&providerAHits) != 2 {
+		t.Fatalf("provider-a hits = %d, want 2", providerAHits)
 	}
-	if atomic.LoadInt32(&providerBHits) != 0 {
-		t.Fatalf("provider-b hits = %d, want 0", providerBHits)
+	if atomic.LoadInt32(&providerBHits) != 1 {
+		t.Fatalf("provider-b hits = %d, want 1", providerBHits)
 	}
 	if atomic.LoadInt32(&providerASecondCancelled) != 1 {
 		t.Fatal("responses retry did not cancel the active provider-a request")
 	}
-	if !strings.Contains(w.Body.String(), "from-a") {
-		t.Fatalf("retry should stay on provider-a, got: %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "from-b") {
+		t.Fatalf("retry should use highest-priority provider-b, got: %s", w.Body.String())
 	}
 	blacklisted := relay.ListProviderBlacklistStatus("openai-responses", poolID)
 	if len(blacklisted) != 0 {

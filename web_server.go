@@ -175,6 +175,8 @@ type rpcCallRequest struct {
 	Args []json.RawMessage `json:"args"`
 }
 
+const maxRPCCallBodySize = 24 << 20
+
 type rpcCallResponse struct {
 	Data any `json:"data"`
 }
@@ -210,6 +212,7 @@ func newAdminServer(rt *appRuntime) *http.Server {
 	originRequired := requireTrustedOrigin(rt.adminSecurity)
 
 	router.POST("/api/wails/call", originRequired, authRequired, func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRPCCallBodySize)
 		var request rpcCallRequest
 		if err := c.ShouldBindJSON(&request); err != nil {
 			c.JSON(http.StatusBadRequest, apiErrorResponse{

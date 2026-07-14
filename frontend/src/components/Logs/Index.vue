@@ -623,7 +623,14 @@ const reconcileRetryingLogs = (items: RequestLog[]) => {
   const next = new Set(retryingLogIds.value)
   for (const id of retryingLogIds.value) {
     const item = logsByID.get(id)
-    if (!item || hasFirstResponse(item) || !isActiveLog(item)) {
+    // The local marker is only for the RPC round trip. Once the tracker has
+    // started the replacement attempt it reports regular processing again.
+    // Leaving this marker in place made successful retries look permanently
+    // stuck at "Retrying" until the request completed.
+    const trackerStillRetrying = item?.retry_requested === true
+      || item?.status === 'retrying'
+      || item?.error_message === '重试'
+    if (!item || hasFirstResponse(item) || !isActiveLog(item) || !trackerStillRetrying) {
       next.delete(id)
     }
   }
@@ -854,11 +861,7 @@ const handleRetryLog = async (item: RequestLog) => {
       }
       showToast(retryRejectedMessage(result?.status), 'warning')
       await refreshLogsIfChanged(true)
-      if (result?.status === 'ignored_transition') {
-        clearRetryingLog(item.id)
-      } else {
-        clearRetryingLogIfSettled(item.id)
-      }
+      clearRetryingLog(item.id)
       return
     }
     await refreshLogsIfChanged(true)

@@ -14,7 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daodao97/xgo/xdb"
 	"github.com/daodao97/xgo/xrequest"
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
 
@@ -79,6 +81,32 @@ func TestStreamingLineDoesNotWriteAfterUserRetryWins(t *testing.T) {
 	}
 	if w.Body.Len() != 0 {
 		t.Fatalf("old attempt wrote data after retry: %q", w.Body.String())
+	}
+}
+
+func TestStartActiveRequestLogSnapshotsAccountPoolTrafficExclusion(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	context.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	pool := &ProviderPool{
+		PoolType:                ProviderPoolTypeAccount,
+		ExcludeFromTotalTraffic: true,
+	}
+	context.Request = context.Request.WithContext(withProviderPoolContext(context.Request.Context(), pool, "user-a"))
+
+	requestLog := (&ProviderRelayService{}).startActiveRequestLog(context, "openai-responses", "gpt-5", false)
+	if !requestLog.ExcludeFromTotalTraffic {
+		t.Fatal("account pool request log should snapshot exclude-from-total setting")
+	}
+
+	pool.ExcludeFromTotalTraffic = false
+	if !requestLog.ExcludeFromTotalTraffic {
+		t.Fatal("request log exclusion should not change after pool configuration changes")
 	}
 }
 
@@ -417,6 +445,60 @@ func TestWriteCodexGuardedStreamingResponseRejectsEmptyStreamAfterKeepAlive(t *t
 	}
 }
 
+func TestWriteCodexGuardedStreamingResponseCommitsOnlyCompletedResponseID(t *testing.T) {
+	tests := []struct {
+		name       string
+		payload    string
+		wantCommit string
+	}{
+		{
+			name: "completed",
+			payload: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n" +
+				"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_complete\"}}\n\n" +
+				"data: [DONE]\n\n",
+			wantCommit: "resp_complete",
+		},
+		{
+			name: "failed",
+			payload: "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\"}}\n\n" +
+				"data: [DONE]\n\n",
+		},
+		{
+			name: "incomplete",
+			payload: "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\"}}\n\n" +
+				"data: [DONE]\n\n",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resp := xrequest.NewResponse(&http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(test.payload)),
+			})
+			var committed string
+			_, _, err := writeCodexGuardedStreamingResponseWithOptions(
+				newStreamingRecorder(),
+				resp,
+				&ReqeustLog{startedAt: time.Now()},
+				codexStreamGuardOptions{
+					deferInitialKeepAlive: true,
+					onSuccessfulCompleted: func(responseID string) {
+						committed = responseID
+					},
+				},
+			)
+			if err != nil {
+				t.Fatalf("guard returned error: %v", err)
+			}
+			if committed != test.wantCommit {
+				t.Fatalf("committed response id = %q, want %q", committed, test.wantCommit)
+			}
+		})
+	}
+}
+
 func TestShouldUseCodexStreamGuardOnlyForResponses(t *testing.T) {
 	relay := &ProviderRelayService{}
 
@@ -503,6 +585,422 @@ func TestWriteCodexGuardedStreamingResponseReleasesOnUsefulContent(t *testing.T)
 	}
 	if requestLog.FirstEventSec <= 0 {
 		t.Fatalf("expected FirstEventSec to be recorded")
+	}
+}
+
+func TestWriteCodexGuardedStreamingResponseTimesOutBeforeUsefulContent(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	resp := xrequest.NewResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       pr,
+	})
+
+	start := time.Now()
+	_, responseWritten, err := writeCodexGuardedStreamingResponseWithOptions(
+		newStreamingRecorder(),
+		resp,
+		&ReqeustLog{startedAt: start},
+		codexStreamGuardOptions{
+			deferInitialKeepAlive:        true,
+			disableKeepAliveUntilRelease: true,
+			firstUsefulContentTimeout:    25 * time.Millisecond,
+		},
+	)
+	if !errors.Is(err, errCodexFirstTextTimeout) {
+		t.Fatalf("err = %v, want errCodexFirstTextTimeout", err)
+	}
+	if responseWritten {
+		t.Fatal("response was committed before first useful content")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("first-content timeout took %s, want prompt timeout", elapsed)
+	}
+}
+
+func TestWriteCodexGuardedStreamingResponseDoesNotTreatUsageAsFirstText(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	resp := xrequest.NewResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       pr,
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := writeCodexGuardedStreamingResponseWithOptions(
+			newStreamingRecorder(),
+			resp,
+			&ReqeustLog{startedAt: time.Now()},
+			codexStreamGuardOptions{
+				deferInitialKeepAlive:        true,
+				disableKeepAliveUntilRelease: true,
+				firstUsefulContentTimeout:    25 * time.Millisecond,
+			},
+		)
+		done <- err
+	}()
+
+	if _, err := pw.Write([]byte("data: {\"type\":\"response.in_progress\",\"response\":{\"usage\":{\"input_tokens\":12}}}\n\n")); err != nil {
+		t.Fatalf("write usage event: %v", err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, errCodexFirstTextTimeout) {
+			t.Fatalf("err = %v, want errCodexFirstTextTimeout after usage-only event", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("usage-only stream did not observe first-text timeout")
+	}
+}
+
+func TestReadResponseBodyWithFirstTextTimeout(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	resp := xrequest.NewResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       reader,
+	})
+
+	startedAt := time.Now()
+	_, err := readResponseBodyWithFirstTextTimeout(resp, 25*time.Millisecond)
+	if !errors.Is(err, errCodexFirstTextTimeout) {
+		t.Fatalf("err = %v, want errCodexFirstTextTimeout", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("first-text timeout took %s, want prompt timeout", elapsed)
+	}
+}
+
+func TestPoolFirstTextTimeoutCancelsBeforeDelayedHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(6 * time.Second):
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n"))
+		}
+	}))
+	defer upstream.Close()
+
+	relay := NewProviderRelayService(NewProviderService(), NewProviderPoolService(), nil, nil, nil, DefaultRelayBindAddr)
+	pool := &ProviderPool{FirstTextRetryEnabled: true, FirstTextRetryTimeoutSeconds: 5}
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5","stream":true}`))
+	request = request.WithContext(withProviderPoolContext(request.Context(), pool, "user-a"))
+	context.Request = request
+
+	startedAt := time.Now()
+	ok, err := relay.forwardRequestWithLog(
+		context,
+		"openai-responses",
+		Provider{ID: 1, Name: "slow", APIURL: upstream.URL, APIKey: "test-key"},
+		"/responses",
+		nil,
+		http.Header{},
+		[]byte(`{"model":"gpt-5","stream":true}`),
+		true,
+		"gpt-5",
+		nil,
+	)
+	if ok || !errors.Is(err, errCodexFirstTextTimeout) {
+		t.Fatalf("forward result = (%v, %v), want first-text timeout", ok, err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 5500*time.Millisecond {
+		t.Fatalf("delayed headers timed out after %s, want close to 5 seconds", elapsed)
+	}
+}
+
+func TestPoolFirstTextTimeoutResetsForEachProviderAttempt(t *testing.T) {
+	requestReachedUpstream := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestReachedUpstream <- struct{}{}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	relay := NewProviderRelayService(NewProviderService(), NewProviderPoolService(), nil, nil, nil, DefaultRelayBindAddr)
+	pool := &ProviderPool{FirstTextRetryEnabled: true, FirstTextRetryTimeoutSeconds: 5}
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5","stream":true}`))
+	request = request.WithContext(withProviderPoolContext(request.Context(), pool, "user-a"))
+	context.Request = request
+	requestLog := &ReqeustLog{startedAt: time.Now().Add(-6 * time.Second)}
+
+	ok, err := relay.forwardRequestWithLog(
+		context,
+		"openai-responses",
+		Provider{ID: 1, Name: "slow", APIURL: upstream.URL, APIKey: "test-key"},
+		"/responses",
+		nil,
+		http.Header{},
+		[]byte(`{"model":"gpt-5","stream":true}`),
+		true,
+		"gpt-5",
+		requestLog,
+	)
+	if !ok || err != nil {
+		t.Fatalf("forward result = (%v, %v), want successful fresh provider attempt", ok, err)
+	}
+	if requestLog.FirstTextSec <= 0 || requestLog.FirstTextSec >= 1 {
+		t.Fatalf("fresh attempt first text = %.3fs, want attempt-relative timing below 1s", requestLog.FirstTextSec)
+	}
+	select {
+	case <-requestReachedUpstream:
+	default:
+		t.Fatal("fresh provider attempt did not reach upstream")
+	}
+}
+
+func TestFirstTextTimeoutAttemptPersistsBeforeLaterClientCancel(t *testing.T) {
+	setupRelayTestEnv(t)
+	db, err := xdb.DB("default")
+	if err != nil {
+		t.Fatalf("get db: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM request_log`); err != nil {
+		t.Fatalf("clear request_log: %v", err)
+	}
+
+	previousQueue := GlobalDBQueueLogs
+	testQueue := NewDBWriteQueue(db, 32, true)
+	GlobalDBQueueLogs = testQueue
+	t.Cleanup(func() {
+		_ = testQueue.Shutdown(time.Second)
+		GlobalDBQueueLogs = previousQueue
+	})
+
+	previousTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() { defaultActiveRequestTracker = previousTracker })
+
+	requestLog := &ReqeustLog{
+		UserID:       "user-timeout-log",
+		Platform:     "openai-responses",
+		Provider:     "slow-key",
+		Model:        "gpt-5",
+		IsStream:     true,
+		RelayKeyID:   "relay-a",
+		HttpCode:     http.StatusGatewayTimeout,
+		ErrorMessage: firstTextTimeoutErrorBody,
+		startedAt:    time.Now().Add(-5 * time.Second),
+	}
+	requestLog.ActiveRequestID = defaultActiveRequestTracker.Start(requestLog, requestLog.startedAt)
+	relay := &ProviderRelayService{}
+	relay.persistFirstTextTimeoutAttempt(requestLog)
+
+	// A later client cancellation belongs to the logical wrapper request. It
+	// must not rewrite or duplicate the provider attempt that already timed out.
+	requestLog.HttpCode = 499
+	requestLog.ErrorMessage = "client cancelled"
+	relay.finishActiveRequestLog(requestLog)
+
+	var count, status int
+	var body string
+	if err := db.QueryRow(`
+		SELECT COUNT(*), COALESCE(MAX(http_code), 0), COALESCE(MAX(error_message), '')
+		FROM request_log WHERE user_id = ? AND provider = ?
+	`, requestLog.UserID, "slow-key").Scan(&count, &status, &body); err != nil {
+		t.Fatalf("query timeout log: %v", err)
+	}
+	if count != 1 || status != http.StatusGatewayTimeout || body != firstTextTimeoutErrorBody {
+		t.Fatalf("persisted timeout = count %d status %d body %q, want one JSON 504", count, status, body)
+	}
+	if active := defaultActiveRequestTracker.List("", "", requestLog.UserID); len(active) != 0 {
+		t.Fatalf("active logs after finish = %+v, want none", active)
+	}
+}
+
+func TestProviderAttemptDeadlineDoesNotStartBeforeProxyPreparation(t *testing.T) {
+	pool := &ProviderPool{
+		ID: "proxy-pool",
+		ProxyConfig: &AccountPoolProxyConfig{
+			Enabled:     true,
+			Selection:   AccountPoolProxySelectionNode,
+			ProxyNodeID: "proxy-a",
+		},
+	}
+	ctx := withProviderPoolContext(context.Background(), pool, "user-a")
+	started := false
+	relay := &ProviderRelayService{httpClient: http.DefaultClient}
+	_, err := relay.doProviderRequestWithAttemptStart(
+		ctx,
+		"https://provider.example/v1/responses",
+		make(http.Header),
+		nil,
+		nil,
+		func(ctx context.Context) context.Context {
+			started = true
+			return ctx
+		},
+	)
+	if err == nil {
+		t.Fatal("proxy preparation without a proxy service unexpectedly succeeded")
+	}
+	if started {
+		t.Fatal("provider/key deadline started before proxy preparation succeeded")
+	}
+}
+
+func TestWriteCodexGuardedStreamingResponseDoesNotTimeoutAfterUsefulContent(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pr.Close()
+
+	resp := xrequest.NewResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       pr,
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := writeCodexGuardedStreamingResponseWithOptions(
+			newStreamingRecorder(),
+			resp,
+			&ReqeustLog{startedAt: time.Now()},
+			codexStreamGuardOptions{
+				deferInitialKeepAlive:        true,
+				disableKeepAliveUntilRelease: true,
+				firstUsefulContentTimeout:    100 * time.Millisecond,
+			},
+		)
+		done <- err
+	}()
+
+	if _, err := pw.Write([]byte("data: {\"type\":\"response.created\"}\n\n")); err != nil {
+		t.Fatalf("write created event: %v", err)
+	}
+	if _, err := pw.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n")); err != nil {
+		t.Fatalf("write useful content: %v", err)
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close upstream stream: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("guard returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("guard did not finish after useful content")
+	}
+}
+
+func TestCodexFirstTextTimeoutCountsTowardProviderBlacklist(t *testing.T) {
+	relay := NewProviderRelayService(NewProviderService(), NewProviderPoolService(), nil, nil, nil, DefaultRelayBindAddr)
+	pool := &ProviderPool{
+		ID:                           "timeout-pool",
+		Platform:                     "openai-responses",
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       2,
+		AutoBlacklistDurationMinutes: 10,
+	}
+	provider := Provider{ID: 9, Name: "slow-provider", Enabled: true}
+
+	if relay.recordCodexStreamPreflightFailureForUser("user-1", "openai-responses", pool.ID, pool, provider, errCodexFirstTextTimeout) {
+		t.Fatal("first first-text timeout should not yet blacklist provider")
+	}
+	if relay.isProviderBlacklistedForUser("user-1", "openai-responses", pool.ID, provider.ID) {
+		t.Fatal("provider blacklisted before threshold")
+	}
+	if !relay.recordCodexStreamPreflightFailureForUser("user-1", "openai-responses", pool.ID, pool, provider, errCodexFirstTextTimeout) {
+		t.Fatal("second first-text timeout should blacklist provider")
+	}
+
+	statuses := relay.ListProviderBlacklistStatusForUser("user-1", "openai-responses", pool.ID)
+	if len(statuses) != 1 || statuses[0].FailureCount != 2 || statuses[0].LastReason != "HTTP 504 (first text timeout)" {
+		t.Fatalf("blacklist status = %+v, want one provider with two HTTP 504 timeout failures", statuses)
+	}
+}
+
+func TestAutoProxyWithoutAvailableNodesDisablesPoolProxy(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	poolService := NewProviderPoolService()
+	pool := &ProviderPool{
+		ID:       "auto-proxy-pool",
+		Platform: "openai-responses",
+		Name:     "Auto Proxy Pool",
+		PoolType: ProviderPoolTypeAccount,
+		Mode:     ProviderPoolModeManaged,
+		AccountPoolConfig: &AccountPoolConfig{
+			APIURL:            "https://upstream.example",
+			ResponsesEndpoint: "/v1/responses",
+			Keys:              []AccountPoolKey{{APIKey: "sk-test-key"}},
+		},
+		ProxyConfig: &AccountPoolProxyConfig{
+			Enabled:                    true,
+			Selection:                  AccountPoolProxySelectionAuto,
+			AutoDisableWhenNoAvailable: true,
+		},
+	}
+	if _, err := poolService.SavePoolForUser("user-1", pool); err != nil {
+		t.Fatalf("save pool: %v", err)
+	}
+
+	relay := NewProviderRelayService(NewProviderService(), poolService, nil, nil, nil, DefaultRelayBindAddr)
+	relay.disableAutoPoolProxy("user-1", pool)
+	if pool.ProxyConfig.Enabled || pool.ProxyConfig.Selection != AccountPoolProxySelectionNone || pool.ProxyConfig.ProxyNodeID != "" {
+		t.Fatalf("in-memory proxy config = %+v, want disabled", pool.ProxyConfig)
+	}
+
+	persisted, err := poolService.GetPoolForUser("user-1", pool.ID)
+	if err != nil {
+		t.Fatalf("load saved pool: %v", err)
+	}
+	if persisted == nil || persisted.ProxyConfig == nil || persisted.ProxyConfig.Enabled || persisted.ProxyConfig.Selection != AccountPoolProxySelectionNone || persisted.ProxyConfig.ProxyNodeID != "" {
+		t.Fatalf("saved proxy config = %+v, want disabled", persisted)
+	}
+}
+
+func TestAutoProxyUnavailableErrorDetection(t *testing.T) {
+	if !isAutoProxyUnavailableError(errors.New("自动选择没有可用代理节点")) {
+		t.Fatal("expected automatic proxy no-node error to be recognized")
+	}
+	if isAutoProxyUnavailableError(errors.New("固定代理节点不可用")) {
+		t.Fatal("fixed-node error should not disable the pool proxy")
+	}
+}
+
+func TestAutoProxyWithoutFallbackSettingStaysEnabled(t *testing.T) {
+	pool := &ProviderPool{ProxyConfig: &AccountPoolProxyConfig{
+		Enabled:   true,
+		Selection: AccountPoolProxySelectionAuto,
+	}}
+	(&ProviderRelayService{}).disableAutoPoolProxy("user-1", pool)
+	if !pool.ProxyConfig.Enabled || pool.ProxyConfig.Selection != AccountPoolProxySelectionAuto {
+		t.Fatalf("proxy config = %+v, want automatic proxy to remain enabled without its fallback setting", pool.ProxyConfig)
+	}
+}
+
+func TestInternalRelayTargetDetection(t *testing.T) {
+	relay := &ProviderRelayService{addr: "127.0.0.1:18100"}
+	for _, target := range []string{
+		"http://localhost:18100/responses",
+		"http://127.0.0.1:18100/v1/responses",
+		"http://[::1]:18100/responses",
+	} {
+		if !relay.isInternalRelayTarget(target) {
+			t.Fatalf("target %q should be recognized as internal relay", target)
+		}
+	}
+	for _, target := range []string{
+		"https://lqapi.cc/v1/responses",
+		"http://localhost:18101/responses",
+		"http://192.168.1.10:18100/responses",
+	} {
+		if relay.isInternalRelayTarget(target) {
+			t.Fatalf("target %q should not be recognized as internal relay", target)
+		}
 	}
 }
 

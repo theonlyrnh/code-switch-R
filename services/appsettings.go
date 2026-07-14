@@ -18,11 +18,13 @@ const (
 )
 
 type AppSettings struct {
-	ShowHomeTitle          bool `json:"show_home_title"`
-	AutoStart              bool `json:"auto_start"`
-	AutoConnectivityTest   bool `json:"auto_connectivity_test"`
-	EnableSwitchNotify     bool `json:"enable_switch_notify"`      // 供应商切换通知开关
-	EnableCodexStreamGuard bool `json:"enable_codex_stream_guard"` // Codex 流式空响应保护开关
+	ShowHomeTitle                    bool `json:"show_home_title"`
+	AutoStart                        bool `json:"auto_start"`
+	AutoConnectivityTest             bool `json:"auto_connectivity_test"`
+	EnableSwitchNotify               bool `json:"enable_switch_notify"`      // 供应商切换通知开关
+	EnableCodexStreamGuard           bool `json:"enable_codex_stream_guard"` // Codex 流式空响应保护开关
+	EnableProxyLatencyMultithreading bool `json:"enable_proxy_latency_multithreading"`
+	ProxyLatencyMaxConcurrency       int  `json:"proxy_latency_max_concurrency"`
 }
 
 type persistedAppSettings struct {
@@ -150,11 +152,13 @@ func (as *AppSettingsService) defaultSettings() AppSettings {
 	}
 
 	return AppSettings{
-		ShowHomeTitle:          true,
-		AutoStart:              autoStartEnabled,
-		AutoConnectivityTest:   true,  // 默认开启自动可用性监控（开箱即用）
-		EnableSwitchNotify:     true,  // 默认开启切换通知
-		EnableCodexStreamGuard: true,  // 默认开启 Codex 流式空响应保护
+		ShowHomeTitle:                    true,
+		AutoStart:                        autoStartEnabled,
+		AutoConnectivityTest:             true, // 默认开启自动可用性监控（开箱即用）
+		EnableSwitchNotify:               true, // 默认开启切换通知
+		EnableCodexStreamGuard:           true, // 默认开启 Codex 流式空响应保护
+		EnableProxyLatencyMultithreading: true,
+		ProxyLatencyMaxConcurrency:       3,
 	}
 }
 
@@ -187,7 +191,9 @@ func (as *AppSettingsService) SaveAdminAuthConfig(config AdminAuthConfig) error 
 func (as *AppSettingsService) SaveAppSettings(settings AppSettings) (AppSettings, error) {
 	as.mu.Lock()
 	defer as.mu.Unlock()
-
+	if settings.ProxyLatencyMaxConcurrency < 1 || settings.ProxyLatencyMaxConcurrency > proxyMaxSpeedTestWorkers {
+		return settings, fmt.Errorf("代理测速最大线程数必须在 1 到 %d 之间", proxyMaxSpeedTestWorkers)
+	}
 	// 同步开机自启动状态
 	if as.autoStartService != nil {
 		if settings.AutoStart {
@@ -265,6 +271,11 @@ func (as *AppSettingsService) loadFullLocked() (persistedAppSettings, error) {
 	}
 	if err := json.Unmarshal(data, &file); err != nil {
 		return file, err
+	}
+	defaults := as.defaultSettings()
+	if file.ProxyLatencyMaxConcurrency == 0 {
+		file.ProxyLatencyMaxConcurrency = defaults.ProxyLatencyMaxConcurrency
+		file.EnableProxyLatencyMultithreading = defaults.EnableProxyLatencyMultithreading
 	}
 	return file, nil
 }

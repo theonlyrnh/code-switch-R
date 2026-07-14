@@ -37,6 +37,7 @@ type CostPrice struct {
 
 type CostSettings struct {
 	ProviderMultipliers map[string]float64   `json:"provider_multipliers"`
+	ModelPrices         map[string]CostPrice `json:"model_prices"`
 	ModelPriceOverrides map[string]CostPrice `json:"model_price_overrides"`
 }
 
@@ -61,11 +62,11 @@ func (cs *CostService) TodayUsageForUser(userID string, platform string, provide
 			COALESCE(provider, '') AS provider,
 			COALESCE(model, '') AS model,
 			COUNT(*) AS total_requests,
-			COALESCE(SUM(input_tokens), 0) AS input_tokens,
-			COALESCE(SUM(output_tokens), 0) AS output_tokens,
-			COALESCE(SUM(cache_create_tokens), 0) AS cache_create_tokens,
-			COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-			COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN input_tokens ELSE 0 END), 0) AS input_tokens,
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN output_tokens ELSE 0 END), 0) AS output_tokens,
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN cache_create_tokens ELSE 0 END), 0) AS cache_create_tokens,
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN cache_read_tokens ELSE 0 END), 0) AS cache_read_tokens,
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN reasoning_tokens ELSE 0 END), 0) AS reasoning_tokens
 		FROM request_log
 		WHERE created_at >= ?
 			AND created_at < ?
@@ -251,6 +252,7 @@ func (cs *CostService) saveSettingsLocked(userID string, settings CostSettings) 
 func defaultCostSettings() CostSettings {
 	return CostSettings{
 		ProviderMultipliers: map[string]float64{},
+		ModelPrices:         map[string]CostPrice{},
 		ModelPriceOverrides: map[string]CostPrice{},
 	}
 }
@@ -268,6 +270,13 @@ func normalizeCostSettings(settings CostSettings) CostSettings {
 		}
 		result.ProviderMultipliers[CostProviderKey(parts[0], parts[1])] = multiplier
 	}
+	for model, value := range settings.ModelPrices {
+		model = normalizeCostModelName(model)
+		if model == "" {
+			continue
+		}
+		result.ModelPrices[model] = normalizeCostPrice(value)
+	}
 	for key, value := range settings.ModelPriceOverrides {
 		parts := strings.SplitN(key, "::", 3)
 		if len(parts) != 3 {
@@ -276,6 +285,10 @@ func normalizeCostSettings(settings CostSettings) CostSettings {
 		result.ModelPriceOverrides[CostModelKey(parts[0], parts[1], parts[2])] = normalizeCostPrice(value)
 	}
 	return result
+}
+
+func normalizeCostModelName(model string) string {
+	return strings.ToLower(strings.TrimSpace(model))
 }
 
 func normalizeCostPrice(price CostPrice) CostPrice {

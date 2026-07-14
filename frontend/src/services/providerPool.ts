@@ -5,6 +5,60 @@ import { Call } from '../wails-runtime'
 
 export type ProviderPoolMode = 'managed' | 'manual'
 export type ProviderPoolType = 'normal' | 'account'
+export type AccountPoolProxySelection = 'none' | 'auto' | 'node'
+
+export interface AccountPoolProxyConfig {
+  enabled: boolean
+  selection: AccountPoolProxySelection
+  proxyNodeId?: string
+  autoDisableWhenNoAvailable?: boolean
+}
+
+export interface ProxyNode {
+  id: string
+  configName: string
+  originalName: string
+  name: string
+  uploader: string
+}
+
+export interface ProxyConfigSummary {
+  /** Stable server-side identifier. Do not derive this from the YAML file name. */
+  id: string
+  name: string
+  fileName: string
+  uploader: string
+  uploadedAt: string
+  /** True only for the user who originally uploaded this YAML configuration. */
+  isOwner: boolean
+  nodes: ProxyNode[]
+}
+
+export interface ProxySpeedTestResult {
+  proxyLatencyMs?: number
+  responsesLatencyMs?: number
+  responsesStatus?: number
+  responsesError?: string
+  responsesCloudflareBlocked?: boolean
+  proxyError?: string
+  cleanupError?: string
+}
+
+export interface ProxyNodeLatencyResult {
+  nodeId: string
+  tested: boolean
+  proxyLatencyMs?: number
+  proxyError?: string
+  responsesLatencyMs?: number
+  responsesStatus?: number
+  responsesError?: string
+  responsesCloudflareBlocked?: boolean
+}
+
+export interface ProxySpeedTestSnapshot {
+  testedAt?: string
+  results: ProxyNodeLatencyResult[]
+}
 
 export interface AccountPoolKey {
   id: number
@@ -25,6 +79,16 @@ export interface ProviderPoolMember {
   weight?: number
 }
 
+export interface SpecialBlacklistRule {
+  id: string
+  name: string
+  httpStatus: number
+  jsonPath?: string
+  expectedJsonValue?: string
+  threshold: number
+  durationMinutes: number
+}
+
 export interface ProviderPool {
   id: string
   platform: string
@@ -34,12 +98,17 @@ export interface ProviderPool {
   manualProviderId?: number | null
   members: ProviderPoolMember[]
   accountPoolConfig?: AccountPoolConfig
+  proxyConfig?: AccountPoolProxyConfig
+  excludeFromTotalTraffic?: boolean
   createdAt: string
   updatedAt: string
   /** 自动拉黑配置（仅 managed 模式生效） */
   autoBlacklistEnabled: boolean
   autoBlacklistThreshold: number
   autoBlacklistDurationMinutes: number
+  specialBlacklistRules: SpecialBlacklistRule[]
+  firstTextRetryEnabled: boolean
+  firstTextRetryTimeoutSeconds: number
 }
 
 export interface ProviderPoolWithProviders extends ProviderPool {
@@ -90,6 +159,45 @@ export async function SavePool(pool: Partial<ProviderPool> & { platform: string;
  */
 export async function DeletePool(poolID: string): Promise<void> {
   return Call.ByName('codeswitch/services.ProviderPoolService.DeletePool', poolID)
+}
+
+export async function ListProxyConfigs(): Promise<ProxyConfigSummary[]> {
+  return Call.ByName('codeswitch/services.ProxyService.ListProxyConfigs')
+}
+
+export async function UploadProxyConfig(fileName: string, content: string): Promise<void> {
+  return Call.ByName('codeswitch/services.ProxyService.UploadProxyConfig', fileName, content)
+}
+
+export async function DeleteProxyConfig(configID: string): Promise<void> {
+  return Call.ByName('codeswitch/services.ProxyService.DeleteProxyConfig', configID)
+}
+
+export async function HideProxyConfig(configID: string): Promise<void> {
+  return Call.ByName('codeswitch/services.ProxyService.HideProxyConfig', configID)
+}
+
+export async function ListHiddenProxyConfigs(): Promise<ProxyConfigSummary[]> {
+  return Call.ByName('codeswitch/services.ProxyService.ListHiddenProxyConfigs')
+}
+
+export async function UnhideProxyConfig(configID: string): Promise<void> {
+  return Call.ByName('codeswitch/services.ProxyService.UnhideProxyConfig', configID)
+}
+
+export async function RefreshProxyConfigs(): Promise<ProxyConfigSummary[]> {
+  return Call.ByName('codeswitch/services.ProxyService.RefreshProxyConfigs')
+}
+
+export async function TestProxy(poolID: string, nodeID: string, responsesURL: string, signal?: AbortSignal): Promise<ProxySpeedTestResult> {
+  if (signal) {
+    return Call.ByNameWithSignal('codeswitch/services.ProxyService.TestProxy', signal, poolID, nodeID, responsesURL)
+  }
+  return Call.ByName('codeswitch/services.ProxyService.TestProxy', poolID, nodeID, responsesURL)
+}
+
+export async function GetProxySpeedTests(poolID: string, responsesURL: string): Promise<ProxySpeedTestSnapshot> {
+  return Call.ByName('codeswitch/services.ProxyService.GetProxySpeedTests', poolID, responsesURL)
 }
 
 /**

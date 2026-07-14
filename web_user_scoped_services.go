@@ -4,6 +4,9 @@ import (
 	"codeswitch/services"
 	"context"
 	"errors"
+	"fmt"
+	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -58,7 +61,173 @@ func (s *userScopedProviderService) DuplicateProvider(ctx context.Context, kind 
 }
 
 type userScopedProviderPoolService struct {
-	base *services.ProviderPoolService
+	base         *services.ProviderPoolService
+	proxyService *services.ProxyService
+}
+
+type userScopedProxyService struct {
+	base        *services.ProxyService
+	poolService *services.ProviderPoolService
+	userStore   *services.UserStore
+}
+
+func (s *userScopedProxyService) ListProxyConfigs(ctx context.Context) ([]services.ProxyConfigSummary, error) {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.base.ListProxyConfigsForUser(user.ID)
+}
+
+func (s *userScopedProxyService) UploadProxyConfig(ctx context.Context, fileName string, content string) error {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	return s.base.UploadProxyConfigForUser(fileName, content, user.ID, user.Username)
+}
+
+func (s *userScopedProxyService) RefreshProxyConfigs(ctx context.Context) ([]services.ProxyConfigSummary, error) {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.base.RefreshProxyConfigs(); err != nil {
+		return nil, err
+	}
+	return s.base.ListProxyConfigsForUser(user.ID)
+}
+
+func (s *userScopedProxyService) ListHiddenProxyConfigs(ctx context.Context) ([]services.ProxyConfigSummary, error) {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.base.ListHiddenProxyConfigsForUser(user.ID)
+}
+
+func (s *userScopedProxyService) HideProxyConfig(ctx context.Context, configID string) error {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	return s.base.HideProxyConfigForUser(user.ID, configID)
+}
+
+func (s *userScopedProxyService) UnhideProxyConfig(ctx context.Context, configID string) error {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	return s.base.UnhideProxyConfigForUser(user.ID, configID)
+}
+
+func (s *userScopedProxyService) DeleteProxyConfig(ctx context.Context, configID string) error {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	if s.userStore == nil || s.poolService == nil {
+		return errors.New("代理配置删除服务未初始化")
+	}
+	return s.base.DeleteProxyConfigForUser(user.ID, configID, s.ensureProxyConfigDeletionSafe)
+}
+
+func (s *userScopedProxyService) ensureProxyConfigDeletionSafe(nodeIDs []string, remainingNodeCount int) error {
+	users, err := s.userStore.ListUsers()
+	if err != nil {
+		return fmt.Errorf("检查号池代理引用失败: %w", err)
+	}
+	nodes := make(map[string]struct{}, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		nodes[nodeID] = struct{}{}
+	}
+	for _, user := range users {
+		pools, err := s.poolService.ListAllPoolsForUser(user.ID)
+		if err != nil {
+			return fmt.Errorf("检查号池代理引用失败: %w", err)
+		}
+		for _, pool := range pools {
+			if services.ProviderPoolType(strings.TrimSpace(string(pool.PoolType))) != services.ProviderPoolTypeAccount || pool.ProxyConfig == nil || !pool.ProxyConfig.Enabled {
+				continue
+			}
+			switch pool.ProxyConfig.Selection {
+			case services.AccountPoolProxySelectionNode:
+				if _, used := nodes[strings.TrimSpace(pool.ProxyConfig.ProxyNodeID)]; used {
+					return errors.New("该代理配置正在被号池固定节点使用，无法删除")
+				}
+			case "", services.AccountPoolProxySelectionAuto:
+				if remainingNodeCount == 0 {
+					return errors.New("该代理配置是号池自动选择的最后一个可用节点，无法删除")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (s *userScopedProxyService) TestProxy(ctx context.Context, poolID string, nodeID string, responsesURL string) (services.ProxySpeedTestResult, error) {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return services.ProxySpeedTestResult{}, err
+	}
+	poolID = strings.TrimSpace(poolID)
+	autoSelectionURL := ""
+	if poolID != "" {
+		pool, err := s.poolService.GetPoolForUser(user.ID, poolID)
+		if err != nil {
+			return services.ProxySpeedTestResult{}, err
+		}
+		if pool == nil || pool.PoolType != services.ProviderPoolTypeAccount {
+			return services.ProxySpeedTestResult{}, errors.New("号池不存在或不是号池模式")
+		}
+		if pool.AccountPoolConfig != nil {
+			autoSelectionURL = pool.AccountPoolConfig.APIURL
+		}
+	}
+	return s.base.TestProxyForUser(ctx, user.ID, poolID, strings.TrimSpace(nodeID), strings.TrimSpace(responsesURL), autoSelectionURL), nil
+}
+
+// GetProxySpeedTests returns the shared latest Responses measurements.
+// poolID is checked only when this is an existing pool; create-pool preview
+// remains supported without exposing any hidden proxy nodes.
+func (s *userScopedProxyService) GetProxySpeedTests(ctx context.Context, poolID string, responsesURL string) (services.ProxySpeedTestSnapshot, error) {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return services.ProxySpeedTestSnapshot{}, err
+	}
+	poolID = strings.TrimSpace(poolID)
+	if poolID != "" {
+		pool, err := s.poolService.GetPoolForUser(user.ID, poolID)
+		if err != nil {
+			return services.ProxySpeedTestSnapshot{}, err
+		}
+		if pool == nil || pool.PoolType != services.ProviderPoolTypeAccount {
+			return services.ProxySpeedTestSnapshot{}, errors.New("号池不存在或不是号池模式")
+		}
+	}
+	return s.base.SharedProxySpeedTestsForUser(user.ID, strings.TrimSpace(responsesURL))
+}
+
+// TestAllProxyLatencies performs controller health checks for every proxy node
+// visible to the authenticated user. poolID is authorization-only: an empty ID
+// supports the create-pool preview and never creates a runtime listener.
+func (s *userScopedProxyService) TestAllProxyLatencies(ctx context.Context, poolID string) ([]services.ProxyNodeLatencyResult, error) {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	poolID = strings.TrimSpace(poolID)
+	if poolID != "" {
+		pool, err := s.poolService.GetPoolForUser(user.ID, poolID)
+		if err != nil {
+			return nil, err
+		}
+		if pool == nil || pool.PoolType != services.ProviderPoolTypeAccount {
+			return nil, errors.New("号池不存在或不是号池模式")
+		}
+	}
+	return s.base.TestAllProxyLatenciesForUser(ctx, user.ID)
 }
 
 func (s *userScopedProviderPoolService) ListPools(ctx context.Context, platform string) ([]services.ProviderPool, error) {
@@ -90,7 +259,34 @@ func (s *userScopedProviderPoolService) SavePool(ctx context.Context, pool *serv
 	if err != nil {
 		return "", err
 	}
-	return s.base.SavePoolForUser(user.ID, pool)
+	var id string
+	if s.proxyService != nil {
+		err = s.proxyService.WithCatalogOperation(func() error {
+			if pool != nil && services.ProviderPoolType(strings.TrimSpace(string(pool.PoolType))) == services.ProviderPoolTypeAccount {
+				if normalizeErr := s.proxyService.NormalizePoolProxyConfigForUserInOperation(user.ID, pool.ProxyConfig); normalizeErr != nil {
+					return normalizeErr
+				}
+			}
+			var saveErr error
+			id, saveErr = s.base.SavePoolForUser(user.ID, pool)
+			return saveErr
+		})
+	} else {
+		id, err = s.base.SavePoolForUser(user.ID, pool)
+	}
+	if err != nil {
+		return "", err
+	}
+	if s.proxyService != nil {
+		baseURL := ""
+		if pool.AccountPoolConfig != nil {
+			baseURL = pool.AccountPoolConfig.APIURL
+		}
+		if err := s.proxyService.SyncPoolProxyWithBaseURL(user.ID, id, pool.ProxyConfig, baseURL); err != nil {
+			log.Printf("同步号池代理 listener 失败（池子已保存）: %v", err)
+		}
+	}
+	return id, nil
 }
 
 func (s *userScopedProviderPoolService) DeletePool(ctx context.Context, poolID string) error {
@@ -98,7 +294,15 @@ func (s *userScopedProviderPoolService) DeletePool(ctx context.Context, poolID s
 	if err != nil {
 		return err
 	}
-	return s.base.DeletePoolForUser(user.ID, poolID)
+	if err := s.base.DeletePoolForUser(user.ID, poolID); err != nil {
+		return err
+	}
+	if s.proxyService != nil {
+		if err := s.proxyService.SyncPoolProxy(user.ID, poolID, nil); err != nil {
+			log.Printf("清理号池代理 listener 失败（池子已删除）: %v", err)
+		}
+	}
+	return nil
 }
 
 type userScopedCodexRelayKeyService struct {
@@ -185,7 +389,8 @@ func (s *userScopedLogService) ProviderDailyStats(ctx context.Context, platform 
 }
 
 type userScopedCostService struct {
-	base *services.CostService
+	base        *services.CostService
+	poolService *services.ProviderPoolService
 }
 
 func (s *userScopedCostService) TodayUsage(ctx context.Context, platform string, provider string) ([]services.CostUsageItem, error) {
@@ -196,7 +401,68 @@ func (s *userScopedCostService) TodayUsage(ctx context.Context, platform string,
 	if err != nil {
 		return nil, err
 	}
-	return s.base.TodayUsageForUser(user.ID, platform, provider)
+	items, err := s.base.TodayUsageForUser(user.ID, platform, "")
+	if err != nil || s.poolService == nil {
+		return items, err
+	}
+	pools, err := s.poolService.ListAllPoolsForUser(user.ID)
+	if err != nil {
+		return nil, err
+	}
+	return aggregateCostUsageByAccountPool(items, pools, strings.TrimSpace(provider)), nil
+}
+
+func aggregateCostUsageByAccountPool(items []services.CostUsageItem, pools []services.ProviderPool, providerFilter string) []services.CostUsageItem {
+	poolNameByAccountProvider := make(map[string]string)
+	for _, pool := range pools {
+		if pool.PoolType != services.ProviderPoolTypeAccount || pool.AccountPoolConfig == nil {
+			continue
+		}
+		poolName := strings.TrimSpace(pool.Name)
+		if poolName == "" {
+			continue
+		}
+		for _, key := range pool.AccountPoolConfig.Keys {
+			poolNameByAccountProvider[services.AccountPoolKeyDisplayName(key)] = poolName
+		}
+	}
+
+	merged := make(map[string]services.CostUsageItem)
+	for _, item := range items {
+		if poolName, ok := poolNameByAccountProvider[item.Provider]; ok {
+			item.Provider = poolName
+		}
+		if providerFilter != "" && item.Provider != providerFilter {
+			continue
+		}
+		key := item.Platform + "\x00" + item.Provider + "\x00" + item.Model
+		current := merged[key]
+		current.Platform = item.Platform
+		current.Provider = item.Provider
+		current.Model = item.Model
+		current.TotalRequests += item.TotalRequests
+		current.InputTokens += item.InputTokens
+		current.OutputTokens += item.OutputTokens
+		current.CacheCreateTokens += item.CacheCreateTokens
+		current.CacheReadTokens += item.CacheReadTokens
+		current.ReasoningTokens += item.ReasoningTokens
+		merged[key] = current
+	}
+
+	result := make([]services.CostUsageItem, 0, len(merged))
+	for _, item := range merged {
+		result = append(result, item)
+	}
+	sort.Slice(result, func(left, right int) bool {
+		if result[left].Platform != result[right].Platform {
+			return result[left].Platform < result[right].Platform
+		}
+		if result[left].Provider != result[right].Provider {
+			return result[left].Provider < result[right].Provider
+		}
+		return result[left].Model < result[right].Model
+	})
+	return result
 }
 
 func (s *userScopedCostService) GetSettings(ctx context.Context) (services.CostSettings, error) {
@@ -505,9 +771,10 @@ func (s *userScopedCodexSettingsService) GetDirectAppliedProviderID(ctx context.
 }
 
 type userScopedConsoleService struct {
-	logService   *services.LogService
-	mu           sync.RWMutex
-	clearedAfter map[string]time.Time
+	logService      *services.LogService
+	poolAttemptLogs *services.PoolAttemptLogService
+	mu              sync.RWMutex
+	clearedAfter    map[string]time.Time
 }
 
 func (s *userScopedConsoleService) GetLogs(ctx context.Context) ([]services.ConsoleLog, error) {
@@ -515,10 +782,7 @@ func (s *userScopedConsoleService) GetLogs(ctx context.Context) ([]services.Cons
 	if err != nil {
 		return nil, err
 	}
-	if s.logService == nil {
-		return []services.ConsoleLog{}, nil
-	}
-	return s.logService.ListHTTPErrorConsoleLogsForUser(user.ID, 200, s.clearTimeForUser(user.ID))
+	return s.listLogs(user.ID, 200)
 }
 
 func (s *userScopedConsoleService) GetRecentLogs(ctx context.Context, count int) ([]services.ConsoleLog, error) {
@@ -526,10 +790,30 @@ func (s *userScopedConsoleService) GetRecentLogs(ctx context.Context, count int)
 	if err != nil {
 		return nil, err
 	}
-	if s.logService == nil {
-		return []services.ConsoleLog{}, nil
+	return s.listLogs(user.ID, count)
+}
+
+func (s *userScopedConsoleService) listLogs(userID string, limit int) ([]services.ConsoleLog, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
 	}
-	return s.logService.ListHTTPErrorConsoleLogsForUser(user.ID, count, s.clearTimeForUser(user.ID))
+	since := s.clearTimeForUser(userID)
+	logs := make([]services.ConsoleLog, 0, limit)
+	if s.logService != nil {
+		finalLogs, err := s.logService.ListHTTPErrorConsoleLogsForUser(userID, 1000, since)
+		if err != nil {
+			return nil, err
+		}
+		logs = append(logs, finalLogs...)
+	}
+	if s.poolAttemptLogs != nil {
+		logs = append(logs, s.poolAttemptLogs.List(userID, 1000, since)...)
+	}
+	sort.SliceStable(logs, func(i, j int) bool { return logs[i].Timestamp.Before(logs[j].Timestamp) })
+	if len(logs) > limit {
+		logs = logs[len(logs)-limit:]
+	}
+	return logs, nil
 }
 
 func (s *userScopedConsoleService) ClearLogs(ctx context.Context) error {

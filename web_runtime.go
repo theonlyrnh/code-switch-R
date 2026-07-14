@@ -50,10 +50,12 @@ type appRuntime struct {
 	modelMonitor       *services.ModelMonitorService
 	versionService     *VersionService
 	consoleService     *services.ConsoleService
+	poolAttemptLogs    *services.PoolAttemptLogService
 	customCliService   *services.CustomCliService
 	networkService     *services.NetworkService
 	providerRelay      *services.ProviderRelayService
 	poolService        *services.ProviderPoolService
+	proxyService       *services.ProxyService
 }
 
 func newAppRuntime() (*appRuntime, error) {
@@ -75,6 +77,10 @@ func newAppRuntime() (*appRuntime, error) {
 	codexRelayKeys := services.NewCodexRelayKeyService()
 	poolService := services.NewProviderPoolService()
 	poolService.SetBindingChecker(codexRelayKeys) // 注入 binding checker，删除 pool 时检查 key 绑定
+	proxyService, err := services.NewProxyService()
+	if err != nil {
+		return nil, fmt.Errorf("初始化共享代理配置失败: %w", err)
+	}
 	bootstrapNetworkService := services.NewNetworkService(defaultRelayAddr, nil, nil, codexRelayKeys)
 	relayAddr := defaultRelayAddr
 	if networkSettings, err := bootstrapNetworkService.GetNetworkSettings(); err != nil {
@@ -86,6 +92,10 @@ func newAppRuntime() (*appRuntime, error) {
 	notificationService := services.NewNotificationService(appSettings)
 	notificationService.SetEventEmitter(eventHub)
 	providerRelay := services.NewProviderRelayService(providerService, poolService, codexRelayKeys, notificationService, appSettings, relayAddr)
+	poolAttemptLogs := services.NewPoolAttemptLogService()
+	providerRelay.SetPoolAttemptLogService(poolAttemptLogs)
+	providerRelay.SetProxyManager(proxyService.Manager())
+	providerRelay.SetProxyService(proxyService)
 	claudeSettings := services.NewClaudeSettingsService(providerRelay.Addr(), codexRelayKeys)
 	codexSettings := services.NewCodexSettingsService(providerRelay.Addr(), codexRelayKeys)
 	cliConfigService := services.NewCliConfigService(providerRelay.Addr(), codexRelayKeys)
@@ -110,11 +120,6 @@ func newAppRuntime() (*appRuntime, error) {
 	consoleService := services.NewConsoleService()
 	customCliService := services.NewCustomCliService(providerRelay.Addr())
 	networkService := services.NewNetworkService(providerRelay.Addr(), claudeSettings, codexSettings, codexRelayKeys)
-
-	// 启动前确保默认池子和 relay key 绑定存在
-	if err := providerRelay.EnsureDefaultPoolsAndBindings(); err != nil {
-		log.Printf("初始化 provider pools 失败: %v", err)
-	}
 
 	if err := providerRelay.Start(); err != nil {
 		return nil, fmt.Errorf("启动代理服务失败: %w", err)
@@ -174,10 +179,12 @@ func newAppRuntime() (*appRuntime, error) {
 		modelMonitor:       modelMonitor,
 		versionService:     versionService,
 		consoleService:     consoleService,
+		poolAttemptLogs:    poolAttemptLogs,
 		customCliService:   customCliService,
 		networkService:     networkService,
 		providerRelay:      providerRelay,
 		poolService:        poolService,
+		proxyService:       proxyService,
 	}, nil
 }
 
@@ -194,6 +201,9 @@ func (rt *appRuntime) shutdown() {
 			log.Printf("停止代理服务失败: %v", err)
 		}
 	}
+	if rt.proxyService != nil {
+		rt.proxyService.Stop()
+	}
 
 	if err := services.ShutdownGlobalDBQueue(10 * time.Second); err != nil {
 		log.Printf("数据库队列关闭超时: %v", err)
@@ -209,7 +219,7 @@ func (rt *appRuntime) registerServices(registry *rpcRegistry) {
 	registry.Register("codeswitch/services.CodexSettingsService", &userScopedCodexSettingsService{base: rt.codexSettings})
 	registry.Register("codeswitch/services.CliConfigService", &userScopedCliConfigService{})
 	registry.Register("codeswitch/services.LogService", &userScopedLogService{base: rt.logService})
-	registry.Register("codeswitch/services.CostService", &userScopedCostService{base: rt.costService})
+	registry.Register("codeswitch/services.CostService", &userScopedCostService{base: rt.costService, poolService: rt.poolService})
 	registry.Register("codeswitch/services.AppSettingsService", rt.appSettings)
 	registry.Register("codeswitch/services.MCPService", rt.mcpService)
 	registry.Register("codeswitch/services.SkillService", rt.skillService)
@@ -220,11 +230,12 @@ func (rt *appRuntime) registerServices(registry *rpcRegistry) {
 	registry.Register("codeswitch/services.ConnectivityTestService", rt.connectivityTest)
 	registry.Register("codeswitch/services.HealthCheckService", &userScopedHealthCheckService{base: rt.healthCheckService})
 	registry.Register("codeswitch/services.ModelMonitorService", &userScopedModelMonitorService{base: rt.modelMonitor})
-	registry.Register("codeswitch/services.ConsoleService", &userScopedConsoleService{logService: rt.logService})
+	registry.Register("codeswitch/services.ConsoleService", &userScopedConsoleService{logService: rt.logService, poolAttemptLogs: rt.poolAttemptLogs})
 	registry.Register("codeswitch/services.CustomCliService", rt.customCliService)
 	registry.Register("codeswitch/services.NetworkService", rt.networkService)
 	registry.Register("codeswitch/services.ProviderRelayService", &userScopedProviderRelayService{base: rt.providerRelay, poolService: rt.poolService})
-	registry.Register("codeswitch/services.ProviderPoolService", &userScopedProviderPoolService{base: rt.poolService})
+	registry.Register("codeswitch/services.ProviderPoolService", &userScopedProviderPoolService{base: rt.poolService, proxyService: rt.proxyService})
+	registry.Register("codeswitch/services.ProxyService", &userScopedProxyService{base: rt.proxyService, poolService: rt.poolService, userStore: rt.adminAuth.UserStore()})
 	registry.Register("codeswitch/services.CodexRelayKeyService", &userScopedCodexRelayKeyService{base: rt.codexRelayKeys, poolService: rt.poolService})
 }
 

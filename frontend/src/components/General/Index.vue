@@ -27,6 +27,8 @@ const autoStartEnabled = ref(getCachedValue('autoStart', false))
 const autoConnectivityTestEnabled = ref(getCachedValue('autoConnectivityTest', false))
 const switchNotifyEnabled = ref(getCachedValue('switchNotify', true)) // 切换通知开关
 const codexStreamGuardEnabled = ref(getCachedValue('codexStreamGuard', true))
+const proxyLatencyMultithreadingEnabled = ref(true)
+const proxyLatencyMaxConcurrency = ref(3)
 const settingsLoading = ref(true)
 const saveBusy = ref(false)
 const logoutBusy = ref(false)
@@ -58,6 +60,8 @@ const loadAppSettings = async () => {
     autoConnectivityTestEnabled.value = data?.auto_connectivity_test ?? false
     switchNotifyEnabled.value = data?.enable_switch_notify ?? true
     codexStreamGuardEnabled.value = data?.enable_codex_stream_guard ?? true
+    proxyLatencyMultithreadingEnabled.value = data?.enable_proxy_latency_multithreading ?? true
+    proxyLatencyMaxConcurrency.value = data?.proxy_latency_max_concurrency ?? 3
 
     // 缓存到 localStorage，下次打开时直接显示正确状态
     localStorage.setItem('app-settings-homeTitle', String(homeTitleVisible.value))
@@ -72,6 +76,8 @@ const loadAppSettings = async () => {
     autoConnectivityTestEnabled.value = false
     switchNotifyEnabled.value = true
     codexStreamGuardEnabled.value = true
+    proxyLatencyMultithreadingEnabled.value = true
+    proxyLatencyMaxConcurrency.value = 3
   } finally {
     settingsLoading.value = false
   }
@@ -81,12 +87,15 @@ const persistAppSettings = async () => {
   if (settingsLoading.value || saveBusy.value) return
   saveBusy.value = true
   try {
+    proxyLatencyMaxConcurrency.value = Math.min(4, Math.max(1, Math.trunc(proxyLatencyMaxConcurrency.value || 1)))
     const payload: AppSettings = {
       show_home_title: homeTitleVisible.value,
       auto_start: autoStartEnabled.value,
       auto_connectivity_test: autoConnectivityTestEnabled.value,
       enable_switch_notify: switchNotifyEnabled.value,
       enable_codex_stream_guard: codexStreamGuardEnabled.value,
+      enable_proxy_latency_multithreading: proxyLatencyMultithreadingEnabled.value,
+      proxy_latency_max_concurrency: proxyLatencyMaxConcurrency.value,
     }
     await saveAppSettings(payload)
 
@@ -211,6 +220,32 @@ onMounted(async () => {
               <span class="hint-text">{{ $t('components.general.label.autoConnectivityTestHint') }}</span>
             </div>
           </ListItem>
+          <ListItem :label="$t('components.general.label.proxyLatencyMultithreading')">
+            <div class="toggle-with-hint">
+              <label class="mac-switch">
+                <input
+                  type="checkbox"
+                  :disabled="settingsLoading || saveBusy"
+                  v-model="proxyLatencyMultithreadingEnabled"
+                  @change="persistAppSettings"
+                />
+                <span></span>
+              </label>
+              <span class="hint-text">{{ $t('components.general.label.proxyLatencyMultithreadingHint') }}</span>
+            </div>
+          </ListItem>
+          <ListItem v-if="proxyLatencyMultithreadingEnabled" :label="$t('components.general.label.proxyLatencyMaxConcurrency')">
+            <input
+              v-model.number="proxyLatencyMaxConcurrency"
+              class="mac-input"
+              type="number"
+              min="1"
+              max="4"
+              step="1"
+              :disabled="settingsLoading || saveBusy"
+              @change="persistAppSettings"
+            />
+          </ListItem>
         </div>
       </section>
 
@@ -294,6 +329,13 @@ onMounted(async () => {
   gap: 4px;
 }
 
+.input-with-hint {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
 .hint-text {
   font-size: 11px;
   color: var(--mac-text-secondary);
@@ -319,6 +361,11 @@ onMounted(async () => {
   }
 
   .toggle-with-hint {
+    align-items: flex-start;
+    width: 100%;
+  }
+
+  .input-with-hint {
     align-items: flex-start;
     width: 100%;
   }

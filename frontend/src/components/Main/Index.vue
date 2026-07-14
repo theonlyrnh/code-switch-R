@@ -386,9 +386,9 @@
       <BaseModal
       :open="modalState.open"
       :title="modalState.editingId ? t('components.main.form.editTitle') : t('components.main.form.createTitle')"
-      @close="closeModal"
+      @close="closeModal()"
     >
-      <form class="vendor-form" @submit.prevent="submitModal">
+      <form class="vendor-form" @submit.prevent="submitModal()">
                 <label class="form-field">
                   <span>{{ t('components.main.form.labels.name') }}</span>
                   <BaseInput
@@ -633,7 +633,7 @@
                 </section>
 
                 <footer class="form-actions">
-                  <BaseButton variant="outline" type="button" @click="closeModal">
+                  <BaseButton variant="outline" type="button" @click="closeModal()">
                     {{ t('components.main.form.actions.cancel') }}
                   </BaseButton>
                   <BaseButton type="submit">
@@ -1825,7 +1825,7 @@ onMounted(async () => {
   await loadLastUsedProviders()
 
   // 监听供应商切换事件
-  unsubscribeSwitched = Events.On('provider:switched', handleProviderSwitched as Events.Callback)
+  unsubscribeSwitched = Events.On('provider:switched', handleProviderSwitched as Parameters<typeof Events.On>[1])
 })
 
 onUnmounted(() => {
@@ -2460,7 +2460,11 @@ watch(
   }
 )
 
-const closeModal = () => {
+const closeModal = async (skipAutoSave = false) => {
+  if (!skipAutoSave && modalState.editingId !== null) {
+    const saved = await submitModal(false)
+    if (!saved) return
+  }
   modalState.open = false
 }
 
@@ -2469,7 +2473,7 @@ const closeConfirm = () => {
   confirmState.card = null
 }
 
-const submitModal = async (): Promise<boolean> => {
+const submitModal = async (closeAfterSave = true): Promise<boolean> => {
   const list = cards[modalState.tabId]
   if (!list) return false
   const name = modalState.form.name.trim()
@@ -2496,6 +2500,7 @@ const submitModal = async (): Promise<boolean> => {
 
   if (editingCard.value) {
     Object.assign(editingCard.value, {
+      name: name || editingCard.value.name,
       apiUrl: apiUrl || editingCard.value.apiUrl,
       apiKey,
       officialSite,
@@ -2572,7 +2577,7 @@ const submitModal = async (): Promise<boolean> => {
     }
   }
 
-  closeModal()
+  if (closeAfterSave) await closeModal(true)
 
   // 通知可用性页面刷新
   window.dispatchEvent(new CustomEvent('providers-updated'))

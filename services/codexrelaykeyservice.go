@@ -480,10 +480,10 @@ func (s *CodexRelayKeyService) GetUsageStatsForUser(userID string, id string, ra
 		SELECT
 			(CAST(strftime('%s', created_at) AS INTEGER) / ?) * ? AS bucket_unix,
 			COUNT(*) AS calls,
-			COALESCE(SUM(input_tokens), 0) AS input_tokens,
-			COALESCE(SUM(output_tokens), 0) AS output_tokens,
-			COALESCE(SUM(cache_create_tokens + cache_read_tokens), 0) AS cache_tokens,
-			COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN input_tokens ELSE 0 END), 0) AS input_tokens,
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN output_tokens ELSE 0 END), 0) AS output_tokens,
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN cache_create_tokens + cache_read_tokens ELSE 0 END), 0) AS cache_tokens,
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN reasoning_tokens ELSE 0 END), 0) AS reasoning_tokens
 		FROM request_log
 		WHERE relay_key_id = ?
 			AND (? = '' OR user_id = ?)

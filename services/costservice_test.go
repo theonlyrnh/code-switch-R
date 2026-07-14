@@ -53,6 +53,7 @@ func TestCostServiceTodayUsageGroupsSuccessfulInputTokenRowsByPlatformProviderMo
 
 	insertCostLog(t, map[string]any{"created_at": todayUTC, "input_tokens": 100, "output_tokens": 200, "cache_create_tokens": 300, "cache_read_tokens": 400, "reasoning_tokens": 500})
 	insertCostLog(t, map[string]any{"created_at": todayUTC, "input_tokens": 7, "output_tokens": 8, "cache_create_tokens": 9, "cache_read_tokens": 10, "reasoning_tokens": 11})
+	insertCostLog(t, map[string]any{"created_at": todayUTC, "input_tokens": 13, "output_tokens": 14, "cache_create_tokens": 15, "cache_read_tokens": 16, "reasoning_tokens": 17, "exclude_from_total": 1})
 	insertCostLog(t, map[string]any{"created_at": todayUTC, "model": "claude-sonnet-4-5", "input_tokens": 1})
 	insertCostLog(t, map[string]any{"created_at": todayUTC, "http_code": 500, "input_tokens": 999})
 	insertCostLog(t, map[string]any{"created_at": todayUTC, "input_tokens": 0, "output_tokens": 999})
@@ -71,7 +72,7 @@ func TestCostServiceTodayUsageGroupsSuccessfulInputTokenRowsByPlatformProviderMo
 	if first.Platform != "claude" || first.Provider != "provider-a" || first.Model != "claude-haiku-4-5" {
 		t.Fatalf("first group = %#v", first)
 	}
-	if first.InputTokens != 107 || first.OutputTokens != 208 || first.CacheCreateTokens != 309 || first.CacheReadTokens != 410 || first.ReasoningTokens != 511 || first.TotalRequests != 2 {
+	if first.InputTokens != 107 || first.OutputTokens != 208 || first.CacheCreateTokens != 309 || first.CacheReadTokens != 410 || first.ReasoningTokens != 511 || first.TotalRequests != 3 {
 		t.Fatalf("first totals = %#v", first)
 	}
 
@@ -94,6 +95,9 @@ func TestCostServiceSettingsPersistPerUserAndNormalizeModels(t *testing.T) {
 		ModelPriceOverrides: map[string]CostPrice{
 			CostModelKey("openai-chat", "Provider A", "GPT-5.4"): {Input: 2, Output: 3, CacheRead: 0.5},
 		},
+		ModelPrices: map[string]CostPrice{
+			" GPT-5.5 ": {Input: 5, Output: 30, CacheRead: 0.5},
+		},
 	}
 	if saved, err := service.SaveSettingsForUser("user-a", settings); err != nil {
 		t.Fatalf("SaveSettingsForUser failed: %v", err)
@@ -108,6 +112,9 @@ func TestCostServiceSettingsPersistPerUserAndNormalizeModels(t *testing.T) {
 	if loaded.ModelPriceOverrides[CostModelKey("openai-chat", "Provider A", "gpt-5.4")].Output != 3 {
 		t.Fatalf("loaded settings did not normalize model key: %#v", loaded.ModelPriceOverrides)
 	}
+	if loaded.ModelPrices["gpt-5.5"].Output != 30 {
+		t.Fatalf("loaded global model prices did not normalize model key: %#v", loaded.ModelPrices)
+	}
 
 	if err := service.ResetProviderMultiplierForUser("user-a", "openai-chat", "Provider A"); err != nil {
 		t.Fatalf("ResetProviderMultiplierForUser failed: %v", err)
@@ -119,7 +126,7 @@ func TestCostServiceSettingsPersistPerUserAndNormalizeModels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSettingsForUser after reset failed: %v", err)
 	}
-	if len(loaded.ProviderMultipliers) != 0 || len(loaded.ModelPriceOverrides) != 0 {
+	if len(loaded.ProviderMultipliers) != 0 || len(loaded.ModelPrices) != 1 || len(loaded.ModelPriceOverrides) != 0 {
 		t.Fatalf("reset settings = %#v", loaded)
 	}
 

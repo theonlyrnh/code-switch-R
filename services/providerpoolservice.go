@@ -10,6 +10,7 @@ import (
 	"os"
 	pathpkg "path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -43,21 +44,41 @@ func normalizePoolMemberLevel(level int) int {
 
 // ProviderPool 供应商池
 type ProviderPool struct {
-	ID                string               `json:"id"`
-	Platform          string               `json:"platform"`
-	Name              string               `json:"name"`
-	PoolType          ProviderPoolType     `json:"poolType"`
-	Mode              ProviderPoolMode     `json:"mode"`
-	ManualProviderID  *int64               `json:"manualProviderId,omitempty"`
-	Members           []ProviderPoolMember `json:"members"`
-	AccountPoolConfig *AccountPoolConfig   `json:"accountPoolConfig,omitempty"`
-	CreatedAt         string               `json:"createdAt"`
-	UpdatedAt         string               `json:"updatedAt"`
+	ID                string                  `json:"id"`
+	Platform          string                  `json:"platform"`
+	Name              string                  `json:"name"`
+	PoolType          ProviderPoolType        `json:"poolType"`
+	Mode              ProviderPoolMode        `json:"mode"`
+	ManualProviderID  *int64                  `json:"manualProviderId,omitempty"`
+	Members           []ProviderPoolMember    `json:"members"`
+	AccountPoolConfig *AccountPoolConfig      `json:"accountPoolConfig,omitempty"`
+	ProxyConfig       *AccountPoolProxyConfig `json:"proxyConfig,omitempty"`
+	// ExcludeFromTotalTraffic keeps account-pool request logs but excludes their
+	// token usage from aggregate traffic and cost totals.
+	ExcludeFromTotalTraffic bool   `json:"excludeFromTotalTraffic,omitempty"`
+	CreatedAt               string `json:"createdAt"`
+	UpdatedAt               string `json:"updatedAt"`
 
 	// 自动拉黑配置（仅 managed 模式生效）
-	AutoBlacklistEnabled         bool `json:"autoBlacklistEnabled"`
-	AutoBlacklistThreshold       int  `json:"autoBlacklistThreshold"`
-	AutoBlacklistDurationMinutes int  `json:"autoBlacklistDurationMinutes"`
+	AutoBlacklistEnabled         bool                   `json:"autoBlacklistEnabled"`
+	AutoBlacklistThreshold       int                    `json:"autoBlacklistThreshold"`
+	AutoBlacklistDurationMinutes int                    `json:"autoBlacklistDurationMinutes"`
+	SpecialBlacklistRules        []SpecialBlacklistRule `json:"specialBlacklistRules"`
+	// 首字超时重试按池隔离。开启后，未收到有效输出的请求按此池配置超时并计入失败。
+	FirstTextRetryEnabled        bool `json:"firstTextRetryEnabled"`
+	FirstTextRetryTimeoutSeconds int  `json:"firstTextRetryTimeoutSeconds"`
+}
+
+// SpecialBlacklistRule applies an independent failure counter to a precise
+// upstream HTTP response. Rules are evaluated in list order.
+type SpecialBlacklistRule struct {
+	ID                string `json:"id"`
+	Name              string `json:"name"`
+	HTTPStatus        int    `json:"httpStatus"`
+	JSONPath          string `json:"jsonPath,omitempty"`
+	ExpectedJSONValue string `json:"expectedJsonValue,omitempty"`
+	Threshold         int    `json:"threshold"`
+	DurationMinutes   int    `json:"durationMinutes"`
 }
 
 // AccountPoolConfig 号池共享的上游配置及密钥列表。
@@ -96,7 +117,7 @@ type providerPoolStore struct {
 
 const (
 	providerPoolsFile                    = "provider-pools.json"
-	providerPoolsStoreVersion            = 3 // version 3 = account pool data model
+	providerPoolsStoreVersion            = 6 // version 6 = per-pool first-text retry configuration
 	providerPoolsBindingMigrationVersion = 2 // version 2 = relay keys explicitly bound
 	initialPoolName                      = "初始池"
 
@@ -105,7 +126,12 @@ const (
 	maxAccountPoolBlacklistThreshold           = 100
 	maxAccountPoolBlacklistDurationMinutes     = 1440
 	maxAccountPoolKeyID                        = int64(1<<52 - 1)
+	defaultFirstTextRetryTimeoutSeconds        = 100
+	minFirstTextRetryTimeoutSeconds            = 5
+	maxFirstTextRetryTimeoutSeconds            = 240
 )
+
+var specialBlacklistJSONPathSegment = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
 
 // ========== ProviderPoolService ==========
 
@@ -123,8 +149,19 @@ type UserPoolBindingChecker interface {
 // 管理 provider-pools.json 的读写、初始池创建、池子查找
 type ProviderPoolService struct {
 	path           string
-	mu             sync.Mutex
+	mu             *sync.Mutex
 	bindingChecker PoolBindingChecker // 只读引用，用于删除前检查
+}
+
+var providerPoolFileLocks sync.Map
+
+func providerPoolMutex(path string) *sync.Mutex {
+	if existing, ok := providerPoolFileLocks.Load(path); ok {
+		return existing.(*sync.Mutex)
+	}
+	created := &sync.Mutex{}
+	actual, _ := providerPoolFileLocks.LoadOrStore(path, created)
+	return actual.(*sync.Mutex)
 }
 
 // NewProviderPoolService 创建供应商池服务
@@ -135,8 +172,10 @@ func NewProviderPoolService() *ProviderPoolService {
 		home = "."
 	}
 
+	path := filepath.Join(home, appSettingsDir, providerPoolsFile)
 	return &ProviderPoolService{
-		path:           filepath.Join(home, appSettingsDir, providerPoolsFile),
+		path:           path,
+		mu:             providerPoolMutex(path),
 		bindingChecker: nil,
 	}
 }
@@ -146,8 +185,10 @@ func NewProviderPoolServiceForUser(userID string) (*ProviderPoolService, error) 
 	if err != nil {
 		return nil, err
 	}
+	path := filepath.Join(dir, providerPoolsFile)
 	return &ProviderPoolService{
-		path:           filepath.Join(dir, providerPoolsFile),
+		path:           path,
+		mu:             providerPoolMutex(path),
 		bindingChecker: nil,
 	}, nil
 }
@@ -247,6 +288,7 @@ func (s *ProviderPoolService) SavePool(pool *ProviderPool) (string, error) {
 	if pool == nil {
 		return "", errors.New("池子不能为空")
 	}
+	pool.ID = strings.TrimSpace(pool.ID)
 
 	if strings.TrimSpace(pool.Platform) == "" {
 		return "", errors.New("池子必须指定 platform")
@@ -354,8 +396,16 @@ func normalizedProviderPoolType(poolType ProviderPoolType) ProviderPoolType {
 }
 
 func normalizeAndValidatePoolForSave(pool *ProviderPool, existing *ProviderPool, pools []ProviderPool) error {
+	if err := normalizeAndValidateFirstTextRetry(pool); err != nil {
+		return err
+	}
+	if err := normalizeAndValidateSpecialBlacklistRules(pool); err != nil {
+		return err
+	}
 	if pool.PoolType == ProviderPoolTypeNormal {
 		pool.AccountPoolConfig = nil
+		pool.ProxyConfig = nil
+		pool.ExcludeFromTotalTraffic = false
 		return nil
 	}
 
@@ -376,6 +426,28 @@ func normalizeAndValidatePoolForSave(pool *ProviderPool, existing *ProviderPool,
 	}
 
 	config := pool.AccountPoolConfig
+	if pool.ProxyConfig == nil {
+		pool.ProxyConfig = &AccountPoolProxyConfig{Selection: AccountPoolProxySelectionNone}
+	}
+	if !pool.ProxyConfig.Enabled {
+		pool.ProxyConfig.Selection = AccountPoolProxySelectionNone
+		pool.ProxyConfig.ProxyNodeID = ""
+		pool.ProxyConfig.AutoDisableWhenNoAvailable = false
+	} else {
+		if pool.ProxyConfig.Selection == "" {
+			pool.ProxyConfig.Selection = AccountPoolProxySelectionAuto
+		}
+		if pool.ProxyConfig.Selection != AccountPoolProxySelectionAuto && pool.ProxyConfig.Selection != AccountPoolProxySelectionNode {
+			return fmt.Errorf("无效的号池代理选择方式: %s", pool.ProxyConfig.Selection)
+		}
+		if pool.ProxyConfig.Selection == AccountPoolProxySelectionNode && strings.TrimSpace(pool.ProxyConfig.ProxyNodeID) == "" {
+			return errors.New("固定代理模式必须选择代理节点")
+		}
+		if pool.ProxyConfig.Selection != AccountPoolProxySelectionAuto {
+			pool.ProxyConfig.AutoDisableWhenNoAvailable = false
+		}
+		pool.ProxyConfig.ProxyNodeID = strings.TrimSpace(pool.ProxyConfig.ProxyNodeID)
+	}
 	config.APIURL = strings.TrimSpace(config.APIURL)
 	parsedAPIURL, err := url.Parse(config.APIURL)
 	if err != nil || parsedAPIURL.Host == "" || parsedAPIURL.RawQuery != "" || parsedAPIURL.Fragment != "" ||
@@ -414,6 +486,107 @@ func normalizeAndValidatePoolForSave(pool *ProviderPool, existing *ProviderPool,
 		return fmt.Errorf("号池拉黑时长不能超过 %d 分钟", maxAccountPoolBlacklistDurationMinutes)
 	}
 	return nil
+}
+
+func normalizeAndValidateFirstTextRetry(pool *ProviderPool) error {
+	if pool == nil {
+		return errors.New("池子不能为空")
+	}
+	if !pool.FirstTextRetryEnabled {
+		if pool.FirstTextRetryTimeoutSeconds <= 0 {
+			pool.FirstTextRetryTimeoutSeconds = defaultFirstTextRetryTimeoutSeconds
+		}
+		return nil
+	}
+	if pool.FirstTextRetryTimeoutSeconds == 0 {
+		pool.FirstTextRetryTimeoutSeconds = defaultFirstTextRetryTimeoutSeconds
+	}
+	if pool.FirstTextRetryTimeoutSeconds < minFirstTextRetryTimeoutSeconds || pool.FirstTextRetryTimeoutSeconds > maxFirstTextRetryTimeoutSeconds {
+		return fmt.Errorf("首字重试时间必须在 %d 到 %d 秒之间", minFirstTextRetryTimeoutSeconds, maxFirstTextRetryTimeoutSeconds)
+	}
+	return nil
+}
+
+func normalizeAndValidateSpecialBlacklistRules(pool *ProviderPool) error {
+	if pool == nil || len(pool.SpecialBlacklistRules) == 0 {
+		if pool != nil {
+			pool.SpecialBlacklistRules = []SpecialBlacklistRule{}
+		}
+		return nil
+	}
+
+	seenIDs := make(map[string]struct{}, len(pool.SpecialBlacklistRules))
+	seenNames := make(map[string]struct{}, len(pool.SpecialBlacklistRules))
+	normalized := make([]SpecialBlacklistRule, 0, len(pool.SpecialBlacklistRules))
+	for index, rule := range pool.SpecialBlacklistRules {
+		rule.ID = strings.TrimSpace(rule.ID)
+		if rule.ID == "" {
+			id, err := newSpecialBlacklistRuleID(seenIDs)
+			if err != nil {
+				return err
+			}
+			rule.ID = id
+		}
+		if _, duplicate := seenIDs[rule.ID]; duplicate {
+			return fmt.Errorf("高级拉黑规则 ID 重复: %s", rule.ID)
+		}
+		seenIDs[rule.ID] = struct{}{}
+
+		rule.Name = strings.TrimSpace(rule.Name)
+		if rule.Name == "" {
+			return fmt.Errorf("高级拉黑规则 #%d 名称不能为空", index+1)
+		}
+		nameKey := strings.ToLower(rule.Name)
+		if _, duplicate := seenNames[nameKey]; duplicate {
+			return fmt.Errorf("高级拉黑规则名称重复: %s", rule.Name)
+		}
+		seenNames[nameKey] = struct{}{}
+		if rule.HTTPStatus < 100 || rule.HTTPStatus > 599 {
+			return fmt.Errorf("高级拉黑规则 %s 的 HTTP 状态码必须在 100 到 599 之间", rule.Name)
+		}
+		rule.JSONPath = strings.TrimSpace(rule.JSONPath)
+		rule.ExpectedJSONValue = strings.TrimSpace(rule.ExpectedJSONValue)
+		if rule.JSONPath == "" && rule.ExpectedJSONValue != "" {
+			return fmt.Errorf("高级拉黑规则 %s 设置 JSON 值时必须填写 JSON 路径", rule.Name)
+		}
+		if rule.JSONPath != "" {
+			if rule.ExpectedJSONValue == "" {
+				return fmt.Errorf("高级拉黑规则 %s 设置 JSON 路径时必须填写 JSON 值", rule.Name)
+			}
+			for _, segment := range strings.Split(rule.JSONPath, ".") {
+				if !specialBlacklistJSONPathSegment.MatchString(segment) {
+					return fmt.Errorf("高级拉黑规则 %s 的 JSON 路径无效", rule.Name)
+				}
+			}
+			var expected interface{}
+			if err := json.Unmarshal([]byte(rule.ExpectedJSONValue), &expected); err != nil {
+				return fmt.Errorf("高级拉黑规则 %s 的 JSON 值无效: %w", rule.Name, err)
+			}
+		}
+		if rule.Threshold < 1 || rule.Threshold > 100 {
+			return fmt.Errorf("高级拉黑规则 %s 的次数阈值必须在 1 到 100 之间", rule.Name)
+		}
+		if rule.DurationMinutes < 1 || rule.DurationMinutes > 1440 {
+			return fmt.Errorf("高级拉黑规则 %s 的拉黑时长必须在 1 到 1440 分钟之间", rule.Name)
+		}
+		normalized = append(normalized, rule)
+	}
+	pool.SpecialBlacklistRules = normalized
+	return nil
+}
+
+func newSpecialBlacklistRuleID(used map[string]struct{}) (string, error) {
+	var randomBytes [8]byte
+	for attempt := 0; attempt < 128; attempt++ {
+		if _, err := cryptorand.Read(randomBytes[:]); err != nil {
+			return "", fmt.Errorf("生成高级拉黑规则 ID 失败: %w", err)
+		}
+		id := fmt.Sprintf("rule_%x", randomBytes)
+		if _, exists := used[id]; !exists {
+			return id, nil
+		}
+	}
+	return "", errors.New("生成唯一高级拉黑规则 ID 失败")
 }
 
 func normalizeAccountPoolKeys(input []AccountPoolKey, existing *ProviderPool, pools []ProviderPool) ([]AccountPoolKey, error) {
@@ -597,15 +770,16 @@ func (s *ProviderPoolService) EnsureDefaultPool(platform string, providers []Pro
 	}
 
 	pool := ProviderPool{
-		ID:               defaultID,
-		Platform:         platform,
-		Name:             initialPoolName,
-		PoolType:         ProviderPoolTypeNormal,
-		Mode:             seed.Mode,
-		ManualProviderID: seed.ManualProviderID,
-		Members:          members,
-		CreatedAt:        now,
-		UpdatedAt:        now,
+		ID:                    defaultID,
+		Platform:              platform,
+		Name:                  initialPoolName,
+		PoolType:              ProviderPoolTypeNormal,
+		Mode:                  seed.Mode,
+		ManualProviderID:      seed.ManualProviderID,
+		Members:               members,
+		CreatedAt:             now,
+		UpdatedAt:             now,
+		SpecialBlacklistRules: []SpecialBlacklistRule{},
 	}
 
 	store.Pools = append(store.Pools, pool)
@@ -743,6 +917,22 @@ func (s *ProviderPoolService) loadLocked() (*providerPoolStore, error) {
 	if err := json.Unmarshal(data, store); err != nil {
 		return nil, fmt.Errorf("解析 provider-pools.json 失败: %w", err)
 	}
+	// Only migrate the immediately preceding schema. Older stores must retain
+	// their existing relay-key binding migration flow before any newer fields
+	// are written back.
+	if store.Version == providerPoolsStoreVersion-1 {
+		migrateFirstTextRetryToPools(store)
+		store.Version = providerPoolsStoreVersion
+		if err := s.saveLocked(store); err != nil {
+			return nil, fmt.Errorf("迁移首字重试池配置失败: %w", err)
+		}
+	}
+	for index := range store.Pools {
+		if store.Pools[index].SpecialBlacklistRules == nil {
+			// Pools persisted before advanced rules are equivalent to an empty list.
+			store.Pools[index].SpecialBlacklistRules = []SpecialBlacklistRule{}
+		}
+	}
 	if store.Pools == nil {
 		store.Pools = []ProviderPool{}
 	}
@@ -750,10 +940,40 @@ func (s *ProviderPoolService) loadLocked() (*providerPoolStore, error) {
 		store.Pools[i].PoolType = normalizedProviderPoolType(store.Pools[i].PoolType)
 		if store.Pools[i].PoolType == ProviderPoolTypeNormal {
 			store.Pools[i].AccountPoolConfig = nil
+			store.Pools[i].ProxyConfig = nil
+			store.Pools[i].ExcludeFromTotalTraffic = false
+		} else if store.Pools[i].ProxyConfig == nil {
+			store.Pools[i].ProxyConfig = &AccountPoolProxyConfig{Selection: AccountPoolProxySelectionNone}
 		}
 	}
 
 	return store, nil
+}
+
+// migrateFirstTextRetryToPools preserves the previous global setting once when
+// upgrading old pool files. After this migration, each pool owns its setting.
+func migrateFirstTextRetryToPools(store *providerPoolStore) {
+	if store == nil {
+		return
+	}
+	type legacyAppSettings struct {
+		Enabled bool `json:"enable_first_text_retry"`
+		Timeout int  `json:"first_text_retry_timeout_seconds"`
+	}
+	legacy := legacyAppSettings{}
+	if home, err := os.UserHomeDir(); err == nil {
+		if data, err := os.ReadFile(filepath.Join(home, appSettingsDir, appSettingsFileName)); err == nil {
+			_ = json.Unmarshal(data, &legacy)
+		}
+	}
+	timeout := legacy.Timeout
+	if timeout < minFirstTextRetryTimeoutSeconds || timeout > maxFirstTextRetryTimeoutSeconds {
+		timeout = defaultFirstTextRetryTimeoutSeconds
+	}
+	for index := range store.Pools {
+		store.Pools[index].FirstTextRetryEnabled = legacy.Enabled
+		store.Pools[index].FirstTextRetryTimeoutSeconds = timeout
+	}
 }
 
 func (s *ProviderPoolService) saveLocked(store *providerPoolStore) error {

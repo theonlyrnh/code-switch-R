@@ -7,6 +7,9 @@
         <p class="costs-description">{{ t('components.costs.description') }}</p>
       </div>
       <div class="costs-actions">
+        <BaseButton type="button" @click="openPriceEditor">
+          {{ t('components.costs.settings.editModels') }}
+        </BaseButton>
         <BaseButton variant="outline" type="button" @click="backToHome">
           {{ t('components.logs.back') }}
         </BaseButton>
@@ -64,59 +67,6 @@
         <strong>{{ formatInteger(summary.requests) }}</strong>
         <small>{{ t('components.costs.summary.successOnly') }}</small>
       </article>
-    </section>
-
-    <section class="costs-panel settings-panel">
-      <div class="panel-header">
-        <div>
-          <h2>{{ t('components.costs.settings.title') }}</h2>
-          <p>{{ t('components.costs.settings.unit') }}</p>
-        </div>
-        <BaseButton type="button" :disabled="!canEditSettings || saving" @click="saveSettings">
-          {{ t('components.costs.settings.save') }}
-        </BaseButton>
-      </div>
-
-      <div v-if="!canEditSettings" class="settings-empty">
-        {{ t('components.costs.settings.chooseProvider') }}
-      </div>
-      <div v-else class="settings-content">
-        <label class="multiplier-field">
-          <span>{{ t('components.costs.settings.multiplier') }}</span>
-          <BaseInput v-model="multiplierInput" type="number" min="0.000001" step="0.000001" />
-          <span class="multiplier-suffix">x</span>
-          <BaseButton variant="outline" type="button" :disabled="saving" @click="resetMultiplier">
-            {{ t('components.costs.settings.resetMultiplier') }}
-          </BaseButton>
-        </label>
-
-        <div class="price-editor-list">
-          <article v-for="row in editableRows" :key="row.key" class="price-editor-card">
-            <div class="price-editor-title">
-              <strong>{{ row.model }}</strong>
-              <span v-if="row.defaultPrice" class="source-pill">{{ t('components.costs.settings.defaultPrice') }}</span>
-              <span v-else class="missing-pill">{{ t('components.costs.missingPrice') }}</span>
-            </div>
-            <div class="price-editor-fields">
-              <label>
-                <span>{{ t('components.costs.price.input') }}</span>
-                <BaseInput v-model="priceDrafts[row.modelKey].input" type="number" min="0" step="0.000001" :placeholder="formatPricePlaceholder(row.defaultPrice?.input)" />
-              </label>
-              <label>
-                <span>{{ t('components.costs.price.output') }}</span>
-                <BaseInput v-model="priceDrafts[row.modelKey].output" type="number" min="0" step="0.000001" :placeholder="formatPricePlaceholder(row.defaultPrice?.output)" />
-              </label>
-              <label>
-                <span>{{ t('components.costs.price.cacheRead') }}</span>
-                <BaseInput v-model="priceDrafts[row.modelKey].cache_read" type="number" min="0" step="0.000001" :placeholder="formatPricePlaceholder(row.defaultPrice?.cache_read)" />
-              </label>
-              <BaseButton variant="outline" type="button" :disabled="saving" @click="resetOverride(row.model)">
-                {{ t('components.costs.settings.clearOverride') }}
-              </BaseButton>
-            </div>
-          </article>
-        </div>
-      </div>
     </section>
 
     <section class="costs-panel">
@@ -180,6 +130,54 @@
         </article>
       </div>
     </section>
+
+    <BaseModal
+      :open="priceEditorOpen"
+      :title="t('components.costs.settings.editModels')"
+      size="wide"
+      @close="closePriceEditor"
+    >
+      <section class="price-editor-modal">
+        <p class="price-editor-unit">{{ t('components.costs.settings.unit') }}</p>
+        <div class="price-editor-table-wrapper">
+          <table class="price-editor-table">
+            <thead>
+              <tr>
+                <th>{{ t('components.costs.table.model') }}</th>
+                <th>{{ t('components.costs.price.input') }}</th>
+                <th>{{ t('components.costs.price.output') }}</th>
+                <th>{{ t('components.costs.price.cacheRead') }}</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in modelPriceDrafts" :key="row.id">
+                <td><BaseInput v-model="row.model" :placeholder="t('components.costs.settings.modelName')" /></td>
+                <td><BaseInput v-model="row.input" type="number" min="0" step="0.000001" /></td>
+                <td><BaseInput v-model="row.output" type="number" min="0" step="0.000001" /></td>
+                <td><BaseInput v-model="row.cache_read" type="number" min="0" step="0.000001" /></td>
+                <td class="price-editor-remove-cell">
+                  <BaseButton variant="outline" type="button" :disabled="saving" @click="removeModelPrice(row.id)">
+                    {{ t('components.costs.settings.removeModel') }}
+                  </BaseButton>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <BaseButton variant="outline" type="button" :disabled="saving" @click="addModelPrice">
+          {{ t('components.costs.settings.addModel') }}
+        </BaseButton>
+      </section>
+      <footer class="form-actions price-editor-actions">
+        <BaseButton variant="outline" type="button" :disabled="saving" @click="closePriceEditor">
+          {{ t('components.main.form.actions.cancel') }}
+        </BaseButton>
+        <BaseButton type="button" :disabled="saving" @click="savePriceEditor">
+          {{ t('components.costs.settings.save') }}
+        </BaseButton>
+      </footer>
+    </BaseModal>
   </div>
 </template>
 
@@ -189,8 +187,9 @@ import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import BaseButton from '../common/BaseButton.vue'
 import BaseInput from '../common/BaseInput.vue'
+import BaseModal from '../common/BaseModal.vue'
 import { LoadProviders } from '../../../bindings/codeswitch/services/providerservice'
-import { fetchLogProviders, type LogPlatform } from '../../services/logs'
+import { type LogPlatform } from '../../services/logs'
 import {
   costModelKey,
   costProviderKey,
@@ -199,8 +198,6 @@ import {
   fetchTodayCostUsage,
   findDefaultPrice,
   normalizeCostModelName,
-  resetModelOverride,
-  resetProviderMultiplier,
   saveCostSettings,
   type CostPrice,
   type CostSettings,
@@ -214,12 +211,13 @@ const router = useRouter()
 
 const loading = ref(false)
 const saving = ref(false)
+const priceEditorOpen = ref(false)
 const usageItems = ref<CostUsageItem[]>([])
 const settings = ref<CostSettings>(defaultCostSettings())
 const providerOptions = ref<string[]>([])
 const COST_PROVIDER_PLATFORMS: LogPlatform[] = ['claude', 'openai-responses', 'openai-chat']
-const multiplierInput = ref('1')
-const priceDrafts = reactive<Record<string, { input: string; output: string; cache_read: string }>>({})
+type ModelPriceDraft = { id: string; model: string; input: string; output: string; cache_read: string }
+const modelPriceDrafts = ref<ModelPriceDraft[]>([])
 const filters = reactive<{ platform: LogPlatform | ''; provider: string }>({ platform: '', provider: '' })
 const REFRESH_INTERVAL = 30
 const countdown = ref(REFRESH_INTERVAL)
@@ -232,7 +230,6 @@ type LoadCostsOptions = {
   silent?: boolean
 }
 
-const canEditSettings = computed(() => Boolean(filters.platform && filters.provider))
 const showProviderGroups = computed(() => filters.provider === '')
 const availableProviderOptions = computed(() => {
   const options = new Set<string>()
@@ -251,8 +248,6 @@ const availableProviderOptions = computed(() => {
 
 const backToHome = () => router.push('/')
 
-const currentProviderKey = computed(() => canEditSettings.value ? costProviderKey(filters.platform, filters.provider) : '')
-
 const multiplier = (platform: string, provider: string) => {
   const value = settings.value.provider_multipliers[costProviderKey(platform, provider)]
   return value && value > 0 ? value : 1
@@ -263,8 +258,10 @@ const overridePriceFor = (platform: string, provider: string, model: string): Co
 }
 
 const effectivePriceFor = (item: CostUsageItem): { price: CostPrice | null; source: 'override' | 'default' | 'missing'; defaultPrice: DefaultModelPrice | null } => {
+  const globalPrice = settings.value.model_prices[normalizeCostModelName(item.model)]
   const override = overridePriceFor(item.platform, item.provider, item.model)
   const defaultPrice = findDefaultPrice(item.platform, item.model)
+  if (globalPrice) return { price: globalPrice, source: 'override', defaultPrice }
   if (override) return { price: override, source: 'override', defaultPrice }
   if (defaultPrice) return { price: defaultPrice, source: 'default', defaultPrice }
   return { price: null, source: 'missing', defaultPrice: null }
@@ -302,8 +299,6 @@ const rowViewModels = computed(() => usageItems.value.map((item) => {
     defaultPrice: priceInfo.defaultPrice,
   }
 }))
-
-const editableRows = computed(() => rowViewModels.value.filter((row) => row.platform === filters.platform && row.provider === filters.provider))
 
 const groups = computed(() => {
   const map = new Map<string, { key: string; platform: string; provider: string; rows: typeof rowViewModels.value }>()
@@ -361,23 +356,10 @@ const loadConfiguredProviderNames = async (platform: LogPlatform | '') => {
   return names
 }
 
-const loadLogProviderNames = async (platform: LogPlatform | '') => {
-  try {
-    const providers = await fetchLogProviders(platform)
-    return (providers ?? []).map(normalizeProviderOption).filter(Boolean)
-  } catch (error) {
-    console.error('failed to load log providers', error)
-    return []
-  }
-}
-
 const loadProviders = async () => {
-  const [configuredProviders, logProviders] = await Promise.all([
-    loadConfiguredProviderNames(filters.platform),
-    loadLogProviderNames(filters.platform),
-  ])
+  const configuredProviders = await loadConfiguredProviderNames(filters.platform)
   const merged = new Set<string>()
-  for (const provider of [...configuredProviders, ...logProviders]) {
+  for (const provider of configuredProviders) {
     const name = normalizeProviderOption(provider)
     if (name) {
       merged.add(name)
@@ -395,7 +377,6 @@ const loadDashboard = async (options: LoadCostsOptions = {}) => {
 }
 
 const loadData = async (options: LoadCostsOptions = {}) => {
-  const draftSync = options.draftSync ?? 'preserve'
   if (!options.silent) {
     loading.value = true
   }
@@ -406,11 +387,6 @@ const loadData = async (options: LoadCostsOptions = {}) => {
     ])
     settings.value = nextSettings
     usageItems.value = nextUsage
-    if (draftSync === 'reset') {
-      syncDrafts()
-    } else if (draftSync === 'preserve') {
-      syncDrafts({ preserveExisting: true })
-    }
   } catch (error: any) {
     showToast(error?.message || t('components.costs.loadFailed'), 'error')
   } finally {
@@ -448,36 +424,57 @@ const manualRefresh = () => {
   void loadDashboard({ draftSync: 'preserve', silent: true })
 }
 
+const openPriceEditor = () => {
+  syncModelPriceDrafts()
+  priceEditorOpen.value = true
+}
+
+const closePriceEditor = () => {
+  priceEditorOpen.value = false
+}
+
 const applyFilters = () => {
   resetTimer()
   void loadDashboard({ draftSync: 'preserve' })
 }
 
-const syncDrafts = (options: { preserveExisting?: boolean } = {}) => {
-  const preserveExisting = options.preserveExisting ?? false
-  if (!currentProviderKey.value) {
-    if (!preserveExisting) {
-      multiplierInput.value = '1'
-    }
-    return
-  }
+const newModelPriceDraft = (): ModelPriceDraft => ({
+  id: typeof crypto?.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
+  model: '',
+  input: '',
+  output: '',
+  cache_read: '',
+})
 
-  if (!preserveExisting || multiplierInput.value.trim() === '') {
-    multiplierInput.value = String(settings.value.provider_multipliers[currentProviderKey.value] ?? 1)
+const syncModelPriceDrafts = () => {
+  const models = new Map<string, string>()
+  for (const item of usageItems.value) {
+    const model = item.model.trim()
+    if (model) models.set(normalizeCostModelName(model), model)
   }
+  for (const model of Object.keys(settings.value.model_prices)) {
+    if (model) models.set(normalizeCostModelName(model), model)
+  }
+  modelPriceDrafts.value = Array.from(models.entries())
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, model]) => {
+      const price = settings.value.model_prices[key]
+      return {
+        id: key,
+        model,
+        input: price ? String(price.input) : '',
+        output: price ? String(price.output) : '',
+        cache_read: price ? String(price.cache_read) : '',
+      }
+    })
+}
 
-  for (const row of editableRows.value) {
-    const key = row.modelKey
-    if (preserveExisting && priceDrafts[key]) {
-      continue
-    }
-    const override = overridePriceFor(row.platform, row.provider, row.model)
-    priceDrafts[key] = {
-      input: override ? String(override.input) : '',
-      output: override ? String(override.output) : '',
-      cache_read: override ? String(override.cache_read) : '',
-    }
-  }
+const addModelPrice = () => {
+  modelPriceDrafts.value.push(newModelPriceDraft())
+}
+
+const removeModelPrice = (id: string) => {
+  modelPriceDrafts.value = modelPriceDrafts.value.filter((row) => row.id !== id)
 }
 
 const parseOptionalPrice = (raw: string): number | null => {
@@ -488,77 +485,43 @@ const parseOptionalPrice = (raw: string): number | null => {
   return value
 }
 
-const saveSettings = async () => {
-  if (!canEditSettings.value) return
+const saveSettings = async (): Promise<boolean> => {
   saving.value = true
   try {
     const nextSettings: CostSettings = {
       provider_multipliers: { ...settings.value.provider_multipliers },
+      model_prices: {},
       model_price_overrides: { ...settings.value.model_price_overrides },
     }
-    const parsedMultiplier = Number(multiplierInput.value)
-    if (Number.isFinite(parsedMultiplier) && parsedMultiplier > 0 && parsedMultiplier !== 1) {
-      nextSettings.provider_multipliers[currentProviderKey.value] = parsedMultiplier
-    } else {
-      delete nextSettings.provider_multipliers[currentProviderKey.value]
-    }
-
-    for (const row of editableRows.value) {
-      const draft = priceDrafts[row.modelKey]
-      if (!draft) continue
-      const input = parseOptionalPrice(draft.input)
-      const output = parseOptionalPrice(draft.output)
-      const cacheRead = parseOptionalPrice(draft.cache_read)
-      const key = costModelKey(row.platform, row.provider, row.model)
-      if (input == null && output == null && cacheRead == null) {
-        delete nextSettings.model_price_overrides[key]
-      } else {
-        nextSettings.model_price_overrides[key] = {
-          input: input ?? row.defaultPrice?.input ?? 0,
-          output: output ?? row.defaultPrice?.output ?? 0,
-          cache_read: cacheRead ?? row.defaultPrice?.cache_read ?? 0,
-        }
+    for (const row of modelPriceDrafts.value) {
+      const model = normalizeCostModelName(row.model)
+      if (!model) continue
+      const input = parseOptionalPrice(row.input)
+      const output = parseOptionalPrice(row.output)
+      const cacheRead = parseOptionalPrice(row.cache_read)
+      if (input == null && output == null && cacheRead == null) continue
+      nextSettings.model_prices[model] = {
+        input: input ?? 0,
+        output: output ?? 0,
+        cache_read: cacheRead ?? 0,
       }
     }
 
     settings.value = await saveCostSettings(nextSettings)
-    syncDrafts()
+    syncModelPriceDrafts()
     showToast(t('components.costs.settings.saved'), 'success')
+		return true
   } catch (error: any) {
     showToast(error?.message || t('components.costs.settings.saveFailed'), 'error')
+		return false
   } finally {
     saving.value = false
   }
 }
 
-const resetMultiplier = async () => {
-  if (!canEditSettings.value) return
-  saving.value = true
-  try {
-    await resetProviderMultiplier(filters.platform, filters.provider)
-    delete settings.value.provider_multipliers[currentProviderKey.value]
-    multiplierInput.value = '1'
-    showToast(t('components.costs.settings.resetDone'), 'success')
-  } catch (error: any) {
-    showToast(error?.message || t('components.costs.settings.saveFailed'), 'error')
-  } finally {
-    saving.value = false
-  }
-}
-
-const resetOverride = async (model: string) => {
-  if (!canEditSettings.value) return
-  saving.value = true
-  try {
-    await resetModelOverride(filters.platform, filters.provider, model)
-    delete settings.value.model_price_overrides[costModelKey(filters.platform, filters.provider, model)]
-    const key = normalizeCostModelName(model)
-    priceDrafts[key] = { input: '', output: '', cache_read: '' }
-    showToast(t('components.costs.settings.resetDone'), 'success')
-  } catch (error: any) {
-    showToast(error?.message || t('components.costs.settings.saveFailed'), 'error')
-  } finally {
-    saving.value = false
+const savePriceEditor = async () => {
+  if (await saveSettings()) {
+    priceEditorOpen.value = false
   }
 }
 
@@ -682,6 +645,7 @@ onUnmounted(() => {
 .cost-summary-card span,
 .cost-summary-card small,
 .panel-header p,
+.price-editor-unit,
 .settings-empty {
   color: var(--mac-text-secondary);
 }
@@ -726,6 +690,21 @@ onUnmounted(() => {
   gap: 16px;
 }
 
+.price-editor-modal {
+  display: grid;
+  gap: 16px;
+}
+
+.price-editor-unit {
+  margin: 0;
+}
+
+.price-editor-actions {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--mac-border);
+}
+
 .multiplier-field {
   display: flex;
   gap: 10px;
@@ -745,6 +724,50 @@ onUnmounted(() => {
 .cost-detail-groups {
   display: grid;
   gap: 12px;
+}
+
+.price-editor-table-wrapper {
+  overflow-x: auto;
+  border: 1px solid var(--mac-border);
+  border-radius: 8px;
+}
+
+.price-editor-table {
+  width: 100%;
+  min-width: 720px;
+  border-collapse: collapse;
+}
+
+.price-editor-table th,
+.price-editor-table td {
+  padding: 10px;
+  border-bottom: 1px solid var(--mac-border);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.price-editor-table th {
+  color: var(--mac-text-secondary);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.price-editor-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.price-editor-table th:first-child,
+.price-editor-table td:first-child {
+  min-width: 220px;
+}
+
+.price-editor-table td input {
+  width: 100%;
+}
+
+.price-editor-remove-cell {
+  width: 1%;
+  white-space: nowrap;
 }
 
 .price-editor-card {

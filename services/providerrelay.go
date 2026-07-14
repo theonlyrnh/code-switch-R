@@ -14,9 +14,11 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daodao97/xgo/xdb"
@@ -28,14 +30,15 @@ import (
 
 // ProviderPoolProviderPenalty 池子内单个 provider 的运行时惩罚状态
 type ProviderPoolProviderPenalty struct {
-	UserID           string    `json:"userID,omitempty"`
-	Platform         string    `json:"platform"`
-	PoolID           string    `json:"poolID"`
-	ProviderID       int64     `json:"providerID"`
-	FailureCount     int       `json:"failureCount"`
-	LastFailureAt    time.Time `json:"lastFailureAt"`
-	BlacklistedUntil time.Time `json:"blacklistedUntil"`
-	LastReason       string    `json:"lastReason"`
+	UserID            string         `json:"userID,omitempty"`
+	Platform          string         `json:"platform"`
+	PoolID            string         `json:"poolID"`
+	ProviderID        int64          `json:"providerID"`
+	FailureCount      int            `json:"failureCount"`
+	LastFailureAt     time.Time      `json:"lastFailureAt"`
+	BlacklistedUntil  time.Time      `json:"blacklistedUntil"`
+	LastReason        string         `json:"lastReason"`
+	RuleFailureCounts map[string]int `json:"ruleFailureCounts,omitempty"`
 }
 type LastUsedProvider struct {
 	UserID       string `json:"userID,omitempty"`
@@ -51,6 +54,11 @@ type ProviderRelayService struct {
 	codexRelayKeys      *CodexRelayKeyService
 	notificationService *NotificationService
 	appSettings         *AppSettingsService
+	proxyManager        *ProxyManager
+	proxyService        *ProxyService
+	proxyClientMu       sync.Mutex
+	proxyClients        map[string]*http.Client
+	proxyClientLastUsed map[string]time.Time
 	httpClient          *http.Client
 	concurrencyLimiter  *ProviderConcurrencyLimiter
 	server              *http.Server
@@ -59,15 +67,111 @@ type ProviderRelayService struct {
 	lastUsedMu          sync.RWMutex                 // 保护 lastUsed 的锁
 
 	// 池子维度 provider 惩罚状态（自动拉黑）
-	poolPenaltyMu sync.Mutex
-	poolPenalties map[string]*ProviderPoolProviderPenalty
+	poolPenaltyMu         sync.Mutex
+	poolPenalties         map[string]*ProviderPoolProviderPenalty
+	poolAttemptLogs       *PoolAttemptLogService
+	accountPoolStickyMu   sync.Mutex
+	accountPoolStickiness *accountPoolStickyStore
+}
+
+func (prs *ProviderRelayService) SetPoolAttemptLogService(service *PoolAttemptLogService) {
+	if prs != nil {
+		prs.poolAttemptLogs = service
+	}
 }
 
 // errClientAbort 表示客户端中断连接，不应计入 provider 失败次数
 var errClientAbort = errors.New("client aborted, skip failure count")
 var errCodexEmptyStream = errors.New("codex upstream stream closed before useful content")
+var errCodexTerminalStreamFailure = errors.New("codex upstream stream ended failed or incomplete before useful content")
+var errCodexInitialBufferLimit = errors.New("codex upstream stream exceeded the preflight buffer before useful content")
+var errCodexFirstTextTimeout = errors.New("codex upstream stream timed out before useful content")
 var errProviderEmptyShell = errors.New("provider returned 200 but all token counts are zero")
 var errActiveRequestRetryRequested = errors.New("active request retry requested")
+
+// firstTextTimeoutErrorBody is recorded for every configured first-text timeout.
+// Keep this JSON stable because special blacklist rules can match its fields.
+const firstTextTimeoutErrorBody = `{"error":{"type":"first_text_timeout","code":"first_text_timeout","message":"upstream first text timeout"}}`
+
+// upstreamClientRequestError preserves a request-scoped upstream 4xx response
+// so an account pool can return it without trying every account key.
+type upstreamClientRequestError struct {
+	statusCode int
+	header     http.Header
+	body       []byte
+}
+
+func (e *upstreamClientRequestError) Error() string {
+	if e == nil {
+		return "upstream client request error"
+	}
+	message := summarizeBodyForError(string(e.body), 1000)
+	if message == "" {
+		return fmt.Sprintf("upstream status %d", e.statusCode)
+	}
+	return fmt.Sprintf("upstream status %d: %s", e.statusCode, message)
+}
+
+// isRequestScopedUpstream4xx reports statuses which describe this request,
+// rather than the account key. Authentication, account, rate-limit, and
+// timeout statuses remain eligible for account-pool failover.
+func isRequestScopedUpstream4xx(status int) bool {
+	if status < http.StatusBadRequest || status >= http.StatusInternalServerError {
+		return false
+	}
+	switch status {
+	case http.StatusUnauthorized,
+		http.StatusPaymentRequired,
+		http.StatusForbidden,
+		http.StatusProxyAuthRequired,
+		http.StatusRequestTimeout,
+		http.StatusTooManyRequests:
+		return false
+	default:
+		return true
+	}
+}
+
+func clientErrorResponseHeaders(header http.Header) http.Header {
+	// Error bodies can be useful to the relay caller, but upstream headers may
+	// contain credentials, cookies, or provider-only diagnostics.
+	sanitized := make(http.Header)
+	if contentType := strings.TrimSpace(header.Get("Content-Type")); contentType != "" {
+		sanitized.Set("Content-Type", contentType)
+	}
+	return sanitized
+}
+
+func newUpstreamClientRequestError(resp *xrequest.Response, provider Provider) (*upstreamClientRequestError, error) {
+	if resp == nil || resp.RawResponse == nil {
+		return nil, errors.New("empty upstream response")
+	}
+	body, err := readResponseBody(resp)
+	if err != nil {
+		return nil, err
+	}
+	return &upstreamClientRequestError{
+		statusCode: resp.StatusCode(),
+		header:     clientErrorResponseHeaders(resp.RawResponse.Header),
+		body:       []byte(redactProviderSecret(string(body), provider)),
+	}, nil
+}
+
+func writeUpstreamClientRequestError(c *gin.Context, upstreamErr *upstreamClientRequestError) {
+	if c == nil || upstreamErr == nil {
+		return
+	}
+	copyResponseHeaders(c.Writer, upstreamErr.header)
+	c.Data(upstreamErr.statusCode, upstreamErr.header.Get("Content-Type"), upstreamErr.body)
+}
+
+func isProxyRequestError(err error) (*proxyRequestError, bool) {
+	var proxyErr *proxyRequestError
+	if errors.As(err, &proxyErr) {
+		return proxyErr, true
+	}
+	return nil, false
+}
 
 const codexEmptyStreamRetryDelay = time.Second
 const relayTrustedProxiesEnv = "CODE_SWITCH_TRUSTED_PROXIES"
@@ -93,6 +197,8 @@ func NewProviderRelayService(providerService *ProviderService, poolService *Prov
 		notificationService: notificationService,
 		appSettings:         appSettings,
 		httpClient:          newRelayHTTPClient(),
+		proxyClients:        make(map[string]*http.Client),
+		proxyClientLastUsed: make(map[string]time.Time),
 		concurrencyLimiter:  NewProviderConcurrencyLimiter(),
 		addr:                addr,
 		lastUsed: map[string]*LastUsedProvider{
@@ -100,8 +206,211 @@ func NewProviderRelayService(providerService *ProviderService, poolService *Prov
 			"openai-responses": nil,
 			"openai-chat":      nil,
 		},
-		poolPenalties: make(map[string]*ProviderPoolProviderPenalty),
+		poolPenalties:         make(map[string]*ProviderPoolProviderPenalty),
+		accountPoolStickiness: newAccountPoolStickyStore(),
 	}
+}
+
+func (prs *ProviderRelayService) accountPoolStickyStore() *accountPoolStickyStore {
+	if prs == nil {
+		return nil
+	}
+	prs.accountPoolStickyMu.Lock()
+	defer prs.accountPoolStickyMu.Unlock()
+	if prs.accountPoolStickiness == nil {
+		prs.accountPoolStickiness = newAccountPoolStickyStore()
+	}
+	return prs.accountPoolStickiness
+}
+
+func (prs *ProviderRelayService) SetProxyManager(manager *ProxyManager) {
+	if prs == nil {
+		return
+	}
+	prs.proxyManager = manager
+}
+
+// SetProxyService enables user-scoped account-pool proxy resolution. The
+// manager remains separately available for request lease tracking.
+func (prs *ProviderRelayService) SetProxyService(service *ProxyService) {
+	if prs == nil {
+		return
+	}
+	prs.proxyService = service
+}
+
+type poolProxyContextKey struct{}
+type poolProxyUserContextKey struct{}
+type accountPoolStickyRequestContextKey struct{}
+
+func withProviderPoolContext(ctx context.Context, pool *ProviderPool, userID string) context.Context {
+	if pool == nil {
+		return ctx
+	}
+	ctx = context.WithValue(ctx, poolProxyContextKey{}, pool)
+	return context.WithValue(ctx, poolProxyUserContextKey{}, userID)
+}
+
+func providerPoolUserFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	userID, _ := ctx.Value(poolProxyUserContextKey{}).(string)
+	return strings.TrimSpace(userID)
+}
+
+func providerPoolFromContext(ctx context.Context) *ProviderPool {
+	if ctx == nil {
+		return nil
+	}
+	pool, _ := ctx.Value(poolProxyContextKey{}).(*ProviderPool)
+	return pool
+}
+
+func withAccountPoolStickyRequestContext(ctx context.Context, request *accountPoolStickyRequest) context.Context {
+	if request == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, accountPoolStickyRequestContextKey{}, request)
+}
+
+func accountPoolStickyRequestFromContext(ctx context.Context) *accountPoolStickyRequest {
+	if ctx == nil {
+		return nil
+	}
+	request, _ := ctx.Value(accountPoolStickyRequestContextKey{}).(*accountPoolStickyRequest)
+	return request
+}
+
+func (prs *ProviderRelayService) requestClient(ctx context.Context) (*http.Client, proxyEndpoint, error) {
+	base := prs.httpClient
+	if base == nil {
+		base = http.DefaultClient
+	}
+	pool := providerPoolFromContext(ctx)
+	if pool == nil || pool.ProxyConfig == nil || !pool.ProxyConfig.Enabled {
+		return base, proxyEndpoint{}, nil
+	}
+	if pool.ProxyConfig.Selection == AccountPoolProxySelectionNone {
+		return nil, proxyEndpoint{}, errors.New("号池已启用代理，但未选择代理策略")
+	}
+	if prs.proxyManager == nil && prs.proxyService == nil {
+		return nil, proxyEndpoint{}, errors.New("号池已启用代理，但代理服务未初始化")
+	}
+	userID := providerPoolUserFromContext(ctx)
+	poolKey := userID + "\x00" + pool.ID
+	var endpoint proxyEndpoint
+	var err error
+	if prs.proxyService != nil {
+		baseURL := ""
+		if pool.AccountPoolConfig != nil {
+			baseURL = pool.AccountPoolConfig.APIURL
+		}
+		endpoint, err = prs.proxyService.ProxyURLForPoolWithBaseURL(ctx, userID, pool.ID, pool.ProxyConfig, baseURL)
+	} else {
+		endpoint, err = prs.proxyManager.ProxyURLForPool(ctx, poolKey, pool.ProxyConfig)
+	}
+	if err != nil {
+		if isAutoProxyUnavailableError(err) {
+			prs.disableAutoPoolProxy(userID, pool)
+		}
+		return nil, proxyEndpoint{}, &proxyRequestError{PoolKey: poolKey, Err: err}
+	}
+	parsed, err := url.Parse(endpoint.URL)
+	if err != nil {
+		return nil, proxyEndpoint{}, err
+	}
+	clientKey := fmt.Sprintf("%s\x00%s\x00%s\x00%d", poolKey, endpoint.Node, endpoint.URL, endpoint.Generation)
+	prs.proxyClientMu.Lock()
+	if prs.proxyClients == nil {
+		prs.proxyClients = make(map[string]*http.Client)
+	}
+	if prs.proxyClientLastUsed == nil {
+		prs.proxyClientLastUsed = make(map[string]time.Time)
+	}
+	now := time.Now()
+	for key, lastUsed := range prs.proxyClientLastUsed {
+		if now.Sub(lastUsed) > 10*time.Minute {
+			if oldClient := prs.proxyClients[key]; oldClient != nil {
+				oldClient.CloseIdleConnections()
+			}
+			delete(prs.proxyClients, key)
+			delete(prs.proxyClientLastUsed, key)
+		}
+	}
+	if client, ok := prs.proxyClients[clientKey]; ok {
+		prs.proxyClientLastUsed[clientKey] = now
+		prs.proxyClientMu.Unlock()
+		return client, endpoint, nil
+	}
+	transport, ok := base.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		transport = newRelayHTTPClient().Transport.(*http.Transport)
+	}
+	clone := transport.Clone()
+	clone.Proxy = http.ProxyURL(parsed)
+	cloneTransport := wrapProxyTransport(clone, prs.proxyManager, endpoint.Key, endpoint.Node, endpoint.Generation)
+	client := &http.Client{Transport: cloneTransport, Timeout: base.Timeout, CheckRedirect: base.CheckRedirect, Jar: base.Jar}
+	prs.proxyClients[clientKey] = client
+	prs.proxyClientLastUsed[clientKey] = now
+	prs.proxyClientMu.Unlock()
+	return client, endpoint, nil
+}
+
+func isAutoProxyUnavailableError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "自动选择没有可用代理节点")
+}
+
+// disableAutoPoolProxy persists the direct-routing fallback after automatic
+// selection proves that every candidate is unavailable. The in-memory pool is
+// updated too, so retries in the current request immediately stop using it.
+func (prs *ProviderRelayService) disableAutoPoolProxy(userID string, pool *ProviderPool) {
+	if prs == nil || pool == nil || pool.ProxyConfig == nil || !pool.ProxyConfig.Enabled || pool.ProxyConfig.Selection != AccountPoolProxySelectionAuto || !pool.ProxyConfig.AutoDisableWhenNoAvailable {
+		return
+	}
+
+	pool.ProxyConfig.Enabled = false
+	pool.ProxyConfig.Selection = AccountPoolProxySelectionNone
+	pool.ProxyConfig.ProxyNodeID = ""
+
+	userID = strings.TrimSpace(userID)
+	if prs.poolService == nil || userID == "" || strings.TrimSpace(pool.ID) == "" {
+		return
+	}
+
+	persisted, err := prs.poolService.GetPoolForUser(userID, pool.ID)
+	if err != nil || persisted == nil || persisted.ProxyConfig == nil || !persisted.ProxyConfig.Enabled || persisted.ProxyConfig.Selection != AccountPoolProxySelectionAuto || !persisted.ProxyConfig.AutoDisableWhenNoAvailable {
+		return
+	}
+	persisted.ProxyConfig.Enabled = false
+	persisted.ProxyConfig.Selection = AccountPoolProxySelectionNone
+	persisted.ProxyConfig.ProxyNodeID = ""
+	if _, err := prs.poolService.SavePoolForUser(userID, persisted); err != nil {
+		fmt.Printf("[proxy] 自动选择无可用节点，关闭号池代理配置失败: pool=%s err=%v\n", pool.ID, err)
+		return
+	}
+
+	if prs.proxyService != nil {
+		baseURL := ""
+		if persisted.AccountPoolConfig != nil {
+			baseURL = persisted.AccountPoolConfig.APIURL
+		}
+		if err := prs.proxyService.SyncPoolProxyWithBaseURL(userID, persisted.ID, persisted.ProxyConfig, baseURL); err != nil {
+			fmt.Printf("[proxy] 自动选择无可用节点，清理号池代理 listener 失败: pool=%s err=%v\n", pool.ID, err)
+		}
+	}
+	fmt.Printf("[proxy] 自动选择无可用代理节点，已关闭号池使用代理: pool=%s\n", pool.ID)
+}
+
+func (prs *ProviderRelayService) recordResponsesCloudflareBlock(ctx context.Context, endpoint proxyEndpoint, responsesURL string, response *http.Response) {
+	if prs == nil || prs.proxyService == nil || strings.TrimSpace(endpoint.SelectedNode) == "" || !cloudflareBlockedResponse(response) {
+		return
+	}
+	pool := providerPoolFromContext(ctx)
+	if pool == nil || pool.ProxyConfig == nil || !pool.ProxyConfig.Enabled || pool.AccountPoolConfig == nil {
+		return
+	}
+	prs.proxyService.RecordResponsesCloudflareBlock(endpoint.SelectedNode, responsesURL, pool.AccountPoolConfig.APIURL)
 }
 
 func newRelayHTTPClient() *http.Client {
@@ -314,6 +623,16 @@ func (prs *ProviderRelayService) isCodexStreamGuardEnabled() bool {
 	return settings.EnableCodexStreamGuard
 }
 
+func firstTextRetryTimeout(pool *ProviderPool) time.Duration {
+	if pool == nil || !pool.FirstTextRetryEnabled {
+		return 0
+	}
+	if pool.FirstTextRetryTimeoutSeconds < minFirstTextRetryTimeoutSeconds || pool.FirstTextRetryTimeoutSeconds > maxFirstTextRetryTimeoutSeconds {
+		return time.Duration(defaultFirstTextRetryTimeoutSeconds) * time.Second
+	}
+	return time.Duration(pool.FirstTextRetryTimeoutSeconds) * time.Second
+}
+
 func (prs *ProviderRelayService) shouldUseCodexStreamGuard(kind, endpoint string) bool {
 	// openai-responses 走 stream guard（Codex 客户端走这个端点）
 	// openai-chat 不走 stream guard
@@ -321,6 +640,51 @@ func (prs *ProviderRelayService) shouldUseCodexStreamGuard(kind, endpoint string
 		return prs.isCodexStreamGuardEnabled()
 	}
 	return strings.EqualFold(kind, "codex") && isResponsesEndpoint(endpoint) && prs.isCodexStreamGuardEnabled()
+}
+
+// Account-pool failover needs a preflight guard even when the optional normal
+// Codex stream guard is disabled. Without it, a 200 SSE failure would be
+// written to the client before another account key can be attempted.
+func (prs *ProviderRelayService) shouldUseResponseStreamGuard(c *gin.Context, kind, endpoint string) bool {
+	if c != nil && c.Request != nil && accountPoolStickyRequestFromContext(c.Request.Context()) != nil {
+		return true
+	}
+	// 首字超时重试必须独立于旧的空流保护开关。开启后，Responses
+	// 流需要在写给客户端前等待真正的首个有效输出。
+	var pool *ProviderPool
+	if c != nil && c.Request != nil {
+		pool = providerPoolFromContext(c.Request.Context())
+	}
+	if (kind == "openai-responses" || (strings.EqualFold(kind, "codex") && isResponsesEndpoint(endpoint))) && firstTextRetryTimeout(pool) > 0 {
+		return true
+	}
+	return prs.shouldUseCodexStreamGuard(kind, endpoint)
+}
+
+// isInternalRelayTarget identifies a provider that forwards back into this
+// relay. Its nested request owns account-key selection and must own the
+// first-text timeout too; cancelling it in the outer wrapper would turn the
+// inner key's timeout into a client abort and skip its blacklist counter.
+func (prs *ProviderRelayService) isInternalRelayTarget(targetURL string) bool {
+	if prs == nil || strings.TrimSpace(prs.addr) == "" {
+		return false
+	}
+	target, err := url.Parse(targetURL)
+	if err != nil {
+		return false
+	}
+	host := strings.TrimSpace(target.Hostname())
+	if !strings.EqualFold(host, "localhost") {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return false
+		}
+	}
+	_, relayPort, err := net.SplitHostPort(prs.addr)
+	if err != nil {
+		return false
+	}
+	return target.Port() == relayPort
 }
 
 func (prs *ProviderRelayService) shouldRequireProviderEnabled(kind string) bool {
@@ -431,6 +795,84 @@ type providerAttemptPlan struct {
 	allBlacklisted bool
 }
 
+func isAccountPool(pool *ProviderPool) bool {
+	return pool != nil && normalizedProviderPoolType(pool.PoolType) == ProviderPoolTypeAccount
+}
+
+func resetProviderAttemptPlanOrder(plan *providerAttemptPlan, providers []Provider) {
+	if plan == nil {
+		return
+	}
+	plan.active = append([]Provider(nil), providers...)
+	plan.levelGroups = make(map[int][]Provider)
+	for _, provider := range plan.active {
+		level := getProviderLevelInPool(plan.pool, provider)
+		plan.levelGroups[level] = append(plan.levelGroups[level], provider)
+	}
+	plan.levels = plan.levels[:0]
+	for level := range plan.levelGroups {
+		plan.levels = append(plan.levels, level)
+	}
+	sort.Ints(plan.levels)
+}
+
+func (prs *ProviderRelayService) beginAccountPoolStickyRequest(c *gin.Context, plan *providerAttemptPlan, body []byte) *accountPoolStickyRequest {
+	if prs == nil || c == nil || plan == nil || !isAccountPool(plan.pool) {
+		return nil
+	}
+	store := prs.accountPoolStickyStore()
+	if store == nil {
+		return nil
+	}
+	scope := newAccountPoolStickyScope(plan.userID, relayKeyIDFromContext(c), plan.pool.Platform, plan.poolID)
+	return store.begin(scope, accountPoolRequestIdentityFromBody(body), plan.active)
+}
+
+func (prs *ProviderRelayService) reorderAccountPoolAttemptPlan(plan *providerAttemptPlan, request *accountPoolStickyRequest) {
+	if prs == nil || plan == nil || request == nil || !isAccountPool(plan.pool) {
+		return
+	}
+	ordered := prs.accountPoolStickyStore().order(request, plan.active)
+	resetProviderAttemptPlanOrder(plan, ordered)
+}
+
+func (prs *ProviderRelayService) commitAccountPoolStickyResponse(c *gin.Context, provider Provider, responseID string) {
+	if prs == nil || c == nil {
+		return
+	}
+	request := accountPoolStickyRequestFromContext(c.Request.Context())
+	if request == nil {
+		return
+	}
+	if prs.isProviderBlacklistedForUser(request.scope.userID, request.scope.platform, request.scope.poolID, provider.ID) {
+		// A concurrent request can finish after another request blacklists this
+		// account key. Do not resurrect a sticky binding for an unavailable key.
+		return
+	}
+	prs.accountPoolStickyStore().commit(request, provider.ID, responseID)
+}
+
+func (prs *ProviderRelayService) responseStreamGuardOptions(c *gin.Context, provider Provider, firstUsefulContentTimeout time.Duration) codexStreamGuardOptions {
+	options := codexStreamGuardOptions{
+		firstUsefulContentTimeout: firstUsefulContentTimeout,
+	}
+	if prs == nil || c == nil || accountPoolStickyRequestFromContext(c.Request.Context()) == nil {
+		return options
+	}
+	return codexStreamGuardOptions{
+		firstUsefulContentTimeout: options.firstUsefulContentTimeout,
+		// The normal guard writes an immediate keepalive. For an account pool,
+		// defer that first write so an empty upstream can fail over without
+		// committing a 200 response before another key is tried.
+		deferInitialKeepAlive:        true,
+		disableKeepAliveUntilRelease: true,
+		failOnTerminalBeforeWrite:    true,
+		onSuccessfulCompleted: func(responseID string) {
+			prs.commitAccountPoolStickyResponse(c, provider, responseID)
+		},
+	}
+}
+
 // isProviderBlacklistedForUser checks whether a provider is currently blacklisted in the given user pool.
 func (prs *ProviderRelayService) isProviderBlacklistedForUser(userID, platform, poolID string, providerID int64) bool {
 	prs.poolPenaltyMu.Lock()
@@ -484,6 +926,88 @@ func (prs *ProviderRelayService) recordProviderSuccessForUser(userID, platform, 
 	delete(prs.poolPenalties, penaltyKey(userID, platform, poolID, provider.ID))
 }
 
+func specialBlacklistRuleForFailure(pool *ProviderPool, status int, errorBody string) *SpecialBlacklistRule {
+	if pool == nil || status < 100 || status > 599 {
+		return nil
+	}
+	for index := range pool.SpecialBlacklistRules {
+		rule := &pool.SpecialBlacklistRules[index]
+		if rule.HTTPStatus != status {
+			continue
+		}
+		if rule.JSONPath == "" {
+			return rule
+		}
+		var body interface{}
+		if json.Unmarshal([]byte(errorBody), &body) != nil {
+			continue
+		}
+		actual, found := jsonValueAtPath(body, rule.JSONPath)
+		if !found {
+			continue
+		}
+		var expected interface{}
+		if json.Unmarshal([]byte(rule.ExpectedJSONValue), &expected) != nil {
+			continue // SavePool validates this; keep runtime fail-closed for stale data.
+		}
+		if reflect.DeepEqual(actual, expected) {
+			return rule
+		}
+	}
+	return nil
+}
+
+func jsonValueAtPath(value interface{}, path string) (interface{}, bool) {
+	current := value
+	for _, segment := range strings.Split(path, ".") {
+		object, ok := current.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		current, ok = object[segment]
+		if !ok {
+			return nil, false
+		}
+	}
+	return current, true
+}
+
+func (prs *ProviderRelayService) recordPoolAttemptError(userID string, pool *ProviderPool, provider Provider, status int, rule *SpecialBlacklistRule, errorMessage string) {
+	if prs == nil || prs.poolAttemptLogs == nil || strings.TrimSpace(userID) == "" || pool == nil {
+		return
+	}
+	subject := strings.TrimSpace(provider.Name)
+	if isValidAccountPoolKeyID(provider.ID) {
+		subject = maskedPoolAttemptKey(provider.APIKey)
+	}
+	if subject == "" {
+		subject = "(unknown)"
+	}
+	parts := []string{fmt.Sprintf("Pool attempt failed | pool=%s provider=%s", pool.Name, subject)}
+	if status > 0 {
+		parts = append(parts, fmt.Sprintf("HTTP %d", status))
+	}
+	if rule != nil {
+		parts = append(parts, fmt.Sprintf("rule=%s", rule.Name))
+	}
+	if message := summarizeBodyForError(redactProviderSecret(errorMessage, provider), 500); message != "" {
+		parts = append(parts, message)
+	}
+	level := "WARN"
+	if status >= 500 || status == 0 {
+		level = "ERROR"
+	}
+	prs.poolAttemptLogs.Add(userID, ConsoleLog{Timestamp: time.Now(), Level: level, Message: strings.Join(parts, " | ")})
+}
+
+func maskedPoolAttemptKey(key string) string {
+	key = strings.TrimSpace(key)
+	if len(key) <= 4 {
+		return "****"
+	}
+	return "****" + key[len(key)-4:]
+}
+
 // recordProviderSuccess clears the failure count for a provider in a pool.
 func (prs *ProviderRelayService) recordProviderSuccess(platform, poolID string, provider Provider) {
 	prs.recordProviderSuccessForUser("", platform, poolID, provider)
@@ -493,6 +1017,10 @@ func (prs *ProviderRelayService) recordProviderSuccess(platform, poolID string, 
 // is reached, blacklists the provider. Returns true when this failure resulted in a new
 // blacklist.
 func (prs *ProviderRelayService) recordProviderFailureForUser(userID, platform, poolID string, pool *ProviderPool, provider Provider, reason string) bool {
+	return prs.recordProviderFailureWithRuleForUser(userID, platform, poolID, pool, provider, reason, nil)
+}
+
+func (prs *ProviderRelayService) recordProviderFailureWithRuleForUser(userID, platform, poolID string, pool *ProviderPool, provider Provider, reason string, rule *SpecialBlacklistRule) bool {
 	if pool == nil {
 		return false
 	}
@@ -505,16 +1033,21 @@ func (prs *ProviderRelayService) recordProviderFailureForUser(userID, platform, 
 		return false
 	}
 	threshold := pool.AutoBlacklistThreshold
-	if threshold <= 0 {
-		threshold = 3
-	} else if isAccountPool && threshold > maxAccountPoolBlacklistThreshold {
-		threshold = maxAccountPoolBlacklistThreshold
-	}
 	durationMinutes := pool.AutoBlacklistDurationMinutes
-	if durationMinutes <= 0 {
-		durationMinutes = 10
-	} else if isAccountPool && durationMinutes > maxAccountPoolBlacklistDurationMinutes {
-		durationMinutes = maxAccountPoolBlacklistDurationMinutes
+	if rule != nil {
+		threshold = rule.Threshold
+		durationMinutes = rule.DurationMinutes
+	} else {
+		if threshold <= 0 {
+			threshold = 3
+		} else if isAccountPool && threshold > maxAccountPoolBlacklistThreshold {
+			threshold = maxAccountPoolBlacklistThreshold
+		}
+		if durationMinutes <= 0 {
+			durationMinutes = 10
+		} else if isAccountPool && durationMinutes > maxAccountPoolBlacklistDurationMinutes {
+			durationMinutes = maxAccountPoolBlacklistDurationMinutes
+		}
 	}
 
 	key := penaltyKey(userID, platform, poolID, provider.ID)
@@ -531,14 +1064,32 @@ func (prs *ProviderRelayService) recordProviderFailureForUser(userID, platform, 
 		prs.poolPenalties[key] = p
 	}
 	wasBlacklisted := !p.BlacklistedUntil.IsZero() && time.Now().Before(p.BlacklistedUntil)
-	p.FailureCount++
+	if rule == nil {
+		p.FailureCount++
+	} else {
+		if p.RuleFailureCounts == nil {
+			p.RuleFailureCounts = make(map[string]int)
+		}
+		p.RuleFailureCounts[rule.ID]++
+	}
 	p.LastFailureAt = time.Now()
 	p.LastReason = reason
+	count := p.FailureCount
+	if rule != nil {
+		count = p.RuleFailureCounts[rule.ID]
+		p.LastReason = rule.Name
+	}
 
-	if p.FailureCount >= threshold {
+	if count >= threshold {
 		p.BlacklistedUntil = time.Now().Add(time.Duration(durationMinutes) * time.Minute)
 		penalty := *p
 		prs.poolPenaltyMu.Unlock()
+		if isAccountPool {
+			// A blacklisted account key must not retain any sticky conversation
+			// bindings. The store spans every relay key owned by this user because
+			// blacklist state is pool-scoped rather than relay-key-scoped.
+			prs.accountPoolStickyStore().invalidateProvider(userID, platform, poolID, provider.ID)
+		}
 		if !wasBlacklisted && prs.notificationService != nil {
 			prs.notificationService.NotifyProviderBlacklistChanged(ProviderBlacklistChangedNotification{
 				UserID:           penalty.UserID,
@@ -809,9 +1360,10 @@ func (prs *ProviderRelayService) buildProviderAttemptPlan(c *gin.Context, kind s
 	return plan, true, nil
 }
 
-// EnsureDefaultPoolsAndBindings 启动时确保默认池子存在
-// relay key 绑定只在一次性迁移（version < 2）时执行
-// 迁移完成后，新 key 不会被自动绑定，必须由用户显式设置
+// EnsureDefaultPoolsAndBindings preserves the legacy default-pool migration
+// for explicit migration and test callers. It is intentionally not invoked
+// during normal startup: new deployments require users to create pools and
+// relay-key bindings explicitly.
 func (prs *ProviderRelayService) EnsureDefaultPoolsAndBindings() error {
 	// 确定每个 platform 的当前模式
 	platforms := []string{"claude", "openai-responses", "openai-chat"}
@@ -959,6 +1511,15 @@ func (prs *ProviderRelayService) validateConfig() []string {
 }
 
 func (prs *ProviderRelayService) Stop() error {
+	prs.proxyClientMu.Lock()
+	for _, client := range prs.proxyClients {
+		if client != nil {
+			client.CloseIdleConnections()
+		}
+	}
+	prs.proxyClients = make(map[string]*http.Client)
+	prs.proxyClientLastUsed = make(map[string]time.Time)
+	prs.proxyClientMu.Unlock()
 	if prs.server == nil {
 		return nil
 	}
@@ -1027,6 +1588,7 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 
 		var requestLog *ReqeustLog
 		var queueItem *ProviderQueueItem
+		var accountStickyRequest *accountPoolStickyRequest
 		ensureRequestLog := func() *ReqeustLog {
 			if requestLog == nil {
 				requestLog = prs.startActiveRequestLog(c, kind, requestedModel, isStream)
@@ -1034,13 +1596,19 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 			return requestLog
 		}
 		defer func() {
+			if accountStickyRequest != nil {
+				prs.accountPoolStickyStore().abort(accountStickyRequest)
+			}
 			if requestLog != nil {
 				prs.finishActiveRequestLog(requestLog)
 			}
 		}()
 
 		totalAttempts := 0
-		var retryTargetProviderID int64
+		// A user-triggered retry deliberately re-enters pool selection instead
+		// of pinning the previous provider. Account pools skip sticky ordering for
+		// that one selection so the highest-priority available key is retried.
+		retrySelectingPoolPriority := false
 		for selectionRound := 0; ; selectionRound++ {
 			if selectionRound > 0 {
 				fmt.Printf("[INFO] 重新读取当前池子和 provider 配置\n")
@@ -1083,22 +1651,37 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 			pool := plan.pool
 			poolID := plan.poolID
 			userID := plan.userID
-			if retryTargetProviderID != 0 && !providerIDInProviders(plan.active, retryTargetProviderID) {
-				currentLog := ensureRequestLog()
-				currentLog.HttpCode = http.StatusServiceUnavailable
-				currentLog.ErrorMessage = "重试目标 provider 当前不可用"
-				if queueItem != nil && prs.concurrencyLimiter != nil {
-					prs.completeQueueWakeAndReserveNext(queueItem.UserID, queueItem.Platform, providerQueueKey(queueItem.UserID, queueItem.Platform, queueItem.PoolID), queueItem.RequestID)
+			accountPool := isAccountPool(pool)
+			if accountPool {
+				if accountStickyRequest == nil {
+					accountStickyRequest = prs.beginAccountPoolStickyRequest(c, plan, bodyBytes)
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": currentLog.ErrorMessage})
-				return
+				if !retrySelectingPoolPriority {
+					prs.reorderAccountPoolAttemptPlan(plan, accountStickyRequest)
+				}
 			}
-
+			// Every account-pool request is pinned to the provider selected for its
+			// current attempt, including anonymous first requests that do not yet
+			// have a durable sticky-session ID. It may move only after the selected
+			// key becomes unavailable through blacklist or pool reconfiguration.
+			strictAccountStickiness := accountPool && !retrySelectingPoolPriority && accountStickyRequest != nil && accountStickyRequest.providerID != 0
+			requestContext := withProviderPoolContext(c.Request.Context(), pool, userID)
+			if accountStickyRequest != nil {
+				requestContext = withAccountPoolStickyRequestContext(requestContext, accountStickyRequest)
+			}
+			c.Request = c.Request.WithContext(requestContext)
 			fmt.Printf("[INFO] 池子模式: %s/%s (模式: %s, 成员: %d)\n", kind, pool.Name, pool.Mode, len(pool.Members))
 
 			if len(plan.active) == 0 {
 				if queueItem != nil && prs.concurrencyLimiter != nil {
 					prs.completeQueueWakeAndReserveNext(queueItem.UserID, queueItem.Platform, providerQueueKey(queueItem.UserID, queueItem.Platform, queueItem.PoolID), queueItem.RequestID)
+				}
+				if accountPool {
+					currentLog := ensureRequestLog()
+					currentLog.HttpCode = http.StatusServiceUnavailable
+					currentLog.ErrorMessage = "号池暂无可用账号"
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "号池暂无可用账号，请稍后重试"})
+					return
 				}
 				if plan.allBlacklisted {
 					fmt.Printf("[WARN] 池子 %s 的所有 provider 均在拉黑期，无可用供应商\n", pool.Name)
@@ -1128,14 +1711,6 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 			currentLog := ensureRequestLog()
 			queueKey := providerQueueKey(userID, kind, poolID)
 			candidateProviders := providersFromAttemptPlan(plan)
-			if retryTargetProviderID != 0 {
-				for _, candidate := range candidateProviders {
-					if candidate.ID == retryTargetProviderID {
-						candidateProviders = []Provider{candidate}
-						break
-					}
-				}
-			}
 			candidateProviderIDs := providerIDsFromProviders(candidateProviders)
 			if queueItem != nil && queueItem.FlexibleProvider {
 				prs.refreshFlexibleQueueReservation(userID, kind, currentLog.ActiveRequestID, candidateProviders)
@@ -1189,6 +1764,7 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 			var lastDuration time.Duration
 			stopOnStickyFailure := false
 			retryRequested := false
+			retryStrictAccountSelection := false
 			sawConcurrencyFull := false
 
 			for _, level := range plan.levels {
@@ -1197,9 +1773,6 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 				fmt.Printf("[INFO] === 尝试 Level %d（%d 个 provider）===\n", level, len(providersInLevel))
 
 				for i, provider := range providersInLevel {
-					if retryTargetProviderID != 0 && provider.ID != retryTargetProviderID {
-						continue
-					}
 					if reservedProviderID != 0 && provider.ID != reservedProviderID {
 						continue
 					}
@@ -1248,65 +1821,31 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 					// 尝试发送请求
 					// 获取有效的端点（用户配置优先）
 					effectiveEndpoint := prs.resolveRelayEndpoint(kind, provider, endpoint)
-					retryTargetProviderID = 0
+					// The priority override applies until a replacement upstream attempt
+					// actually starts. It must survive queueing and config reloads.
+					retrySelectingPoolPriority = false
 					startTime := time.Now()
 					ok, err := prs.forwardRequestWithLog(c, kind, provider, effectiveEndpoint, query, clientHeaders, currentBodyBytes, isStream, effectiveModel, currentLog)
 					duration := time.Since(startTime)
 					if errors.Is(err, errActiveRequestRetryRequested) {
-						fmt.Printf("[INFO] 用户触发重试，重新请求当前 provider: Provider=%s | Model=%s\n", provider.Name, effectiveModel)
-						releaseProviderSlot(false)
-						retryProviders := []Provider{provider}
-						retryProviderIDs := []int64{provider.ID}
-						if queueItem == nil {
-							queueItem = &ProviderQueueItem{
-								RequestID:   currentLog.ActiveRequestID,
-								UserID:      userID,
-								Platform:    kind,
-								PoolID:      poolID,
-								Model:       requestedModel,
-								Providers:   retryProviders,
-								ProviderIDs: retryProviderIDs,
-							}
-						}
-						refreshProviderQueueItem(queueItem, userID, kind, poolID, requestedModel, retryProviders, retryProviderIDs)
-						queueItem.FlexibleProvider = false
-						if !prs.waitForProviderQueueTurn(c, queueItem, currentLog, false, retryProviders, false) {
-							return
-						}
-						retryTargetProviderID = provider.ID
+						fmt.Printf("[INFO] 用户触发重试，按当前池优先级重新选择 provider: Provider=%s | Model=%s\n", provider.Name, effectiveModel)
+						releaseProviderSlot(true)
+						retrySelectingPoolPriority = true
 						retryRequested = true
 						break
 					}
 
 					failedFromEmptyStreamRetry := false
-					if !ok && errors.Is(err, errCodexEmptyStream) {
+					if !ok && !accountPool && isCodexStreamPreflightRetryError(err) {
 						var retryAttempts int
 						var retryDuration time.Duration
-						ok, provider, err, retryAttempts, retryDuration, failedFromEmptyStreamRetry = prs.retryCodexEmptyStreamSameProvider(c, kind, poolID, pool, provider, endpoint, query, clientHeaders, bodyBytes, isStream, requestedModel, currentLog)
+						ok, provider, err, retryAttempts, retryDuration, failedFromEmptyStreamRetry = prs.retryCodexEmptyStreamSameProvider(c, kind, poolID, pool, provider, endpoint, query, clientHeaders, bodyBytes, isStream, requestedModel, currentLog, err)
 						totalAttempts += retryAttempts
 						duration += retryDuration
 						if errors.Is(err, errActiveRequestRetryRequested) {
-							fmt.Printf("[INFO] 用户在空流保护重试期间触发重试，重新请求当前 provider: Provider=%s\n", provider.Name)
-							releaseProviderSlot(false)
-							retryProviders := []Provider{provider}
-							retryProviderIDs := []int64{provider.ID}
-							if queueItem == nil {
-								queueItem = &ProviderQueueItem{
-									RequestID:   currentLog.ActiveRequestID,
-									UserID:      userID,
-									Platform:    kind,
-									PoolID:      poolID,
-									Model:       requestedModel,
-									Providers:   retryProviders,
-									ProviderIDs: retryProviderIDs,
-								}
-							}
-							refreshProviderQueueItem(queueItem, userID, kind, poolID, requestedModel, retryProviders, retryProviderIDs)
-							queueItem.FlexibleProvider = false
-							if !prs.waitForProviderQueueTurn(c, queueItem, currentLog, false, retryProviders, false) {
-								return
-							}
-							retryTargetProviderID = provider.ID
+							fmt.Printf("[INFO] 用户在空流保护重试期间触发重试，按当前池优先级重新选择 provider: Provider=%s\n", provider.Name)
+							releaseProviderSlot(true)
+							retrySelectingPoolPriority = true
 							retryRequested = true
 							break
 						}
@@ -1348,16 +1887,69 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 						releaseProviderSlot(true)
 						return
 					}
+					if proxyErr, proxyFailure := isProxyRequestError(err); proxyFailure {
+						// A local Mihomo/listener failure says nothing about the
+						// provider credential. Do not poison the provider blacklist.
+						if prs.proxyManager != nil {
+							prs.proxyManager.InvalidateProxy(proxyErr.PoolKey, proxyErr.Node)
+						}
+						releaseProviderSlot(true)
+						stopOnStickyFailure = true
+						break
+					}
+					if accountPool {
+						var clientErr *upstreamClientRequestError
+						if errors.As(err, &clientErr) {
+							// A deterministic request validation error is independent of
+							// the selected account key. Returning it directly avoids
+							// replaying the same invalid request through every key.
+							if currentLog != nil {
+								currentLog.HttpCode = clientErr.statusCode
+								currentLog.ErrorMessage = summarizeBodyForError(string(clientErr.body), 1000)
+							}
+							prs.recordPoolAttemptError(userID, pool, provider, clientErr.statusCode, nil, clientErr.Error())
+							releaseProviderSlot(true)
+							writeUpstreamClientRequestError(c, clientErr)
+							return
+						}
+					}
+					statusCode := 0
+					errorBody := ""
+					if currentLog != nil {
+						statusCode = currentLog.HttpCode
+						errorBody = currentLog.ErrorMessage
+					}
+					matchedRule := specialBlacklistRuleForFailure(pool, statusCode, errorBody)
+					attemptLogMessage := errorMsg
+					if errorBody != "" {
+						attemptLogMessage = errorBody
+					}
+					if !failedFromEmptyStreamRetry {
+						prs.recordPoolAttemptError(userID, pool, provider, statusCode, matchedRule, attemptLogMessage)
+					}
+					failureReason := errorMsg
+					if matchedRule == nil && statusCode > 0 {
+						failureReason = fmt.Sprintf("HTTP %d", statusCode)
+					}
 
-					// 记录 provider 失败（自动拉黑逻辑）。空流重试路径已在内部计数，跳过。
+					// 记录 provider 失败（自动拉黑逻辑）。流预提交重试路径已在内部计数，跳过。
 					blacklistedAfterFailure := false
 					if !failedFromEmptyStreamRetry {
-						blacklistedAfterFailure = prs.recordProviderFailureForUser(userID, kind, poolID, pool, provider, errorMsg)
+						blacklistedAfterFailure = prs.recordProviderFailureWithRuleForUser(userID, kind, poolID, pool, provider, failureReason, matchedRule)
 					} else {
 						blacklistedAfterFailure = prs.isProviderBlacklistedForUser(userID, kind, poolID, provider.ID)
 					}
+					if strictAccountStickiness {
+						// Rebuild the attempt plan after every key failure. While the
+						// sticky key remains available, order() keeps this request on
+						// that key. Once it is blacklisted, the invalidated session is
+						// rebound to the next available key before its next attempt.
+						releaseProviderSlot(true)
+						retryStrictAccountSelection = true
+						break
+					}
 
-					if !blacklistedAfterFailure {
+					if !blacklistedAfterFailure && !accountPool {
 						fmt.Printf("[WARN] Provider %s 本次失败但未进入拉黑，保持为主 provider，停止继续切换\n", provider.Name)
 						releaseProviderSlot(true)
 						stopOnStickyFailure = true
@@ -1365,7 +1957,7 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 					}
 
 					// 发送切换通知：仅在 provider 进入拉黑后，才切到下一个可用 provider
-					if prs.notificationService != nil {
+					if blacklistedAfterFailure && prs.notificationService != nil {
 						nextProvider := nextProviderNameAfterIndex(plan.levels, plan.levelGroups, level, i)
 						if nextProvider != "" {
 							prs.notificationService.NotifyProviderSwitch(SwitchNotification{
@@ -1380,13 +1972,13 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 					releaseProviderSlot(true)
 				}
 
-				if retryRequested || stopOnStickyFailure {
+				if retryRequested || retryStrictAccountSelection || stopOnStickyFailure {
 					break
 				}
 				fmt.Printf("[WARN] Level %d 的所有 %d 个 provider 均失败，尝试下一 Level\n", level, len(providersInLevel))
 			}
 
-			if retryRequested {
+			if retryRequested || retryStrictAccountSelection {
 				continue
 			}
 
@@ -1419,6 +2011,17 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 			fmt.Printf("[ERROR] 所有 %d 个 provider 均失败，最后尝试: %s | 错误: %s\n",
 				totalAttempts, lastProvider, errorMsg)
 
+			if accountPool {
+				if _, proxyFailure := isProxyRequestError(lastError); !proxyFailure {
+					if requestLog != nil {
+						requestLog.HttpCode = http.StatusBadGateway
+						requestLog.ErrorMessage = "号池中所有可用账号均请求失败"
+					}
+					c.JSON(http.StatusBadGateway, gin.H{"error": "号池中所有可用账号均请求失败，请稍后重试"})
+					return
+				}
+			}
+
 			if requestLog != nil {
 				requestLog.HttpCode = http.StatusBadGateway
 				requestLog.ErrorMessage = errorMsg
@@ -1436,14 +2039,16 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 
 func (prs *ProviderRelayService) startActiveRequestLog(c *gin.Context, kind string, model string, isStream bool) *ReqeustLog {
 	start := time.Now()
+	pool := providerPoolFromContext(c.Request.Context())
 	requestLog := &ReqeustLog{
-		Platform:   kind,
-		Model:      model,
-		UserID:     relayUserIDFromContext(c),
-		IsStream:   isStream,
-		RelayKeyID: relayKeyIDFromContext(c),
-		ClientIP:   clientIPFromRequest(c.Request),
-		startedAt:  start,
+		Platform:                kind,
+		Model:                   model,
+		UserID:                  relayUserIDFromContext(c),
+		IsStream:                isStream,
+		RelayKeyID:              relayKeyIDFromContext(c),
+		ClientIP:                clientIPFromRequest(c.Request),
+		ExcludeFromTotalTraffic: isAccountPool(pool) && pool.ExcludeFromTotalTraffic,
+		startedAt:               start,
 	}
 	activeRequestID := defaultActiveRequestTracker.Start(requestLog, start)
 	requestLog.ActiveRequestID = activeRequestID
@@ -1455,11 +2060,21 @@ func (prs *ProviderRelayService) finishActiveRequestLog(requestLog *ReqeustLog) 
 	if requestLog == nil {
 		return
 	}
+	defaultActiveRequestTracker.Finish(requestLog.ActiveRequestID)
+	if requestLog.attemptPersisted {
+		return
+	}
+	prs.persistCompletedRequestLog(requestLog)
+}
+
+func (prs *ProviderRelayService) persistCompletedRequestLog(requestLog *ReqeustLog) {
+	if requestLog == nil {
+		return
+	}
 	if requestLog.startedAt.IsZero() {
 		requestLog.startedAt = time.Now()
 	}
 	requestLog.DurationSec = time.Since(requestLog.startedAt).Seconds()
-	defaultActiveRequestTracker.Finish(requestLog.ActiveRequestID)
 
 	if GlobalDBQueueLogs == nil {
 		fmt.Printf("⚠️  写入 request_log 失败: 队列未初始化\n")
@@ -1474,8 +2089,8 @@ func (prs *ProviderRelayService) finishActiveRequestLog(requestLog *ReqeustLog) 
 			user_id, platform, model, provider, relay_key_id, http_code,
 			input_tokens, output_tokens, cache_create_tokens, cache_read_tokens,
 			reasoning_tokens, is_stream, duration_sec, first_token_duration_sec, client_ip,
-			upstream_header_sec, first_event_sec, first_text_sec, error_message, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			upstream_header_sec, first_event_sec, first_text_sec, error_message, exclude_from_total, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		requestLog.UserID,
 		requestLog.Platform,
@@ -1496,6 +2111,7 @@ func (prs *ProviderRelayService) finishActiveRequestLog(requestLog *ReqeustLog) 
 		requestLog.FirstEventSec,
 		requestLog.FirstTextSec,
 		requestLog.ErrorMessage,
+		boolToInt(requestLog.ExcludeFromTotalTraffic),
 		time.Now().UTC().Format(timeLayout),
 	)
 
@@ -1503,6 +2119,21 @@ func (prs *ProviderRelayService) finishActiveRequestLog(requestLog *ReqeustLog) 
 		fmt.Printf("写入 request_log 失败: %v\n", err)
 	}
 	RecordModelMonitorTraffic(requestLog)
+}
+
+func (prs *ProviderRelayService) persistFirstTextTimeoutAttempt(requestLog *ReqeustLog) {
+	if requestLog == nil || requestLog.attemptPersisted {
+		return
+	}
+	requestLog.HttpCode = http.StatusGatewayTimeout
+	requestLog.ErrorMessage = firstTextTimeoutErrorBody
+	completed := *requestLog
+	completed.Status = requestLogStatusCompleted
+	completed.RetryRequested = false
+	completed.attemptPersisted = false
+	prs.persistCompletedRequestLog(&completed)
+	requestLog.attemptPersisted = true
+	defaultActiveRequestTracker.MarkAttemptTransition(requestLog.ActiveRequestID, time.Now())
 }
 
 func (r *ReqeustLog) prepareProviderAttempt(c *gin.Context, kind string, provider Provider, model string, isStream bool) {
@@ -1533,8 +2164,8 @@ func (r *ReqeustLog) prepareProviderAttempt(c *gin.Context, kind string, provide
 	r.QueueStartedAt = ""
 	r.QueueKey = ""
 	r.inputTokensIncludeCacheRead = false
-	defaultActiveRequestTracker.MarkProcessing(r.ActiveRequestID, provider.Name)
-	defaultActiveRequestTracker.Update(r.ActiveRequestID, r)
+	r.attemptPersisted = false
+	r.startedAt = time.Now()
 }
 
 func (prs *ProviderRelayService) syncProviderQueuePositions(queueKey string) {
@@ -1679,8 +2310,8 @@ func (prs *ProviderRelayService) forwardRequest(
 	kind string,
 	provider Provider,
 	endpoint string,
-	query map[string]string,
-	clientHeaders map[string]string,
+	query url.Values,
+	clientHeaders http.Header,
 	bodyBytes []byte,
 	isStream bool,
 	model string,
@@ -1695,15 +2326,15 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 	kind string,
 	provider Provider,
 	endpoint string,
-	query map[string]string,
-	clientHeaders map[string]string,
+	query url.Values,
+	clientHeaders http.Header,
 	bodyBytes []byte,
 	isStream bool,
 	model string,
 	requestLog *ReqeustLog,
 ) (ok bool, err error) {
 	targetURL := joinURL(provider.APIURL, endpoint)
-	headers := cloneMap(clientHeaders)
+	headers := cloneHeaders(clientHeaders)
 
 	// ========== count_tokens 本地估算（协议转换之前拦截）==========
 	if kind == "claude" && strings.HasSuffix(endpoint, "/count_tokens") {
@@ -1721,60 +2352,115 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 		bodyBytes = ensureOpenAIChatStreamUsage(bodyBytes)
 	}
 
+	// Remove client-controlled Connection tokens before adding trusted provider
+	// credentials. Otherwise `Connection: Authorization` could strip the header
+	// after it has been injected below.
+	removeHopByHopHeaders(headers)
 	removeInboundAuthHeaders(headers)
+	deleteHeaderCaseInsensitive(headers, "Accept-Encoding")
 
 	// 根据认证方式设置请求头（默认 Bearer，与 v2.2.x 保持一致）
 	authType := strings.ToLower(strings.TrimSpace(provider.ConnectivityAuthType))
 	switch authType {
 	case "x-api-key":
 		// 仅当用户显式选择 x-api-key 时使用（Anthropic 官方 API）
-		headers["x-api-key"] = provider.APIKey
+		headers.Set("x-api-key", provider.APIKey)
 		if kind == "claude" {
-			headers["anthropic-version"] = "2023-06-01"
+			headers.Set("anthropic-version", "2023-06-01")
 		}
 	case "", "bearer":
 		// 默认使用 Bearer token（兼容所有第三方中转）
-		headers["Authorization"] = fmt.Sprintf("Bearer %s", provider.APIKey)
+		headers.Set("Authorization", fmt.Sprintf("Bearer %s", provider.APIKey))
 	default:
 		// 自定义 Header 名
 		headerName := strings.TrimSpace(provider.ConnectivityAuthType)
 		if headerName == "" || strings.EqualFold(headerName, "custom") {
 			headerName = "Authorization"
 		}
-		headers[headerName] = provider.APIKey
+		headers.Set(headerName, provider.APIKey)
 	}
 
-	if _, ok := headers["Accept"]; !ok {
-		headers["Accept"] = "application/json"
+	if headers.Get("Accept") == "" {
+		headers.Set("Accept", "application/json")
 	}
 	if isStream {
 		deleteHeaderCaseInsensitive(headers, "Accept")
 		deleteHeaderCaseInsensitive(headers, "Accept-Encoding")
 		deleteHeaderCaseInsensitive(headers, "Content-Encoding")
-		headers["Accept"] = "text/event-stream"
-		headers["Accept-Encoding"] = "identity"
+		headers.Set("Accept", "text/event-stream")
+		headers.Set("Accept-Encoding", "identity")
 	}
 
 	requestCtx, requestCancel := context.WithCancel(c.Request.Context())
+	guardStreamingResponse := prs.shouldUseResponseStreamGuard(c, kind, endpoint)
+	// A nested local relay request reaches the actual account pool in a second
+	// hop. Only that inner hop may cancel for a first-text timeout, otherwise
+	// the account key sees a client abort and cannot be blacklisted.
+	firstTextTimeoutOwnedByAttempt := guardStreamingResponse && !prs.isInternalRelayTarget(targetURL)
+	firstTextTimeout := time.Duration(0)
+	firstTextAttemptStartedAt := time.Time{}
+	var firstTextAttemptTimedOut atomic.Bool
+	requestAttemptCtx := requestCtx
+	cancelRequestAttempt := func() {}
+	stopFirstTextAttemptTimer := func() {}
+	startFirstTextAttempt := func(ctx context.Context) context.Context { return ctx }
 	if requestLog == nil {
 		requestLog = prs.startActiveRequestLog(c, kind, model, isStream)
 		defer prs.finishActiveRequestLog(requestLog)
 	}
 	requestLog.prepareProviderAttempt(c, kind, provider, model, isStream)
 	activeRequestID := requestLog.ActiveRequestID
-	cancelGeneration := defaultActiveRequestTracker.RegisterCancel(activeRequestID, requestCancel)
+	defer func() {
+		if errors.Is(err, errCodexFirstTextTimeout) {
+			prs.persistFirstTextTimeoutAttempt(requestLog)
+		}
+	}()
+	if firstTextTimeoutOwnedByAttempt {
+		firstTextTimeout = firstTextRetryTimeout(providerPoolFromContext(c.Request.Context()))
+		if firstTextTimeout > 0 {
+			startFirstTextAttempt = func(ctx context.Context) context.Context {
+				if !firstTextAttemptStartedAt.IsZero() {
+					return requestAttemptCtx
+				}
+				// Proxy selection and local listener preparation do not belong to a
+				// provider key. Start the deadline only when client.Do is about to send
+				// the first upstream HTTP request for this attempt.
+				firstTextAttemptStartedAt = time.Now()
+				requestLog.startedAt = firstTextAttemptStartedAt
+				defaultActiveRequestTracker.ResetAttemptStart(activeRequestID, requestLog, firstTextAttemptStartedAt)
+				requestAttemptCtx, cancelRequestAttempt = context.WithCancel(ctx)
+				timer := time.AfterFunc(firstTextTimeout, func() {
+					firstTextAttemptTimedOut.Store(true)
+					cancelRequestAttempt()
+				})
+				stopFirstTextAttemptTimer = func() {
+					timer.Stop()
+				}
+				return requestAttemptCtx
+			}
+		}
+	}
+	defer func() { cancelRequestAttempt() }()
+	cancelGeneration := defaultActiveRequestTracker.BeginAttempt(activeRequestID, requestLog, requestCancel)
 	defer func() {
 		retryRequested := defaultActiveRequestTracker.UnregisterCancel(activeRequestID, cancelGeneration)
 		requestCancel()
-		if retryRequested && !errors.Is(err, errActiveRequestRetryRequested) {
+		if retryRequested && !errors.Is(err, errActiveRequestRetryRequested) && !errors.Is(err, errCodexFirstTextTimeout) {
 			requestLog.markRetryRequested()
 			ok = false
 			err = errActiveRequestRetryRequested
 		}
 	}()
-	defaultActiveRequestTracker.Update(requestLog.ActiveRequestID, requestLog)
-
-	resp, err := prs.doProviderRequest(requestCtx, targetURL, headers, query, bodyBytes)
+	resp, err := prs.doProviderRequestWithAttemptStart(requestCtx, targetURL, headers, query, bodyBytes, startFirstTextAttempt)
+	stopFirstTextAttemptTimer()
+	if firstTextAttemptTimedOut.Load() {
+		if resp != nil && resp.RawResponse != nil && resp.RawResponse.Body != nil {
+			_ = resp.RawResponse.Body.Close()
+		}
+		requestLog.HttpCode = http.StatusGatewayTimeout
+		requestLog.ErrorMessage = firstTextTimeoutErrorBody
+		return false, errCodexFirstTextTimeout
+	}
 	if err != nil && defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
 		requestLog.markRetryRequested()
 		return false, errActiveRequestRetryRequested
@@ -1786,6 +2472,18 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 	}
 	requestLog.markUpstreamHeaders()
 	defaultActiveRequestTracker.Update(requestLog.ActiveRequestID, requestLog)
+	remainingFirstTextTimeout := time.Duration(0)
+	if firstTextTimeout > 0 && !firstTextAttemptStartedAt.IsZero() {
+		remainingFirstTextTimeout = firstTextTimeout - time.Since(firstTextAttemptStartedAt)
+		if remainingFirstTextTimeout <= 0 {
+			if resp != nil && resp.RawResponse != nil && resp.RawResponse.Body != nil {
+				_ = resp.RawResponse.Body.Close()
+			}
+			requestLog.HttpCode = http.StatusGatewayTimeout
+			requestLog.ErrorMessage = firstTextTimeoutErrorBody
+			return false, errCodexFirstTextTimeout
+		}
+	}
 
 	// 无论成功失败，先尝试记录 HttpCode
 	if resp != nil {
@@ -1798,9 +2496,21 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 			fmt.Printf("[INFO] Provider %s 响应存在但状态码为0，判定为客户端中断\n", provider.Name)
 			return false, fmt.Errorf("%w: %v", errClientAbort, err)
 		}
+		if resp != nil && isAccountPool(providerPoolFromContext(c.Request.Context())) && isRequestScopedUpstream4xx(resp.StatusCode()) {
+			clientErr, readErr := newUpstreamClientRequestError(resp, provider)
+			if readErr != nil {
+				return false, readErr
+			}
+			requestLog.ErrorMessage = summarizeBodyForError(string(clientErr.body), 1000)
+			return false, clientErr
+		}
 		// 尝试从响应体提取供应商原始错误信息
 		if resp != nil {
-			if upstreamBody := extractUpstreamError(resp); upstreamBody != "" {
+			upstreamBody, extractErr := extractUpstreamError(resp)
+			if extractErr != nil {
+				return false, extractErr
+			}
+			if upstreamBody != "" {
 				upstreamBody = redactProviderSecret(upstreamBody, provider)
 				requestLog.ErrorMessage = summarizeBodyForError(upstreamBody, 1000)
 				return false, fmt.Errorf("upstream status %d: %s", resp.StatusCode(), upstreamBody)
@@ -1822,10 +2532,22 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 			fmt.Printf("[INFO] Provider %s 响应错误但状态码为0，判定为客户端中断\n", provider.Name)
 			return false, fmt.Errorf("%w: %v", errClientAbort, resp.Error())
 		}
+		if isAccountPool(providerPoolFromContext(c.Request.Context())) && isRequestScopedUpstream4xx(status) {
+			clientErr, readErr := newUpstreamClientRequestError(resp, provider)
+			if readErr != nil {
+				return false, readErr
+			}
+			requestLog.ErrorMessage = summarizeBodyForError(string(clientErr.body), 1000)
+			return false, clientErr
+		}
 		// 优先使用 extractUpstreamError 提取完整错误（覆盖 SSE 空 body 场景）
 		errMsg := strings.TrimSpace(resp.Error().Error())
 		if errMsg == "" {
-			if upstreamBody := extractUpstreamError(resp); upstreamBody != "" {
+			upstreamBody, extractErr := extractUpstreamError(resp)
+			if extractErr != nil {
+				return false, extractErr
+			}
+			if upstreamBody != "" {
 				errMsg = upstreamBody
 			}
 		}
@@ -1843,10 +2565,25 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 		fmt.Printf("[WARN] Provider %s 返回状态码 0，但无错误，当作成功处理\n", provider.Name)
 		var copyErr error
 		if isStreamResponse(resp, isStream) {
-			if prs.shouldUseCodexStreamGuard(kind, endpoint) {
+			if prs.shouldUseResponseStreamGuard(c, kind, endpoint) {
 				var responseWritten bool
-				_, responseWritten, copyErr = writeCodexGuardedStreamingResponse(c.Writer, resp, requestLog, ReqeustLogHook(c, kind, requestLog))
-				if copyErr != nil && (errors.Is(copyErr, errCodexEmptyStream) || !responseWritten) {
+				_, responseWritten, copyErr = writeCodexGuardedStreamingResponseWithOptions(c.Writer, resp, requestLog, prs.responseStreamGuardOptions(c, provider, remainingFirstTextTimeout), ReqeustLogHook(c, kind, requestLog))
+				if firstTextAttemptTimedOut.Load() {
+					requestLog.HttpCode = http.StatusGatewayTimeout
+					requestLog.ErrorMessage = firstTextTimeoutErrorBody
+					return false, errCodexFirstTextTimeout
+				}
+				if errors.Is(copyErr, errCodexFirstTextTimeout) {
+					requestLog.HttpCode = http.StatusGatewayTimeout
+					requestLog.ErrorMessage = firstTextTimeoutErrorBody
+					return false, errCodexFirstTextTimeout
+				}
+				if copyErr != nil && (requestCtx.Err() != nil || c.Request.Context().Err() != nil || errors.Is(copyErr, context.Canceled)) {
+					requestLog.HttpCode = 499
+					requestLog.ErrorMessage = "client aborted"
+					return false, fmt.Errorf("%w: %v", errClientAbort, copyErr)
+				}
+				if copyErr != nil && (isCodexStreamPreflightRetryError(copyErr) || !responseWritten) {
 					if defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
 						requestLog.markRetryRequested()
 						return false, errActiveRequestRetryRequested
@@ -1881,8 +2618,13 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 
 		// 非流式：先读取响应体，解析 token 和内容，确认非空壳后再写给客户端
 		if !isStream && !isStreamResponse(resp, isStream) {
-			bodyData, readErr := readResponseBody(resp)
+			bodyData, readErr := readResponseBodyWithFirstTextTimeout(resp, remainingFirstTextTimeout)
 			if readErr != nil {
+				if errors.Is(readErr, errCodexFirstTextTimeout) {
+					requestLog.HttpCode = http.StatusGatewayTimeout
+					requestLog.ErrorMessage = firstTextTimeoutErrorBody
+					return false, errCodexFirstTextTimeout
+				}
 				if defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
 					requestLog.markRetryRequested()
 					return false, errActiveRequestRetryRequested
@@ -1933,6 +2675,9 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 				requestLog.markRetryRequested()
 				return false, errActiveRequestRetryRequested
 			}
+			if kind == "openai-responses" {
+				prs.commitAccountPoolStickyResponse(c, provider, gjson.GetBytes(finalBody, "id").String())
+			}
 			defaultActiveRequestTracker.MarkResponseStarted(requestLog.ActiveRequestID)
 			c.Writer.WriteHeader(status)
 			if _, writeErr := c.Writer.Write(finalBody); writeErr != nil {
@@ -1943,10 +2688,25 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 
 		var copyErr error
 		if isStreamResponse(resp, isStream) {
-			if prs.shouldUseCodexStreamGuard(kind, endpoint) {
+			if prs.shouldUseResponseStreamGuard(c, kind, endpoint) {
 				var responseWritten bool
-				_, responseWritten, copyErr = writeCodexGuardedStreamingResponse(c.Writer, resp, requestLog, ReqeustLogHook(c, kind, requestLog))
-				if copyErr != nil && (errors.Is(copyErr, errCodexEmptyStream) || !responseWritten) {
+				_, responseWritten, copyErr = writeCodexGuardedStreamingResponseWithOptions(c.Writer, resp, requestLog, prs.responseStreamGuardOptions(c, provider, remainingFirstTextTimeout), ReqeustLogHook(c, kind, requestLog))
+				if firstTextAttemptTimedOut.Load() {
+					requestLog.HttpCode = http.StatusGatewayTimeout
+					requestLog.ErrorMessage = firstTextTimeoutErrorBody
+					return false, errCodexFirstTextTimeout
+				}
+				if errors.Is(copyErr, errCodexFirstTextTimeout) {
+					requestLog.HttpCode = http.StatusGatewayTimeout
+					requestLog.ErrorMessage = firstTextTimeoutErrorBody
+					return false, errCodexFirstTextTimeout
+				}
+				if copyErr != nil && (requestCtx.Err() != nil || c.Request.Context().Err() != nil || errors.Is(copyErr, context.Canceled)) {
+					requestLog.HttpCode = 499
+					requestLog.ErrorMessage = "client aborted"
+					return false, fmt.Errorf("%w: %v", errClientAbort, copyErr)
+				}
+				if copyErr != nil && (isCodexStreamPreflightRetryError(copyErr) || !responseWritten) {
 					if defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
 						requestLog.markRetryRequested()
 						return false, errActiveRequestRetryRequested
@@ -1973,8 +2733,21 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 		return true, nil
 	}
 
+	if isAccountPool(providerPoolFromContext(c.Request.Context())) && isRequestScopedUpstream4xx(status) {
+		clientErr, readErr := newUpstreamClientRequestError(resp, provider)
+		if readErr != nil {
+			return false, readErr
+		}
+		requestLog.ErrorMessage = summarizeBodyForError(string(clientErr.body), 1000)
+		return false, clientErr
+	}
+
 	// 尝试从响应体提取供应商原始错误信息
-	if upstreamBody := extractUpstreamError(resp); upstreamBody != "" {
+	upstreamBody, extractErr := extractUpstreamError(resp)
+	if extractErr != nil {
+		return false, extractErr
+	}
+	if upstreamBody != "" {
 		requestLog.ErrorMessage = summarizeBodyForError(upstreamBody, 1000)
 		return false, fmt.Errorf("upstream status %d: %s", status, upstreamBody)
 	}
@@ -1982,16 +2755,39 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 	return false, fmt.Errorf("upstream status %d", status)
 }
 
-func (prs *ProviderRelayService) doProviderRequest(ctx context.Context, targetURL string, headers map[string]string, query map[string]string, bodyBytes []byte) (*xrequest.Response, error) {
-	client := prs.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
+func (prs *ProviderRelayService) doProviderRequest(ctx context.Context, targetURL string, headers http.Header, query url.Values, bodyBytes []byte) (*xrequest.Response, error) {
+	return prs.doProviderRequestWithAttemptStart(ctx, targetURL, headers, query, bodyBytes, nil)
+}
 
+func (prs *ProviderRelayService) doProviderRequestWithAttemptStart(
+	ctx context.Context,
+	targetURL string,
+	headers http.Header,
+	query url.Values,
+	bodyBytes []byte,
+	startAttempt func(context.Context) context.Context,
+) (*xrequest.Response, error) {
 	const maxAttempts = 2
 	var lastErr error
+	requestCtx := ctx
+	attemptStarted := false
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		req, err := newProviderHTTPRequest(ctx, targetURL, headers, query, bodyBytes)
+		client, endpoint, clientErr := prs.requestClient(requestCtx)
+		if clientErr != nil {
+			lastErr = clientErr
+			if proxyErr, ok := isProxyRequestError(clientErr); ok {
+				prs.proxyManager.InvalidateProxy(proxyErr.PoolKey, proxyErr.Node)
+			}
+			if _, ok := isProxyRequestError(clientErr); ok && attempt+1 < maxAttempts {
+				continue
+			}
+			return nil, clientErr
+		}
+		if !attemptStarted && startAttempt != nil {
+			requestCtx = startAttempt(requestCtx)
+			attemptStarted = true
+		}
+		req, err := newProviderHTTPRequest(requestCtx, targetURL, headers, query, bodyBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -2002,16 +2798,19 @@ func (prs *ProviderRelayService) doProviderRequest(ctx context.Context, targetUR
 				_ = resp.Body.Close()
 			}
 			lastErr = err
-			if attempt+1 < maxAttempts && waitBeforeProviderRetry(ctx) == nil {
+			if proxyErr, ok := isProxyRequestError(err); ok {
+				prs.proxyManager.InvalidateProxy(proxyErr.PoolKey, proxyErr.Node)
+			}
+			if attempt+1 < maxAttempts && waitBeforeProviderRetry(requestCtx) == nil {
 				continue
 			}
 			return nil, err
 		}
-
+		prs.recordResponsesCloudflareBlock(requestCtx, endpoint, targetURL, resp)
 		if resp != nil && resp.StatusCode >= http.StatusInternalServerError && attempt+1 < maxAttempts {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-			if waitBeforeProviderRetry(ctx) == nil {
+			if waitBeforeProviderRetry(requestCtx) == nil {
 				continue
 			}
 		}
@@ -2025,7 +2824,7 @@ func (prs *ProviderRelayService) doProviderRequest(ctx context.Context, targetUR
 	return nil, fmt.Errorf("provider request failed")
 }
 
-func newProviderHTTPRequest(ctx context.Context, targetURL string, headers map[string]string, query map[string]string, bodyBytes []byte) (*http.Request, error) {
+func newProviderHTTPRequest(ctx context.Context, targetURL string, headers http.Header, query url.Values, bodyBytes []byte) (*http.Request, error) {
 	requestURL, err := addQueryParams(targetURL, query)
 	if err != nil {
 		return nil, err
@@ -2036,16 +2835,20 @@ func newProviderHTTPRequest(ctx context.Context, targetURL string, headers map[s
 		return nil, err
 	}
 	req.ContentLength = int64(len(bodyBytes))
-	for key, value := range headers {
+	forwardHeaders := cloneHeaders(headers)
+	removeHopByHopHeaders(forwardHeaders)
+	for key, values := range forwardHeaders {
 		if strings.TrimSpace(key) == "" {
 			continue
 		}
-		req.Header.Set(key, value)
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
 	}
 	return req, nil
 }
 
-func addQueryParams(targetURL string, query map[string]string) (string, error) {
+func addQueryParams(targetURL string, query url.Values) (string, error) {
 	if len(query) == 0 {
 		return targetURL, nil
 	}
@@ -2054,14 +2857,37 @@ func addQueryParams(targetURL string, query map[string]string) (string, error) {
 		return "", err
 	}
 	values := parsed.Query()
-	for key, value := range query {
+	for key, valuesForKey := range query {
 		if strings.TrimSpace(key) == "" {
 			continue
 		}
-		values.Set(key, value)
+		values.Del(key)
+		for _, value := range valuesForKey {
+			values.Add(key, value)
+		}
 	}
 	parsed.RawQuery = values.Encode()
 	return parsed.String(), nil
+}
+
+func appendRawQuery(targetURL, rawQuery string) string {
+	if rawQuery == "" {
+		return targetURL
+	}
+	fragment := ""
+	if index := strings.IndexByte(targetURL, '#'); index >= 0 {
+		fragment = targetURL[index:]
+		targetURL = targetURL[:index]
+	}
+	separator := "?"
+	if strings.Contains(targetURL, "?") {
+		if strings.HasSuffix(targetURL, "?") || strings.HasSuffix(targetURL, "&") {
+			separator = ""
+		} else {
+			separator = "&"
+		}
+	}
+	return targetURL + separator + rawQuery + fragment
 }
 
 func waitBeforeProviderRetry(ctx context.Context) error {
@@ -2105,6 +2931,40 @@ func waitBeforeCodexEmptyStreamRetryForRequest(ctx context.Context, requestLog *
 	return waitErr
 }
 
+func isCodexStreamPreflightRetryError(err error) bool {
+	return errors.Is(err, errCodexEmptyStream) || errors.Is(err, errCodexFirstTextTimeout)
+}
+
+func codexStreamPreflightFailureReason(err error) string {
+	if errors.Is(err, errCodexFirstTextTimeout) {
+		return "HTTP 504 (first text timeout)"
+	}
+	return "codex empty stream"
+}
+
+func codexStreamPreflightFailureBody(err error) string {
+	if errors.Is(err, errCodexFirstTextTimeout) {
+		return firstTextTimeoutErrorBody
+	}
+	return ""
+}
+
+func (prs *ProviderRelayService) recordCodexStreamPreflightFailureForUser(userID, kind, poolID string, pool *ProviderPool, provider Provider, err error) bool {
+	reason := codexStreamPreflightFailureReason(err)
+	errorBody := codexStreamPreflightFailureBody(err)
+	statusCode := 0
+	if errors.Is(err, errCodexFirstTextTimeout) {
+		statusCode = http.StatusGatewayTimeout
+	}
+	matchedRule := specialBlacklistRuleForFailure(pool, statusCode, errorBody)
+	logBody := errorBody
+	if logBody == "" {
+		logBody = reason
+	}
+	prs.recordPoolAttemptError(userID, pool, provider, statusCode, matchedRule, logBody)
+	return prs.recordProviderFailureWithRuleForUser(userID, kind, poolID, pool, provider, reason, matchedRule)
+}
+
 func (prs *ProviderRelayService) retryCodexEmptyStreamSameProvider(
 	c *gin.Context,
 	kind string,
@@ -2112,36 +2972,41 @@ func (prs *ProviderRelayService) retryCodexEmptyStreamSameProvider(
 	pool *ProviderPool,
 	initialProvider Provider,
 	endpoint string,
-	query map[string]string,
-	clientHeaders map[string]string,
+	query url.Values,
+	clientHeaders http.Header,
 	originalBodyBytes []byte,
 	isStream bool,
 	requestedModel string,
 	requestLog *ReqeustLog,
+	initialErr error,
 ) (bool, Provider, error, int, time.Duration, bool) {
 	provider := initialProvider
 	attempts := 0
 	totalDuration := time.Duration(0)
 	userID := relayUserIDFromContext(c)
 
-	// 第一次空流已由 forwardRequest 检测到，计入失败
-	blacklisted := prs.recordProviderFailureForUser(userID, kind, poolID, pool, provider, "codex empty stream")
+	if c.Request.Context().Err() != nil {
+		return false, provider, fmt.Errorf("%w: %v", errClientAbort, c.Request.Context().Err()), attempts, totalDuration, false
+	}
+
+	// 第一次流预提交失败已由 forwardRequest 检测到，计入失败。
+	blacklisted := prs.recordCodexStreamPreflightFailureForUser(userID, kind, poolID, pool, provider, initialErr)
 	if blacklisted {
-		fmt.Printf("[INFO] Codex 空流保护: Provider %s 因空流被自动拉黑，停止同 provider 重试\n", provider.Name)
-		return false, provider, fmt.Errorf("provider %s blacklisted after empty stream", provider.Name), attempts, totalDuration, true
+		fmt.Printf("[INFO] Codex 流预提交保护: Provider %s 因首次输出超时或空流被自动拉黑，停止同 provider 重试\n", provider.Name)
+		return false, provider, fmt.Errorf("provider %s blacklisted after stream preflight failure", provider.Name), attempts, totalDuration, true
 	}
 
 	for {
 		if err := waitBeforeCodexEmptyStreamRetryForRequest(c.Request.Context(), requestLog); err != nil {
 			if errors.Is(err, errActiveRequestRetryRequested) {
-				return false, provider, err, attempts, totalDuration, false
+				return false, provider, err, attempts, totalDuration, true
 			}
-			return false, provider, fmt.Errorf("%w: %v", errClientAbort, err), attempts, totalDuration, false
+			return false, provider, fmt.Errorf("%w: %v", errClientAbort, err), attempts, totalDuration, true
 		}
 
 		nextProvider, ok, err := prs.selectCodexEmptyStreamRetryProviderForUser(userID, kind, poolID, provider.Name, requestedModel)
 		if err != nil {
-			return false, provider, err, attempts, totalDuration, false
+			return false, provider, err, attempts, totalDuration, true
 		}
 		if !ok {
 			fmt.Printf("[INFO] Codex 空流保护: Provider %s 当前不可用，继续等待恢复，不切换到其他 provider\n", provider.Name)
@@ -2154,7 +3019,7 @@ func (prs *ProviderRelayService) retryCodexEmptyStreamSameProvider(
 		if effectiveModel != requestedModel && requestedModel != "" {
 			modifiedBody, err := ReplaceModelInRequestBody(originalBodyBytes, effectiveModel)
 			if err != nil {
-				return false, provider, err, attempts, totalDuration, false
+				return false, provider, err, attempts, totalDuration, true
 			}
 			currentBodyBytes = modifiedBody
 		}
@@ -2176,13 +3041,13 @@ func (prs *ProviderRelayService) retryCodexEmptyStreamSameProvider(
 			prs.recordProviderSuccessForUser(userID, kind, poolID, provider)
 			return true, provider, nil, attempts, totalDuration, false
 		}
-		if errors.Is(requestErr, errCodexEmptyStream) {
-			fmt.Printf("[WARN] Codex 空流保护: Provider %s 仍返回空流，继续后台重试 | 耗时: %.2fs\n",
+		if isCodexStreamPreflightRetryError(requestErr) {
+			fmt.Printf("[WARN] Codex 流预提交保护: Provider %s 在首次输出前失败，继续后台重试 | 耗时: %.2fs\n",
 				provider.Name, duration.Seconds())
-			// 每次空流都计入失败
-			if prs.recordProviderFailureForUser(userID, kind, poolID, pool, provider, "codex empty stream") {
-				fmt.Printf("[INFO] Codex 空流保护: Provider %s 因连续空流被自动拉黑，停止同 provider 重试\n", provider.Name)
-				return false, provider, fmt.Errorf("provider %s blacklisted after repeated empty streams", provider.Name), attempts, totalDuration, true
+			// 每次首次输出前失败都计入 HTTP 失败次数。
+			if prs.recordCodexStreamPreflightFailureForUser(userID, kind, poolID, pool, provider, requestErr) {
+				fmt.Printf("[INFO] Codex 流预提交保护: Provider %s 因连续首次输出超时或空流被自动拉黑，停止同 provider 重试\n", provider.Name)
+				return false, provider, fmt.Errorf("provider %s blacklisted after repeated stream preflight failures", provider.Name), attempts, totalDuration, true
 			}
 			continue
 		}
@@ -2269,7 +3134,11 @@ func upstreamHTMLStreamError(resp *xrequest.Response) error {
 	if !strings.Contains(contentType, "text/html") {
 		return nil
 	}
-	body := summarizeBodyForError(extractUpstreamError(resp), 240)
+	rawBody, extractErr := extractUpstreamError(resp)
+	if extractErr != nil {
+		return extractErr
+	}
+	body := summarizeBodyForError(rawBody, 240)
 	if body == "" {
 		return fmt.Errorf("upstream returned HTML instead of SSE")
 	}
@@ -2360,6 +3229,7 @@ type codexStreamGuardState struct {
 	sawFailed        bool
 	sawIncomplete    bool
 	sawUsefulContent bool
+	responseID       string
 	inputTokens      int64
 	outputTokens     int64
 	cacheTokens      int64
@@ -2393,6 +3263,9 @@ func (s *codexStreamGuardState) observeLine(line []byte) {
 			s.sawUsefulContent = true
 		}
 	}
+	if responseID := strings.TrimSpace(gjson.Get(data, "response.id").String()); responseID != "" {
+		s.responseID = responseID
+	}
 
 	usage := gjson.Get(data, "response.usage")
 	if usage.Exists() {
@@ -2418,7 +3291,23 @@ func (s codexStreamGuardState) isEmptyFailure() bool {
 	return !s.sawUsefulContent && s.totalTokens() == 0
 }
 
+func (s codexStreamGuardState) completedSuccessfully() bool {
+	return s.sawCompleted && !s.sawFailed && !s.sawIncomplete && strings.TrimSpace(s.responseID) != ""
+}
+
+type codexStreamGuardOptions struct {
+	deferInitialKeepAlive        bool
+	disableKeepAliveUntilRelease bool
+	failOnTerminalBeforeWrite    bool
+	firstUsefulContentTimeout    time.Duration
+	onSuccessfulCompleted        func(responseID string)
+}
+
 func writeCodexGuardedStreamingResponse(w http.ResponseWriter, resp *xrequest.Response, requestLog *ReqeustLog, hooks ...xrequest.ResponseHook) (int64, bool, error) {
+	return writeCodexGuardedStreamingResponseWithOptions(w, resp, requestLog, codexStreamGuardOptions{}, hooks...)
+}
+
+func writeCodexGuardedStreamingResponseWithOptions(w http.ResponseWriter, resp *xrequest.Response, requestLog *ReqeustLog, options codexStreamGuardOptions, hooks ...xrequest.ResponseHook) (int64, bool, error) {
 	if resp == nil || resp.RawResponse == nil {
 		return 0, false, fmt.Errorf("empty upstream response")
 	}
@@ -2434,8 +3323,11 @@ func writeCodexGuardedStreamingResponse(w http.ResponseWriter, resp *xrequest.Re
 	var writeMu sync.Mutex
 	clientStarted := responseWriterWritten(w)
 	released := false
+	var preflightReleased atomic.Bool
+	var firstUsefulContentTimedOut atomic.Bool
 	totalBytes := int64(0)
 	state := codexStreamGuardState{}
+	completionCommitted := false
 	var initialBuffer bytes.Buffer
 
 	writeHeaderLocked := func() {
@@ -2475,6 +3367,7 @@ func writeCodexGuardedStreamingResponse(w http.ResponseWriter, resp *xrequest.Re
 	flushInitialBuffer := func() error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
+		preflightReleased.Store(true)
 		released = true
 		writeHeaderLocked()
 		if initialBuffer.Len() == 0 {
@@ -2486,6 +3379,23 @@ func writeCodexGuardedStreamingResponse(w http.ResponseWriter, resp *xrequest.Re
 		return err
 	}
 
+	var stopFirstUsefulContentTimer func()
+	if options.firstUsefulContentTimeout > 0 {
+		timer := time.AfterFunc(options.firstUsefulContentTimeout, func() {
+			if preflightReleased.Load() {
+				return
+			}
+			firstUsefulContentTimedOut.Store(true)
+			// Closing the upstream body unblocks a pending ReadBytes call, so this
+			// attempt can be retried before it emits any useful content.
+			_ = raw.Body.Close()
+		})
+		stopFirstUsefulContentTimer = func() {
+			timer.Stop()
+		}
+		defer stopFirstUsefulContentTimer()
+	}
+
 	writeStreamingLineLocked := func(line []byte) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
@@ -2494,52 +3404,87 @@ func writeCodexGuardedStreamingResponse(w http.ResponseWriter, resp *xrequest.Re
 		return err
 	}
 
-	if err := func() error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		return sendKeepAliveLocked()
-	}(); err != nil {
-		return totalBytes, clientStarted, err
+	if !options.deferInitialKeepAlive {
+		if err := func() error {
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			return sendKeepAliveLocked()
+		}(); err != nil {
+			return totalBytes, clientStarted, err
+		}
 	}
 
-	stopKeepAlive := make(chan struct{})
-	keepAliveStopped := make(chan struct{})
-	go func() {
-		defer close(keepAliveStopped)
-		ticker := time.NewTicker(codexStreamGuardKeepAliveInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				writeMu.Lock()
-				err := sendKeepAliveLocked()
-				writeMu.Unlock()
-				if err != nil {
-					fmt.Printf("[WARN] Codex 空流保护: SSE 保活写入失败: %v\n", err)
+	if !options.disableKeepAliveUntilRelease {
+		stopKeepAlive := make(chan struct{})
+		keepAliveStopped := make(chan struct{})
+		go func() {
+			defer close(keepAliveStopped)
+			ticker := time.NewTicker(codexStreamGuardKeepAliveInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					writeMu.Lock()
+					err := sendKeepAliveLocked()
+					writeMu.Unlock()
+					if err != nil {
+						fmt.Printf("[WARN] Codex 空流保护: SSE 保活写入失败: %v\n", err)
+						return
+					}
+				case <-stopKeepAlive:
 					return
 				}
-			case <-stopKeepAlive:
-				return
 			}
-		}
-	}()
-	defer func() {
-		close(stopKeepAlive)
-		<-keepAliveStopped
-	}()
+		}()
+		defer func() {
+			close(stopKeepAlive)
+			<-keepAliveStopped
+		}()
+	}
 
 	reader := bufio.NewReader(raw.Body)
 	for {
 		line, err := reader.ReadBytes('\n')
+		if firstUsefulContentTimedOut.Load() && !preflightReleased.Load() {
+			return totalBytes, clientStarted, errCodexFirstTextTimeout
+		}
 		if len(line) > 0 {
+			state.observeLine(line)
+			if !completionCommitted && state.completedSuccessfully() && options.onSuccessfulCompleted != nil {
+				// response.completed is the protocol's terminal success event. Commit
+				// its alias immediately so a continuation can arrive while the
+				// upstream keeps the SSE connection open after completion.
+				options.onSuccessfulCompleted(state.responseID)
+				completionCommitted = true
+			}
 			if released {
 				if writeErr := writeStreamingLineLocked(line); writeErr != nil {
 					return totalBytes, clientStarted, writeErr
 				}
 			} else {
 				initialBuffer.Write(line)
-				state.observeLine(line)
-				if state.shouldRelease() || initialBuffer.Len() >= codexStreamGuardMaxInitialBufferBytes {
+				terminalFailure := state.sawFailed || state.sawIncomplete
+				// Account pools must not commit an SSE response before a key has
+				// produced useful content or a completed response. If an upstream
+				// sends unbounded non-useful events, fail this key internally rather
+				// than flushing the preflight buffer and making failover impossible.
+				if options.failOnTerminalBeforeWrite && initialBuffer.Len() >= codexStreamGuardMaxInitialBufferBytes && !state.sawUsefulContent && !state.sawCompleted {
+					return totalBytes, clientStarted, errCodexInitialBufferLimit
+				}
+				canReleaseInitialBuffer := state.shouldRelease()
+				if options.firstUsefulContentTimeout > 0 && !state.sawUsefulContent {
+					// Input-token usage, response.created and other metadata are not
+					// a first output. Keep them buffered until text/function output,
+					// so they cannot disable the configured first-text timeout.
+					canReleaseInitialBuffer = state.sawCompleted
+				}
+				if options.firstUsefulContentTimeout > 0 && initialBuffer.Len() >= codexStreamGuardMaxInitialBufferBytes && !state.sawUsefulContent {
+					return totalBytes, clientStarted, errCodexFirstTextTimeout
+				}
+				if (!options.failOnTerminalBeforeWrite || !terminalFailure) && (canReleaseInitialBuffer || initialBuffer.Len() >= codexStreamGuardMaxInitialBufferBytes) {
+					if stopFirstUsefulContentTimer != nil && state.sawUsefulContent {
+						stopFirstUsefulContentTimer()
+					}
 					if writeErr := flushInitialBuffer(); writeErr != nil {
 						return totalBytes, clientStarted, writeErr
 					}
@@ -2548,8 +3493,14 @@ func writeCodexGuardedStreamingResponse(w http.ResponseWriter, resp *xrequest.Re
 		}
 
 		if err != nil {
+			if firstUsefulContentTimedOut.Load() && !preflightReleased.Load() {
+				return totalBytes, clientStarted, errCodexFirstTextTimeout
+			}
 			if err == io.EOF {
 				if !released {
+					if options.failOnTerminalBeforeWrite && (state.sawFailed || state.sawIncomplete) {
+						return totalBytes, clientStarted, errCodexTerminalStreamFailure
+					}
 					if state.isEmptyFailure() {
 						return totalBytes, clientStarted, errCodexEmptyStream
 					}
@@ -2638,9 +3589,7 @@ func writeStreamingLine(w http.ResponseWriter, line []byte, requestLog *ReqeustL
 
 func copyStreamingResponseHeaders(dst, src http.Header) {
 	for key, values := range src {
-		switch strings.ToLower(key) {
-		case "content-length", "content-encoding", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-			"te", "trailer", "transfer-encoding", "upgrade":
+		if isHopByHopHeader(key, src) || strings.EqualFold(key, "content-length") || strings.EqualFold(key, "content-encoding") {
 			continue
 		}
 		for _, value := range values {
@@ -2681,13 +3630,18 @@ func writeOpenAIChatJSONResponse(w http.ResponseWriter, resp *xrequest.Response,
 		return fmt.Errorf("empty upstream response")
 	}
 
-	body := resp.Bytes()
+	if resp.RawResponse.Body == nil {
+		return fmt.Errorf("empty upstream response body")
+	}
+	defer resp.RawResponse.Body.Close()
+	body, err := io.ReadAll(resp.RawResponse.Body)
+	if err != nil {
+		return err
+	}
 	OpenAIChatParseTokenUsageFromResponse(string(body), requestLog)
 
 	for key, values := range resp.Headers() {
-		lowerKey := strings.ToLower(key)
-		switch lowerKey {
-		case "content-length", "content-encoding", "transfer-encoding", "connection":
+		if isHopByHopHeader(key, resp.Headers()) || strings.EqualFold(key, "content-length") || strings.EqualFold(key, "content-encoding") {
 			continue
 		}
 		for _, value := range values {
@@ -2708,86 +3662,119 @@ func writeOpenAIChatJSONResponse(w http.ResponseWriter, resp *xrequest.Response,
 	}
 	w.WriteHeader(status)
 
-	_, err := w.Write(body)
+	_, err = w.Write(body)
 	return err
 }
 
 // extractUpstreamError 从供应商响应中提取原始错误信息（最多 512 字节）
-func extractUpstreamError(resp *xrequest.Response) string {
-	if resp == nil {
-		return ""
+func extractUpstreamError(resp *xrequest.Response) (string, error) {
+	if resp == nil || resp.RawResponse == nil || resp.RawResponse.Body == nil {
+		return "", nil
 	}
-	// 优先尝试 String()（会自动解压 gzip 等）
-	body := resp.String()
-	// SSE 流式响应时 String() 返回空，回退到直接读取 RawResponse.Body（带超时防御）
-	if body == "" && resp.RawResponse != nil && resp.RawResponse.Body != nil {
-		done := make(chan []byte, 1)
-		go func() {
-			raw, err := io.ReadAll(io.LimitReader(resp.RawResponse.Body, 512))
-			if err == nil {
-				done <- raw
-			} else {
-				done <- nil
-			}
-		}()
-		select {
-		case raw := <-done:
-			if raw != nil {
-				body = string(raw)
-			}
-		case <-time.After(500 * time.Millisecond):
-			// 超时放弃，关闭 Body 中断后台读取，避免 goroutine 泄漏
-			resp.RawResponse.Body.Close()
+	defer resp.RawResponse.Body.Close()
+	type readResult struct {
+		raw []byte
+		err error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		raw, err := io.ReadAll(io.LimitReader(resp.RawResponse.Body, 513))
+		done <- readResult{raw: raw, err: err}
+	}()
+	timer := time.NewTimer(500 * time.Millisecond)
+	defer timer.Stop()
+	var body string
+	select {
+	case read := <-done:
+		if read.err != nil {
+			return "", read.err
 		}
+		body = string(read.raw)
+	case <-timer.C:
+		// Closing the body interrupts the background read on net/http bodies.
+		_ = resp.RawResponse.Body.Close()
+		return "", errors.New("读取供应商错误响应超时")
 	}
 	if body == "" {
-		return ""
+		return "", nil
 	}
 	// 截断过长的错误信息
 	if len(body) > 512 {
 		body = body[:512] + "..."
 	}
-	return body
+	return body, nil
 }
 
-func cloneHeaders(header http.Header) map[string]string {
-	cloned := make(map[string]string, len(header))
+func cloneHeaders(header http.Header) http.Header {
+	cloned := make(http.Header, len(header))
 	for key, values := range header {
-		if len(values) > 0 {
-			cloned[key] = values[len(values)-1]
-		}
+		cloned[key] = append([]string(nil), values...)
 	}
 	return cloned
 }
 
-func deleteHeaderCaseInsensitive(headers map[string]string, target string) {
-	for key := range headers {
-		if strings.EqualFold(key, target) {
-			delete(headers, key)
+func removeHopByHopHeaders(headers http.Header) {
+	if headers == nil {
+		return
+	}
+	for _, value := range headers.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			deleteHeaderCaseInsensitive(headers, strings.TrimSpace(token))
+		}
+	}
+	for _, key := range []string{
+		"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Proxy-Connection", "TE", "Trailer", "Transfer-Encoding", "Upgrade",
+	} {
+		deleteHeaderCaseInsensitive(headers, key)
+	}
+}
+
+func isHopByHopHeader(key string, headers http.Header) bool {
+	if strings.EqualFold(key, "Connection") {
+		return true
+	}
+	for _, value := range headers.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), key) {
+				return true
+			}
+		}
+	}
+	switch strings.ToLower(key) {
+	case "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func deleteHeaderCaseInsensitive(headers any, target string) {
+	switch typed := headers.(type) {
+	case http.Header:
+		for key := range typed {
+			if strings.EqualFold(key, target) {
+				delete(typed, key)
+			}
+		}
+	case map[string]string:
+		for key := range typed {
+			if strings.EqualFold(key, target) {
+				delete(typed, key)
+			}
 		}
 	}
 }
 
-func removeInboundAuthHeaders(headers map[string]string) {
+func removeInboundAuthHeaders(headers any) {
 	deleteHeaderCaseInsensitive(headers, "authorization")
 	deleteHeaderCaseInsensitive(headers, "x-api-key")
 	deleteHeaderCaseInsensitive(headers, codexRelayKeyHeader)
 }
 
-func cloneMap(m map[string]string) map[string]string {
-	cloned := make(map[string]string, len(m))
-	for k, v := range m {
-		cloned[k] = v
-	}
-	return cloned
-}
-
-func flattenQuery(values map[string][]string) map[string]string {
-	query := make(map[string]string, len(values))
+func flattenQuery(values url.Values) url.Values {
+	query := make(url.Values, len(values))
 	for key, items := range values {
-		if len(items) > 0 {
-			query[key] = items[len(items)-1]
-		}
+		query[key] = append([]string(nil), items...)
 	}
 	return query
 }
@@ -2848,6 +3835,7 @@ func ensureRequestLogTableWithDB(db *sql.DB) error {
 		first_event_sec REAL DEFAULT 0,
 		first_text_sec REAL DEFAULT 0,
 		error_message TEXT,
+		exclude_from_total INTEGER DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`
 
@@ -2886,6 +3874,9 @@ func ensureRequestLogTableWithDB(db *sql.DB) error {
 		return err
 	}
 	if err := ensureRequestLogColumn(db, "error_message", "TEXT"); err != nil {
+		return err
+	}
+	if err := ensureRequestLogColumn(db, "exclude_from_total", "INTEGER DEFAULT 0"); err != nil {
 		return err
 	}
 
@@ -2987,6 +3978,7 @@ type ReqeustLog struct {
 	CacheCreateTokens           int     `json:"cache_create_tokens"`
 	CacheReadTokens             int     `json:"cache_read_tokens"`
 	ReasoningTokens             int     `json:"reasoning_tokens"`
+	ExcludeFromTotalTraffic     bool    `json:"exclude_from_total"`
 	IsStream                    bool    `json:"is_stream"`
 	DurationSec                 float64 `json:"duration_sec"`
 	FirstTokenDurationSec       float64 `json:"first_token_duration_sec"`
@@ -3004,6 +3996,7 @@ type ReqeustLog struct {
 	QueueKey                    string  `json:"-"`
 	startedAt                   time.Time
 	inputTokensIncludeCacheRead bool
+	attemptPersisted            bool
 }
 
 func (r *ReqeustLog) elapsedSinceStart() float64 {
@@ -3060,13 +4053,34 @@ func readResponseBody(resp *xrequest.Response) ([]byte, error) {
 	return data, nil
 }
 
+// readResponseBodyWithFirstTextTimeout treats a delayed non-streaming response
+// body as a first-text timeout too. This also covers upstreams that return SSE
+// despite the client omitting the optional stream field.
+func readResponseBodyWithFirstTextTimeout(resp *xrequest.Response, timeout time.Duration) ([]byte, error) {
+	if timeout <= 0 || resp == nil || resp.RawResponse == nil || resp.RawResponse.Body == nil {
+		return readResponseBody(resp)
+	}
+
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(timeout, func() {
+		timedOut.Store(true)
+		_ = resp.RawResponse.Body.Close()
+	})
+	body, err := readResponseBody(resp)
+	if !timer.Stop() && timedOut.Load() {
+		return nil, errCodexFirstTextTimeout
+	}
+	if timedOut.Load() {
+		return nil, errCodexFirstTextTimeout
+	}
+	return body, err
+}
+
 // copyResponseHeaders copies upstream response headers to the client writer,
 // filtering out hop-by-hop and content-length headers.
 func copyResponseHeaders(w http.ResponseWriter, upstream http.Header) {
 	for key, values := range upstream {
-		lowerKey := strings.ToLower(key)
-		switch lowerKey {
-		case "content-length", "content-encoding", "transfer-encoding", "connection":
+		if isHopByHopHeader(key, upstream) || strings.EqualFold(key, "content-length") || strings.EqualFold(key, "content-encoding") {
 			continue
 		}
 		for _, value := range values {
@@ -3584,8 +4598,11 @@ func writeModelsProviderResponse(c *gin.Context, response *modelsProviderRespons
 		return
 	}
 	for key, values := range response.header {
+		if isHopByHopHeader(key, response.header) || strings.EqualFold(key, "Content-Length") {
+			continue
+		}
 		for _, value := range values {
-			c.Header(key, value)
+			c.Writer.Header().Add(key, value)
 		}
 	}
 	c.Data(response.statusCode, response.contentType, response.body)
@@ -3601,52 +4618,71 @@ func (prs *ProviderRelayService) fetchModelsFromProvider(
 		endpoint = "/v1/models"
 	}
 	targetURL := joinURL(provider.APIURL, endpoint)
-
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, targetURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
+	targetURL = appendRawQuery(targetURL, c.Request.URL.RawQuery)
 
 	headers := cloneHeaders(c.Request.Header)
 	removeInboundAuthHeaders(headers)
-	for key, value := range headers {
-		if strings.TrimSpace(key) == "" {
-			continue
-		}
-		req.Header.Set(key, value)
-	}
+	removeHopByHopHeaders(headers)
+	deleteHeaderCaseInsensitive(headers, "Accept-Encoding")
 
 	authType := strings.ToLower(strings.TrimSpace(provider.ConnectivityAuthType))
 	switch authType {
 	case "x-api-key":
-		req.Header.Set("x-api-key", provider.APIKey)
-		req.Header.Set("anthropic-version", "2023-06-01")
+		headers.Set("x-api-key", provider.APIKey)
+		headers.Set("anthropic-version", "2023-06-01")
 	case "", "bearer":
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", provider.APIKey))
+		headers.Set("Authorization", fmt.Sprintf("Bearer %s", provider.APIKey))
 	default:
 		headerName := strings.TrimSpace(provider.ConnectivityAuthType)
 		if headerName == "" || strings.EqualFold(headerName, "custom") {
 			headerName = "Authorization"
 		}
-		req.Header.Set(headerName, provider.APIKey)
+		headers.Set(headerName, provider.APIKey)
 	}
 
-	if req.Header.Get("Accept") == "" {
-		req.Header.Set("Accept", "application/json")
+	if headers.Get("Accept") == "" {
+		headers.Set("Accept", "application/json")
 	}
+	headers.Set("Accept-Encoding", "identity")
 
-	client := prs.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
+	var (
+		resp *http.Response
+		err  error
+	)
+	for attempt := 0; attempt < 2; attempt++ {
+		req, requestErr := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, targetURL, nil)
+		if requestErr != nil {
+			return nil, fmt.Errorf("failed to create request: %w", requestErr)
+		}
+		req.Header = cloneHeaders(headers)
+		client, _, clientErr := prs.requestClient(c.Request.Context())
+		if clientErr != nil {
+			if proxyErr, ok := isProxyRequestError(clientErr); ok {
+				prs.proxyManager.InvalidateProxy(proxyErr.PoolKey, proxyErr.Node)
+			}
+			if attempt == 0 {
+				continue
+			}
+			return nil, clientErr
+		}
+		resp, err = client.Do(req)
+		if err == nil {
+			break
+		}
+		if proxyErr, ok := isProxyRequestError(err); ok {
+			prs.proxyManager.InvalidateProxy(proxyErr.PoolKey, proxyErr.Node)
+			if attempt == 0 {
+				continue
+			}
+		}
 		if c.Request.Context().Err() != nil || errors.Is(err, context.Canceled) {
 			return nil, fmt.Errorf("%w: %v", errClientAbort, err)
 		}
 		fmt.Printf("[%s] ✗ 请求失败: %s | 错误: %v\n", logPrefix, provider.Name, err)
 		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	if resp == nil {
+		return nil, errors.New("request failed without a response")
 	}
 	defer resp.Body.Close()
 
@@ -3746,93 +4782,156 @@ func (prs *ProviderRelayService) forwardModelsRequest(
 	var lastErr error
 	var sawAllBlacklisted bool
 	var sawPoolResolved bool
+	var sawAccountPoolFailure bool
+	var sawAccountPoolUnavailable bool
+	var modelsStickyRequests []*accountPoolStickyRequest
+	defer func() {
+		for _, request := range modelsStickyRequests {
+			prs.accountPoolStickyStore().abort(request)
+		}
+	}()
 
+candidateLoop:
 	for _, candidate := range candidates {
-		plan, poolResolved, selectErr := prs.buildProviderAttemptPlan(c, candidate, "")
-		if selectErr != nil {
-			lastErr = selectErr
-			if poolResolved {
-				sawPoolResolved = true
-			}
-			fmt.Printf("[%s][WARN] 跳过 %s 模型列表池: %v\n", logPrefix, candidate, selectErr)
-			continue
-		}
-		sawPoolResolved = true
-		if len(plan.active) == 0 {
-			if plan.allBlacklisted {
-				sawAllBlacklisted = true
-				lastErr = fmt.Errorf("池子 %s 内所有 provider 均在临时拉黑期", plan.pool.Name)
-				fmt.Printf("[%s][WARN] %s\n", logPrefix, lastErr)
-				continue
-			}
-			lastErr = fmt.Errorf("no providers available in pool %s/%s", candidate, plan.pool.Name)
-			fmt.Printf("[%s][WARN] %s\n", logPrefix, lastErr)
-			continue
-		}
-
-		providers := providersFromAttemptPlan(plan)
-		for i, provider := range providers {
-			fmt.Printf("[%s] 使用 Provider: %s | Platform: %s | Pool: %s | URL: %s\n",
-				logPrefix, provider.Name, candidate, plan.pool.Name, provider.APIURL)
-
-			response, fetchErr := prs.fetchModelsFromProvider(c, provider, logPrefix)
-			if fetchErr == nil && response != nil && response.statusCode >= http.StatusOK && response.statusCode < http.StatusMultipleChoices {
-				fmt.Printf("[%s] ✓ 成功: %s | HTTP %d\n", logPrefix, provider.Name, response.statusCode)
-				prs.recordProviderSuccessForUser(plan.userID, candidate, plan.poolID, provider)
-				writeModelsProviderResponse(c, response)
-				return nil
-			}
-
-			if fetchErr == nil && response != nil {
-				redactedBody := redactProviderSecret(string(response.body), provider)
-				if redactedBody != string(response.body) {
-					response.body = []byte(redactedBody)
-					response.header.Del("Content-Length")
+		var accountStickyRequest *accountPoolStickyRequest
+		for {
+			plan, poolResolved, selectErr := prs.buildProviderAttemptPlan(c, candidate, "")
+			if selectErr != nil {
+				lastErr = selectErr
+				if poolResolved {
+					sawPoolResolved = true
 				}
-				for headerName, values := range response.header {
-					for valueIndex, value := range values {
-						values[valueIndex] = redactProviderSecret(value, provider)
+				fmt.Printf("[%s][WARN] 跳过 %s 模型列表池: %v\n", logPrefix, candidate, selectErr)
+				continue candidateLoop
+			}
+			sawPoolResolved = true
+			accountPool := isAccountPool(plan.pool)
+			if accountPool {
+				if accountStickyRequest == nil {
+					accountStickyRequest = prs.beginAccountPoolStickyRequest(c, plan, nil)
+					if accountStickyRequest != nil {
+						modelsStickyRequests = append(modelsStickyRequests, accountStickyRequest)
 					}
-					response.header[headerName] = values
 				}
-				bodySummary := summarizeBodyForError(redactedBody, 1000)
-				fetchErr = fmt.Errorf("upstream status %d: %s", response.statusCode, bodySummary)
+				prs.reorderAccountPoolAttemptPlan(plan, accountStickyRequest)
 			}
-			if fetchErr == nil {
-				fetchErr = fmt.Errorf("empty models response")
+			c.Request = c.Request.WithContext(withProviderPoolContext(c.Request.Context(), plan.pool, plan.userID))
+			if len(plan.active) == 0 {
+				if accountPool {
+					sawAccountPoolUnavailable = true
+				}
+				if plan.allBlacklisted {
+					sawAllBlacklisted = true
+					lastErr = fmt.Errorf("池子 %s 内所有 provider 均在临时拉黑期", plan.pool.Name)
+					fmt.Printf("[%s][WARN] %s\n", logPrefix, lastErr)
+					continue candidateLoop
+				}
+				lastErr = fmt.Errorf("no providers available in pool %s/%s", candidate, plan.pool.Name)
+				fmt.Printf("[%s][WARN] %s\n", logPrefix, lastErr)
+				continue candidateLoop
 			}
-			if errors.Is(fetchErr, errClientAbort) {
-				return fetchErr
-			}
-			redactedFetchError := redactProviderSecret(fetchErr.Error(), provider)
-			if redactedFetchError != fetchErr.Error() {
-				fetchErr = errors.New(redactedFetchError)
-			}
-			lastErr = fetchErr
-			fmt.Printf("[%s][WARN] Provider %s 模型列表失败: %v\n", logPrefix, provider.Name, fetchErr)
 
-			blacklistedAfterFailure := prs.recordProviderFailureForUser(plan.userID, candidate, plan.poolID, plan.pool, provider, fetchErr.Error())
-			if !blacklistedAfterFailure {
-				if response != nil {
+			providers := providersFromAttemptPlan(plan)
+			retryStrictAccountSelection := false
+			for i, provider := range providers {
+				fmt.Printf("[%s] 使用 Provider: %s | Platform: %s | Pool: %s | URL: %s\n",
+					logPrefix, provider.Name, candidate, plan.pool.Name, provider.APIURL)
+
+				response, fetchErr := prs.fetchModelsFromProvider(c, provider, logPrefix)
+				if fetchErr == nil && response != nil && response.statusCode >= http.StatusOK && response.statusCode < http.StatusMultipleChoices {
+					fmt.Printf("[%s] ✓ 成功: %s | HTTP %d\n", logPrefix, provider.Name, response.statusCode)
+					prs.recordProviderSuccessForUser(plan.userID, candidate, plan.poolID, provider)
 					writeModelsProviderResponse(c, response)
+					return nil
+				}
+
+				if fetchErr == nil && response != nil {
+					redactedBody := redactProviderSecret(string(response.body), provider)
+					if redactedBody != string(response.body) {
+						response.body = []byte(redactedBody)
+						response.header.Del("Content-Length")
+					}
+					for headerName, values := range response.header {
+						for valueIndex, value := range values {
+							values[valueIndex] = redactProviderSecret(value, provider)
+						}
+						response.header[headerName] = values
+					}
+					if accountPool && isRequestScopedUpstream4xx(response.statusCode) {
+						// This status describes the caller's request, not this account
+						// key. Do not fail over or add an account-pool penalty.
+						response.header = clientErrorResponseHeaders(response.header)
+						writeModelsProviderResponse(c, response)
+						return nil
+					}
+					bodySummary := summarizeBodyForError(redactedBody, 1000)
+					fetchErr = fmt.Errorf("upstream status %d: %s", response.statusCode, bodySummary)
+				}
+				if fetchErr == nil {
+					fetchErr = fmt.Errorf("empty models response")
+				}
+				if errors.Is(fetchErr, errClientAbort) {
 					return fetchErr
 				}
-				c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("请求失败: %v", fetchErr)})
-				return fetchErr
-			}
+				redactedFetchError := redactProviderSecret(fetchErr.Error(), provider)
+				if redactedFetchError != fetchErr.Error() {
+					fetchErr = errors.New(redactedFetchError)
+				}
+				lastErr = fetchErr
+				if accountPool {
+					sawAccountPoolFailure = true
+				}
+				fmt.Printf("[%s][WARN] Provider %s 模型列表失败: %v\n", logPrefix, provider.Name, fetchErr)
+				if proxyErr, proxyFailure := isProxyRequestError(fetchErr); proxyFailure {
+					if prs.proxyManager != nil {
+						prs.proxyManager.InvalidateProxy(proxyErr.PoolKey, proxyErr.Node)
+					}
+					c.JSON(http.StatusBadGateway, gin.H{"error": "代理连接失败，请稍后重试"})
+					return fetchErr
+				}
 
-			if prs.notificationService != nil && i+1 < len(providers) {
-				prs.notificationService.NotifyProviderSwitch(SwitchNotification{
-					UserID:       plan.userID,
-					FromProvider: provider.Name,
-					ToProvider:   providers[i+1].Name,
-					Reason:       fetchErr.Error(),
-					Platform:     candidate,
-				})
+				blacklistedAfterFailure := prs.recordProviderFailureForUser(plan.userID, candidate, plan.poolID, plan.pool, provider, fetchErr.Error())
+				if accountPool && accountStickyRequest != nil && accountStickyRequest.providerID != 0 {
+					// Rebuild after every account-key failure. The provisional binding
+					// keeps A selected while it remains usable; blacklist/deletion lets
+					// order() select the next key in a fresh plan.
+					retryStrictAccountSelection = true
+					break
+				}
+				if !blacklistedAfterFailure {
+					if response != nil {
+						writeModelsProviderResponse(c, response)
+						return fetchErr
+					}
+					c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("请求失败: %v", fetchErr)})
+					return fetchErr
+				}
+
+				if prs.notificationService != nil && i+1 < len(providers) {
+					prs.notificationService.NotifyProviderSwitch(SwitchNotification{
+						UserID:       plan.userID,
+						FromProvider: provider.Name,
+						ToProvider:   providers[i+1].Name,
+						Reason:       fetchErr.Error(),
+						Platform:     candidate,
+					})
+				}
 			}
+			if retryStrictAccountSelection {
+				continue
+			}
+			continue candidateLoop
 		}
 	}
 
+	if sawAccountPoolFailure {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "号池中所有可用账号均请求失败，请稍后重试"})
+		return lastErr
+	}
+	if sawAccountPoolUnavailable {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "号池暂无可用账号，请稍后重试"})
+		return lastErr
+	}
 	if sawAllBlacklisted {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "所有可用于 /v1/models 的 provider 均在临时拉黑期"})
 		return lastErr

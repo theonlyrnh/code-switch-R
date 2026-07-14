@@ -106,6 +106,58 @@ func TestActiveRequestTrackerListFiltersAndFinishes(t *testing.T) {
 	}
 }
 
+func TestActiveRequestTrackerBeginAttemptResetsVisibleDuration(t *testing.T) {
+	tracker := newActiveRequestTracker()
+	requestStartedAt := time.Now().Add(-30 * time.Second)
+	requestLog := &ReqeustLog{
+		UserID:    "user-a",
+		Platform:  "openai-responses",
+		Provider:  "key-a",
+		Model:     "gpt-5",
+		startedAt: requestStartedAt,
+	}
+	id := tracker.Start(requestLog, requestStartedAt)
+
+	attemptStartedAt := time.Now()
+	requestLog.startedAt = attemptStartedAt
+	requestLog.Provider = "key-b"
+	tracker.BeginAttempt(id, requestLog, func() {})
+
+	logs := tracker.List("openai-responses", "", "user-a")
+	if len(logs) != 1 {
+		t.Fatalf("active logs = %+v, want one fresh attempt", logs)
+	}
+	if logs[0].Provider != "key-b" || logs[0].DurationSec < 0 || logs[0].DurationSec >= time.Second.Seconds() {
+		t.Fatalf("fresh attempt log = %+v, want key-b duration below one second", logs[0])
+	}
+}
+
+func TestActiveRequestTrackerTimeoutTransitionDropsOldKeyAndResetsDuration(t *testing.T) {
+	tracker := newActiveRequestTracker()
+	startedAt := time.Now().Add(-5 * time.Second)
+	requestLog := &ReqeustLog{
+		UserID:       "user-a",
+		Platform:     "openai-responses",
+		Provider:     "timed-out-key",
+		Model:        "gpt-5",
+		HttpCode:     504,
+		ErrorMessage: firstTextTimeoutErrorBody,
+	}
+	id := tracker.Start(requestLog, startedAt)
+	tracker.MarkAttemptTransition(id, time.Now())
+
+	logs := tracker.List("openai-responses", "", "user-a")
+	if len(logs) != 1 {
+		t.Fatalf("transition logs = %+v, want one", logs)
+	}
+	if logs[0].Provider != "" || logs[0].Status != requestLogStatusRetrying || logs[0].HttpCode != 0 {
+		t.Fatalf("transition log = %+v, want provider-free retrying row", logs[0])
+	}
+	if logs[0].DurationSec < 0 || logs[0].DurationSec >= time.Second.Seconds() {
+		t.Fatalf("transition duration = %.3fs, want below one second", logs[0].DurationSec)
+	}
+}
+
 func TestActiveRequestTrackerRetryCancelsAndMarksLog(t *testing.T) {
 	tracker := newActiveRequestTracker()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -146,6 +198,36 @@ func TestActiveRequestTrackerRetryIsIdempotentForCurrentAttempt(t *testing.T) {
 	}
 	if cancelCalls != 1 {
 		t.Fatalf("cancel calls = %d, want one for repeated retry", cancelCalls)
+	}
+}
+
+func TestActiveRequestTrackerBeginAttemptInstallsRetryStateAtomically(t *testing.T) {
+	tracker := newActiveRequestTracker()
+	activeID := tracker.Start(&ReqeustLog{UserID: "user-a", Provider: "provider-a"}, time.Now())
+
+	firstCancelCalls := 0
+	if generation := tracker.BeginAttempt(activeID, &ReqeustLog{UserID: "user-a", Provider: "provider-a"}, func() { firstCancelCalls++ }); generation == 0 {
+		t.Fatal("first attempt generation = 0")
+	}
+	if result := tracker.Retry(-activeID, "user-a"); result.Status != activeRequestRetryTriggered {
+		t.Fatalf("first retry status = %q, want %q", result.Status, activeRequestRetryTriggered)
+	}
+	if firstCancelCalls != 1 {
+		t.Fatalf("first cancel calls = %d, want 1", firstCancelCalls)
+	}
+
+	secondCancelCalls := 0
+	if generation := tracker.BeginAttempt(activeID, &ReqeustLog{UserID: "user-a", Provider: "provider-a"}, func() { secondCancelCalls++ }); generation == 0 {
+		t.Fatal("second attempt generation = 0")
+	}
+	if tracker.IsRetryRequested(activeID) {
+		t.Fatal("new attempt retained a completed retry request")
+	}
+	if result := tracker.Retry(-activeID, "user-a"); result.Status != activeRequestRetryTriggered {
+		t.Fatalf("second retry status = %q, want %q", result.Status, activeRequestRetryTriggered)
+	}
+	if secondCancelCalls != 1 {
+		t.Fatalf("second cancel calls = %d, want 1", secondCancelCalls)
 	}
 }
 
@@ -248,8 +330,8 @@ func TestActiveRequestTrackerRetryIgnoresFinishedFirstTextAndWrongUser(t *testin
 	startedID := tracker.Start(&ReqeustLog{UserID: "user-a"}, time.Now())
 	tracker.MarkResponseStarted(startedID)
 	tracker.RegisterCancel(startedID, func() {})
-	if result := tracker.Retry(-startedID, "user-a"); result.Status != activeRequestRetryTriggered {
-		t.Fatalf("response-started retry status = %q, want %q", result.Status, activeRequestRetryTriggered)
+	if result := tracker.Retry(-startedID, "user-a"); result.Status != activeRequestRetryIgnoredResponseStarted {
+		t.Fatalf("response-started retry status = %q, want %q", result.Status, activeRequestRetryIgnoredResponseStarted)
 	}
 
 	firstTextID := tracker.Start(&ReqeustLog{

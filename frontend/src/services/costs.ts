@@ -23,6 +23,7 @@ export type CostPrice = {
 
 export type CostSettings = {
   provider_multipliers: Record<string, number>
+  model_prices: Record<string, CostPrice>
   model_price_overrides: Record<string, CostPrice>
 }
 
@@ -36,6 +37,7 @@ export type DefaultModelPrice = CostPrice & {
 
 export const defaultCostSettings = (): CostSettings => ({
   provider_multipliers: {},
+  model_prices: {},
   model_price_overrides: {},
 })
 
@@ -59,6 +61,7 @@ export const fetchCostSettings = async (): Promise<CostSettings> => {
     ...defaultCostSettings(),
     ...settings,
     provider_multipliers: settings?.provider_multipliers ?? {},
+    model_prices: settings?.model_prices ?? {},
     model_price_overrides: settings?.model_price_overrides ?? {},
   }
 }

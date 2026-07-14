@@ -124,6 +124,100 @@ func (t *activeRequestTracker) RegisterCancel(id int64, cancel context.CancelFun
 	return generation
 }
 
+// BeginAttempt makes a new upstream attempt retryable only after its state and
+// cancellation function have been installed together. Keeping this transition
+// under one lock prevents the Logs retry action from observing a processing
+// request that has no cancellation function yet.
+func (t *activeRequestTracker) BeginAttempt(id int64, logEntry *ReqeustLog, cancel context.CancelFunc) uint64 {
+	if t == nil || id == 0 || logEntry == nil || cancel == nil {
+		return 0
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	existing, ok := t.requests[id]
+	if !ok {
+		return 0
+	}
+	attemptStartedAt := logEntry.startedAt
+	if attemptStartedAt.IsZero() {
+		attemptStartedAt = existing.startedAt
+	}
+	next := snapshotActiveRequest(id, logEntry, attemptStartedAt)
+	next.cancelGeneration = existing.cancelGeneration + 1
+	next.cancel = cancel
+	next.retryRequested = false
+	next.responseStarted = false
+	next.log.Status = requestLogStatusProcessing
+	next.log.RetryRequested = false
+	t.requests[id] = next
+	return next.cancelGeneration
+}
+
+// ResetAttemptStart keeps the logical request ID stable while making timing in
+// the Logs page relative to the provider/key attempt that is actually starting.
+func (t *activeRequestTracker) ResetAttemptStart(id int64, logEntry *ReqeustLog, startedAt time.Time) {
+	if t == nil || id == 0 || logEntry == nil {
+		return
+	}
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	existing, ok := t.requests[id]
+	if !ok {
+		return
+	}
+	next := snapshotActiveRequest(id, logEntry, startedAt)
+	next.cancel = existing.cancel
+	next.cancelGeneration = existing.cancelGeneration
+	next.retryRequested = existing.retryRequested
+	next.responseStarted = existing.responseStarted
+	t.requests[id] = next
+}
+
+// MarkAttemptTransition removes a completed provider/key from the active row.
+// Its 504 snapshot is already persisted; the remaining active row represents
+// selection or waiting for the next attempt and starts timing from zero.
+func (t *activeRequestTracker) MarkAttemptTransition(id int64, startedAt time.Time) {
+	if t == nil || id == 0 {
+		return
+	}
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	existing, ok := t.requests[id]
+	if !ok {
+		return
+	}
+	existing.startedAt = startedAt
+	existing.log.Provider = ""
+	existing.log.HttpCode = 0
+	existing.log.InputTokens = 0
+	existing.log.OutputTokens = 0
+	existing.log.CacheCreateTokens = 0
+	existing.log.CacheReadTokens = 0
+	existing.log.ReasoningTokens = 0
+	existing.log.UpstreamHeaderSec = 0
+	existing.log.FirstEventSec = 0
+	existing.log.FirstTextSec = 0
+	existing.log.FirstTokenDurationSec = 0
+	existing.log.ErrorMessage = "重试"
+	existing.log.Status = requestLogStatusRetrying
+	existing.log.RetryRequested = true
+	existing.log.CreatedAt = startedAt.In(beijingLocation).Format(timeLayout)
+	existing.retryRequested = false
+	existing.responseStarted = false
+	existing.cancel = nil
+	t.requests[id] = existing
+}
+
 func (t *activeRequestTracker) UnregisterCancel(id int64, generation uint64) bool {
 	if t == nil || id == 0 || generation == 0 {
 		return false
@@ -272,6 +366,16 @@ func (t *activeRequestTracker) Retry(id int64, userID string) ActiveRequestRetry
 	if existing.log.Status == requestLogStatusQueued {
 		t.mu.Unlock()
 		return ActiveRequestRetryResult{Status: activeRequestRetryIgnoredQueued}
+	}
+	if existing.responseStarted {
+		firstTokenSec := existing.log.FirstTokenDurationSec
+		firstTextSec := existing.log.FirstTextSec
+		t.mu.Unlock()
+		return ActiveRequestRetryResult{
+			Status:                activeRequestRetryIgnoredResponseStarted,
+			FirstTokenDurationSec: firstTokenSec,
+			FirstTextSec:          firstTextSec,
+		}
 	}
 	if existing.retryRequested {
 		t.mu.Unlock()

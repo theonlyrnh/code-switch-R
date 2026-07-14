@@ -16,6 +16,11 @@ const loading = ref(false)
 const logsContainer = ref<HTMLElement>()
 let refreshInterval: number | null = null
 
+const hasSelectedConsoleText = () => {
+  const selection = window.getSelection()
+  return Boolean(selection && !selection.isCollapsed && selection.toString().trim())
+}
+
 const goBack = () => {
   router.push('/')
 }
@@ -23,6 +28,9 @@ const goBack = () => {
 const loadLogs = async () => {
   try {
     const result = await Call.ByName('codeswitch/services.ConsoleService.GetLogs')
+    // Vue replaces the log rows when this value changes. Preserve a user's
+    // native text selection so Ctrl/Cmd+C can copy any individual entry.
+    if (hasSelectedConsoleText()) return
     logs.value = result as ConsoleLog[]
 
     if (autoScroll.value) {
@@ -184,6 +192,8 @@ onUnmounted(() => {
   line-height: 1.6;
   background: #1e1e1e;
   color: #d4d4d4;
+  user-select: text;
+  cursor: text;
 }
 
 html.dark .console-content {
@@ -196,6 +206,7 @@ html.dark .console-content {
   gap: 12px;
   padding: 4px 0;
   border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  user-select: text;
 }
 
 .log-entry:last-child {

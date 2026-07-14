@@ -82,30 +82,31 @@ func (ls *LogService) ListRequestLogsForUser(userID string, platform string, pro
 		errorMessage := record.GetString("error_message")
 		retryRequested := errorMessage == "重试" && record.GetInt("http_code") == 499
 		logEntry := ReqeustLog{
-			ID:                    record.GetInt64("id"),
-			UserID:                record.GetString("user_id"),
-			Platform:              record.GetString("platform"),
-			Model:                 record.GetString("model"),
-			Provider:              record.GetString("provider"),
-			RelayKeyID:            relayKeyID,
-			RelayKeyName:          relayKeyDisplayName(relayKeyID, keyNames),
-			HttpCode:              record.GetInt("http_code"),
-			ErrorMessage:          errorMessage,
-			InputTokens:           record.GetInt("input_tokens"),
-			OutputTokens:          record.GetInt("output_tokens"),
-			CacheCreateTokens:     record.GetInt("cache_create_tokens"),
-			CacheReadTokens:       record.GetInt("cache_read_tokens"),
-			ReasoningTokens:       record.GetInt("reasoning_tokens"),
-			CreatedAt:             formatCreatedAtBeijing(record),
-			IsStream:              record.GetBool("is_stream"),
-			DurationSec:           record.GetFloat64("duration_sec"),
-			FirstTokenDurationSec: firstTokenSec,
-			ClientIP:              record.GetString("client_ip"),
-			UpstreamHeaderSec:     record.GetFloat64("upstream_header_sec"),
-			FirstEventSec:         record.GetFloat64("first_event_sec"),
-			FirstTextSec:          firstTextSec,
-			Status:                requestLogStatusCompleted,
-			RetryRequested:        retryRequested,
+			ID:                      record.GetInt64("id"),
+			UserID:                  record.GetString("user_id"),
+			Platform:                record.GetString("platform"),
+			Model:                   record.GetString("model"),
+			Provider:                record.GetString("provider"),
+			RelayKeyID:              relayKeyID,
+			RelayKeyName:            relayKeyDisplayName(relayKeyID, keyNames),
+			HttpCode:                record.GetInt("http_code"),
+			ErrorMessage:            errorMessage,
+			InputTokens:             record.GetInt("input_tokens"),
+			OutputTokens:            record.GetInt("output_tokens"),
+			CacheCreateTokens:       record.GetInt("cache_create_tokens"),
+			CacheReadTokens:         record.GetInt("cache_read_tokens"),
+			ReasoningTokens:         record.GetInt("reasoning_tokens"),
+			ExcludeFromTotalTraffic: record.GetBool("exclude_from_total"),
+			CreatedAt:               formatCreatedAtBeijing(record),
+			IsStream:                record.GetBool("is_stream"),
+			DurationSec:             record.GetFloat64("duration_sec"),
+			FirstTokenDurationSec:   firstTokenSec,
+			ClientIP:                record.GetString("client_ip"),
+			UpstreamHeaderSec:       record.GetFloat64("upstream_header_sec"),
+			FirstEventSec:           record.GetFloat64("first_event_sec"),
+			FirstTextSec:            firstTextSec,
+			Status:                  requestLogStatusCompleted,
+			RetryRequested:          retryRequested,
 		}
 		logs = append(logs, logEntry)
 	}
@@ -218,6 +219,7 @@ func (ls *LogService) StatsSinceForUser(userID string, platform string) (LogStat
 			"reasoning_tokens",
 			"cache_create_tokens",
 			"cache_read_tokens",
+			"exclude_from_total",
 			"created_at",
 		),
 		xdb.OrderByAsc("created_at"),
@@ -271,11 +273,7 @@ func (ls *LogService) StatsSinceForUser(userID string, platform string) (LogStat
 			}
 		}
 		bucket := seriesBuckets[bucketIndex]
-		input := record.GetInt("input_tokens")
-		output := record.GetInt("output_tokens")
-		reasoning := record.GetInt("reasoning_tokens")
-		cacheCreate := record.GetInt("cache_create_tokens")
-		cacheRead := record.GetInt("cache_read_tokens")
+		input, output, reasoning, cacheCreate, cacheRead := trafficTokensForTotals(record)
 		bucket.TotalRequests++
 		bucket.InputTokens += int64(input)
 		bucket.OutputTokens += int64(output)
@@ -331,6 +329,7 @@ func (ls *LogService) ProviderDailyStatsForUser(userID string, platform string) 
 			"reasoning_tokens",
 			"cache_create_tokens",
 			"cache_read_tokens",
+			"exclude_from_total",
 			"created_at",
 		),
 	}
@@ -370,11 +369,7 @@ func (ls *LogService) ProviderDailyStatsForUser(userID string, platform string) 
 			statMap[provider] = stat
 		}
 		httpCode := record.GetInt("http_code")
-		input := record.GetInt("input_tokens")
-		output := record.GetInt("output_tokens")
-		reasoning := record.GetInt("reasoning_tokens")
-		cacheCreate := record.GetInt("cache_create_tokens")
-		cacheRead := record.GetInt("cache_read_tokens")
+		input, output, reasoning, cacheCreate, cacheRead := trafficTokensForTotals(record)
 		stat.TotalRequests++
 		// 只有 HTTP 200-299 才算成功，其他（包括 0）都算失败
 		if httpCode >= 200 && httpCode < 300 {
@@ -486,6 +481,19 @@ func emptyAsUnknown(value string) string {
 		return "(unknown)"
 	}
 	return value
+}
+
+// trafficTokensForTotals leaves request counts and raw request logs intact
+// while suppressing token aggregation for account pools that opt out.
+func trafficTokensForTotals(record xdb.Record) (input, output, reasoning, cacheCreate, cacheRead int) {
+	if record.GetBool("exclude_from_total") {
+		return 0, 0, 0, 0, 0
+	}
+	return record.GetInt("input_tokens"),
+		record.GetInt("output_tokens"),
+		record.GetInt("reasoning_tokens"),
+		record.GetInt("cache_create_tokens"),
+		record.GetInt("cache_read_tokens")
 }
 
 func parseCreatedAt(record xdb.Record) (time.Time, bool) {

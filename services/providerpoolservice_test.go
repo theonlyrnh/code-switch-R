@@ -56,6 +56,60 @@ func TestProviderPoolServiceDefaultPoolCreation(t *testing.T) {
 	}
 }
 
+func TestFirstTextRetryIsValidatedPerPool(t *testing.T) {
+	pool := &ProviderPool{}
+	if err := normalizeAndValidateFirstTextRetry(pool); err != nil {
+		t.Fatalf("disabled first-text retry rejected: %v", err)
+	}
+	if pool.FirstTextRetryEnabled || pool.FirstTextRetryTimeoutSeconds != defaultFirstTextRetryTimeoutSeconds {
+		t.Fatalf("disabled pool retry config = %+v, want disabled with default timeout", pool)
+	}
+
+	pool.FirstTextRetryEnabled = true
+	pool.FirstTextRetryTimeoutSeconds = 0
+	if err := normalizeAndValidateFirstTextRetry(pool); err != nil {
+		t.Fatalf("enabled retry without explicit timeout rejected: %v", err)
+	}
+	if pool.FirstTextRetryTimeoutSeconds != defaultFirstTextRetryTimeoutSeconds {
+		t.Fatalf("enabled default timeout = %d, want %d", pool.FirstTextRetryTimeoutSeconds, defaultFirstTextRetryTimeoutSeconds)
+	}
+
+	pool.FirstTextRetryTimeoutSeconds = minFirstTextRetryTimeoutSeconds - 1
+	if err := normalizeAndValidateFirstTextRetry(pool); err == nil {
+		t.Fatal("first-text retry timeout below minimum was accepted")
+	}
+	pool.FirstTextRetryTimeoutSeconds = maxFirstTextRetryTimeoutSeconds + 1
+	if err := normalizeAndValidateFirstTextRetry(pool); err == nil {
+		t.Fatal("first-text retry timeout above maximum was accepted")
+	}
+}
+
+func TestMigrateGlobalFirstTextRetryToExistingPools(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	settingsDir := filepath.Join(os.Getenv("HOME"), appSettingsDir)
+	if err := os.MkdirAll(settingsDir, 0o700); err != nil {
+		t.Fatalf("create settings directory: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(settingsDir, appSettingsFileName),
+		[]byte(`{"enable_first_text_retry":true,"first_text_retry_timeout_seconds":5}`),
+		0o600,
+	); err != nil {
+		t.Fatalf("write legacy app settings: %v", err)
+	}
+
+	store := &providerPoolStore{
+		Version: 5,
+		Pools:   []ProviderPool{{ID: "pool-a"}, {ID: "pool-b"}},
+	}
+	migrateFirstTextRetryToPools(store)
+	for _, pool := range store.Pools {
+		if !pool.FirstTextRetryEnabled || pool.FirstTextRetryTimeoutSeconds != 5 {
+			t.Fatalf("migrated pool = %+v, want enabled 5-second timeout", pool)
+		}
+	}
+}
+
 func TestProviderPoolServiceDefaultPoolIdempotent(t *testing.T) {
 	testHome := t.TempDir()
 	t.Setenv("HOME", testHome)
@@ -367,6 +421,7 @@ func TestProviderPoolServiceNormalizesLegacyAndNormalPools(t *testing.T) {
 				ResponsesEndpoint: "/responses",
 				Keys:              []AccountPoolKey{{ID: -1, APIKey: "ignored"}},
 			},
+			ExcludeFromTotalTraffic: true,
 		}},
 	}
 	if err := os.MkdirAll(filepath.Dir(service.path), 0o700); err != nil {
@@ -385,6 +440,9 @@ func TestProviderPoolServiceNormalizesLegacyAndNormalPools(t *testing.T) {
 	}
 	if pool.AccountPoolConfig != nil {
 		t.Fatal("normal pool should discard irrelevant account config")
+	}
+	if pool.ExcludeFromTotalTraffic {
+		t.Fatal("normal pool should discard exclude-from-total setting")
 	}
 
 	pool.AccountPoolConfig = &AccountPoolConfig{APIURL: "https://still-ignored.example.com"}
@@ -415,6 +473,7 @@ func TestProviderPoolServiceSaveAccountPoolNormalizesConfiguration(t *testing.T)
 				{ID: -101, APIKey: "\t sk-second-secret-value \t"},
 			},
 		},
+		ExcludeFromTotalTraffic:      true,
 		AutoBlacklistEnabled:         false,
 		AutoBlacklistThreshold:       0,
 		AutoBlacklistDurationMinutes: -1,
@@ -429,6 +488,9 @@ func TestProviderPoolServiceSaveAccountPoolNormalizesConfiguration(t *testing.T)
 	}
 	if pool.Mode != ProviderPoolModeManaged || !pool.AutoBlacklistEnabled {
 		t.Fatalf("account pool mode/blacklist = %q/%v", pool.Mode, pool.AutoBlacklistEnabled)
+	}
+	if !pool.ExcludeFromTotalTraffic {
+		t.Fatal("account pool should retain exclude-from-total setting")
 	}
 	if pool.AutoBlacklistThreshold != defaultAccountPoolBlacklistThreshold || pool.AutoBlacklistDurationMinutes != defaultAccountPoolBlacklistDurationMinutes {
 		t.Fatalf("blacklist defaults = %d/%d", pool.AutoBlacklistThreshold, pool.AutoBlacklistDurationMinutes)
@@ -457,6 +519,10 @@ func TestProviderPoolServiceSaveAccountPoolNormalizesConfiguration(t *testing.T)
 		if key.ID == -100 || key.ID == -101 || key.ID == 123 {
 			t.Fatalf("new account pool trusted client key ID %d", key.ID)
 		}
+	}
+	savedPool, err := service.GetPool(id)
+	if err != nil || savedPool == nil || !savedPool.ExcludeFromTotalTraffic {
+		t.Fatalf("saved exclude-from-total setting = %#v, err = %v", savedPool, err)
 	}
 
 	data, err := os.ReadFile(service.path)
@@ -1234,5 +1300,40 @@ func TestProviderPoolStoreVersionTwoDoesNotRepeatBindingMigration(t *testing.T) 
 	}
 	if string(data) != string(originalData) {
 		t.Fatal("rejected future-version write changed the store")
+	}
+}
+
+func TestProviderPoolStoreVersionThreeUpgradesWithDisabledProxyConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	service := NewProviderPoolService()
+	pool := validAccountPoolForTest()
+	pool.ID = "pool_openai-responses_v3"
+	store := &providerPoolStore{Version: 3, Pools: []ProviderPool{*pool}}
+	if err := os.MkdirAll(filepath.Dir(service.path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := AtomicWriteJSON(service.path, store); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := service.GetPool(pool.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded == nil || loaded.ProxyConfig == nil || loaded.ProxyConfig.Enabled || loaded.ProxyConfig.Selection != AccountPoolProxySelectionNone {
+		t.Fatalf("loaded v3 proxy config = %#v", loaded)
+	}
+	if _, err := service.SavePool(loaded); err != nil {
+		t.Fatalf("save migrated v3 pool: %v", err)
+	}
+	data, err := os.ReadFile(service.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var migrated providerPoolStore
+	if err := json.Unmarshal(data, &migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated.Version != providerPoolsStoreVersion || len(migrated.Pools) != 1 || migrated.Pools[0].ProxyConfig == nil {
+		t.Fatalf("migrated store = %#v", migrated)
 	}
 }

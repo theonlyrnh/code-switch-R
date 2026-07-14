@@ -23,7 +23,7 @@ function notifyAdminAuthInvalid() {
   window.dispatchEvent(new Event('codeswitch-admin-auth-invalid'))
 }
 
-async function rpcCall<T>(name: string, args: any[]): Promise<T> {
+async function rpcCall<T>(name: string, args: any[], signal?: AbortSignal): Promise<T> {
   const response = await fetch('/api/wails/call', {
     method: 'POST',
     credentials: 'include',
@@ -31,6 +31,7 @@ async function rpcCall<T>(name: string, args: any[]): Promise<T> {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ name, args }),
+    signal,
   })
 
   const payload = await response.json().catch(() => ({})) as RPCSuccess<T> & RPCError
@@ -68,6 +69,10 @@ export function resetEventSource() {
 export namespace Call {
   export function ByName<T = any>(name: string, ...args: any[]): CancellablePromise<T> {
     return rpcCall<T>(name, args)
+  }
+
+  export function ByNameWithSignal<T = any>(name: string, signal: AbortSignal, ...args: any[]): CancellablePromise<T> {
+    return rpcCall<T>(name, args, signal)
   }
 
   export function ByID<T = any>(id: number, ..._args: any[]): CancellablePromise<T> {
