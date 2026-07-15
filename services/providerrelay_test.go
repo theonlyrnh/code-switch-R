@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -290,6 +291,31 @@ func (r *streamingRecorder) BodyString() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.body.String()
+}
+
+type cancelAfterFirstTextRecorder struct {
+	header http.Header
+	cancel context.CancelFunc
+	writes int
+}
+
+func (r *cancelAfterFirstTextRecorder) Header() http.Header {
+	return r.header
+}
+
+func (r *cancelAfterFirstTextRecorder) WriteHeader(int) {}
+
+func (r *cancelAfterFirstTextRecorder) Flush() {}
+
+func (r *cancelAfterFirstTextRecorder) Write(data []byte) (int, error) {
+	r.writes++
+	// The first write is the guard keepalive and the second contains actual
+	// text. Simulate the downstream closing only after that text was accepted.
+	if r.writes >= 3 {
+		r.cancel()
+		return 0, context.Canceled
+	}
+	return len(data), nil
 }
 
 func TestWriteStreamingResponseFlushesFirstLineImmediately(t *testing.T) {
@@ -676,8 +702,61 @@ func TestReadResponseBodyWithFirstTextTimeout(t *testing.T) {
 	}
 }
 
+func TestLateClientCloseAfterFirstTextKeepsSuccessfulResponseLog(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() {
+		defaultActiveRequestTracker = oldTracker
+	})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n")
+	}))
+	defer upstream.Close()
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	recorder := &cancelAfterFirstTextRecorder{
+		header: make(http.Header),
+		cancel: cancel,
+	}
+	context, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5","stream":true}`))
+	context.Request = request.WithContext(requestContext)
+
+	relay := NewProviderRelayService(NewProviderService(), NewProviderPoolService(), nil, nil, nil, DefaultRelayBindAddr)
+	requestLog := &ReqeustLog{startedAt: time.Now()}
+	ok, err := relay.forwardRequestWithLog(
+		context,
+		"openai-responses",
+		Provider{ID: 1, Name: "provider-a", APIURL: upstream.URL, APIKey: "test-key"},
+		"/responses",
+		nil,
+		http.Header{},
+		[]byte(`{"model":"gpt-5","stream":true}`),
+		true,
+		"gpt-5",
+		requestLog,
+	)
+	if !ok || err != nil {
+		t.Fatalf("late close after first text = (%v, %v), want successful response", ok, err)
+	}
+	if requestLog.HttpCode != http.StatusOK {
+		t.Fatalf("http code = %d, want 200", requestLog.HttpCode)
+	}
+	if requestLog.FirstTextSec <= 0 {
+		t.Fatalf("first text = %.3fs, want positive", requestLog.FirstTextSec)
+	}
+	if requestLog.ErrorMessage != "" {
+		t.Fatalf("error message = %q, want empty successful log", requestLog.ErrorMessage)
+	}
+}
+
 func TestPoolFirstTextTimeoutCancelsBeforeDelayedHeaders(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
 		select {
 		case <-r.Context().Done():
 			return
@@ -760,6 +839,57 @@ func TestPoolFirstTextTimeoutResetsForEachProviderAttempt(t *testing.T) {
 	}
 }
 
+func TestPoolFirstTextTimeoutResetsForLowLevelHTTPRetry(t *testing.T) {
+	var calls atomic.Int32
+	secondAttemptStarted := make(chan time.Time, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		secondAttemptStarted <- time.Now()
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+
+	relay := NewProviderRelayService(NewProviderService(), NewProviderPoolService(), nil, nil, nil, DefaultRelayBindAddr)
+	pool := &ProviderPool{FirstTextRetryEnabled: true, FirstTextRetryTimeoutSeconds: 5}
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5","stream":true}`))
+	request = request.WithContext(withProviderPoolContext(request.Context(), pool, "user-a"))
+	context.Request = request
+
+	ok, err := relay.forwardRequestWithLog(
+		context,
+		"openai-responses",
+		Provider{ID: 1, Name: "retrying-provider", APIURL: upstream.URL, APIKey: "test-key"},
+		"/responses",
+		nil,
+		http.Header{},
+		[]byte(`{"model":"gpt-5","stream":true}`),
+		true,
+		"gpt-5",
+		nil,
+	)
+	if ok || !errors.Is(err, errCodexFirstTextTimeout) {
+		t.Fatalf("forward result = (%v, %v), want first-text timeout", ok, err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("HTTP attempts = %d, want 2", got)
+	}
+	select {
+	case startedAt := <-secondAttemptStarted:
+		if elapsed := time.Since(startedAt); elapsed < 4750*time.Millisecond || elapsed > 5500*time.Millisecond {
+			t.Fatalf("second HTTP attempt timed out after %s, want its own five-second deadline", elapsed)
+		}
+	default:
+		t.Fatal("second HTTP attempt never started")
+	}
+}
+
 func TestFirstTextTimeoutAttemptPersistsBeforeLaterClientCancel(t *testing.T) {
 	setupRelayTestEnv(t)
 	db, err := xdb.DB("default")
@@ -831,15 +961,15 @@ func TestProviderAttemptDeadlineDoesNotStartBeforeProxyPreparation(t *testing.T)
 	ctx := withProviderPoolContext(context.Background(), pool, "user-a")
 	started := false
 	relay := &ProviderRelayService{httpClient: http.DefaultClient}
-	_, err := relay.doProviderRequestWithAttemptStart(
+	_, _, err := relay.doProviderRequestWithAttemptStart(
 		ctx,
 		"https://provider.example/v1/responses",
 		make(http.Header),
 		nil,
 		nil,
-		func(ctx context.Context) context.Context {
+		func(ctx context.Context) *providerRequestAttempt {
 			started = true
-			return ctx
+			return &providerRequestAttempt{ctx: ctx}
 		},
 	)
 	if err == nil {
@@ -982,25 +1112,186 @@ func TestAutoProxyWithoutFallbackSettingStaysEnabled(t *testing.T) {
 	}
 }
 
-func TestInternalRelayTargetDetection(t *testing.T) {
-	relay := &ProviderRelayService{addr: "127.0.0.1:18100"}
-	for _, target := range []string{
-		"http://localhost:18100/responses",
-		"http://127.0.0.1:18100/v1/responses",
-		"http://[::1]:18100/responses",
-	} {
-		if !relay.isInternalRelayTarget(target) {
-			t.Fatalf("target %q should be recognized as internal relay", target)
+func TestPoolFirstTextTimeoutAlsoCancelsLocalRelayProvider(t *testing.T) {
+	localRelay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(6 * time.Second):
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n"))
 		}
+	}))
+	defer localRelay.Close()
+
+	// Match the target's listener exactly. Before the unified ownership rule,
+	// this made the relay suppress the outer pool's first-text deadline.
+	relay := NewProviderRelayService(NewProviderService(), NewProviderPoolService(), nil, nil, nil, localRelay.Listener.Addr().String())
+	pool := &ProviderPool{FirstTextRetryEnabled: true, FirstTextRetryTimeoutSeconds: 5}
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5","stream":true}`))
+	request = request.WithContext(withProviderPoolContext(request.Context(), pool, "user-a"))
+	context.Request = request
+
+	startedAt := time.Now()
+	ok, err := relay.forwardRequestWithLog(
+		context,
+		"openai-responses",
+		Provider{ID: 1, Name: "local-relay", APIURL: localRelay.URL, APIKey: "test-key"},
+		"/responses",
+		nil,
+		http.Header{},
+		[]byte(`{"model":"gpt-5","stream":true}`),
+		true,
+		"gpt-5",
+		nil,
+	)
+	if ok || !errors.Is(err, errCodexFirstTextTimeout) {
+		t.Fatalf("forward result = (%v, %v), want first-text timeout", ok, err)
 	}
-	for _, target := range []string{
-		"https://lqapi.cc/v1/responses",
-		"http://localhost:18101/responses",
-		"http://192.168.1.10:18100/responses",
-	} {
-		if relay.isInternalRelayTarget(target) {
-			t.Fatalf("target %q should not be recognized as internal relay", target)
+	if elapsed := time.Since(startedAt); elapsed < 4500*time.Millisecond || elapsed > 5500*time.Millisecond {
+		t.Fatalf("local relay timed out after %s, want close to 5 seconds", elapsed)
+	}
+}
+
+func TestNestedPoolOuterTimeoutDoesNotBlameInnerAccountKey(t *testing.T) {
+	oldTracker := defaultActiveRequestTracker
+	defaultActiveRequestTracker = newActiveRequestTracker()
+	t.Cleanup(func() { defaultActiveRequestTracker = oldTracker })
+
+	slowUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
+		<-r.Context().Done()
+	}))
+	defer slowUpstream.Close()
+
+	innerPool := &ProviderPool{
+		ID:                           "inner-account-pool",
+		Platform:                     "openai-responses",
+		PoolType:                     ProviderPoolTypeAccount,
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       1,
+		AutoBlacklistDurationMinutes: 5,
+		FirstTextRetryEnabled:        true,
+		FirstTextRetryTimeoutSeconds: 10,
+	}
+	innerProvider := Provider{
+		ID:     -1,
+		Name:   "inner-account-key",
+		APIURL: slowUpstream.URL,
+		APIKey: "inner-key",
+	}
+	innerRelay := NewProviderRelayService(NewProviderService(), NewProviderPoolService(), nil, nil, nil, DefaultRelayBindAddr)
+	type innerResult struct {
+		ok  bool
+		err error
+		log ReqeustLog
+	}
+	innerResults := make(chan innerResult, 1)
+	localRelay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
+		context, _ := gin.CreateTestContext(w)
+		request := r.WithContext(withProviderPoolContext(r.Context(), innerPool, "user-a"))
+		context.Request = request
+		requestLog := &ReqeustLog{startedAt: time.Now()}
+		ok, err := innerRelay.forwardRequestWithLog(
+			context,
+			"openai-responses",
+			innerProvider,
+			"/responses",
+			nil,
+			http.Header{},
+			[]byte(`{"model":"gpt-5","stream":true}`),
+			true,
+			"gpt-5",
+			requestLog,
+		)
+		innerResults <- innerResult{ok: ok, err: err, log: *requestLog}
+	}))
+	defer localRelay.Close()
+
+	rule := SpecialBlacklistRule{
+		ID:                "outer-first-text-timeout",
+		Name:              "Outer first-text timeout",
+		HTTPStatus:        http.StatusGatewayTimeout,
+		JSONPath:          "error.code",
+		ExpectedJSONValue: `"first_text_timeout"`,
+		Threshold:         1,
+		DurationMinutes:   5,
+	}
+	outerPool := &ProviderPool{
+		ID:                           "outer-normal-pool",
+		Platform:                     "openai-responses",
+		PoolType:                     ProviderPoolTypeNormal,
+		Mode:                         ProviderPoolModeManaged,
+		AutoBlacklistEnabled:         true,
+		AutoBlacklistThreshold:       10,
+		AutoBlacklistDurationMinutes: 5,
+		SpecialBlacklistRules:        []SpecialBlacklistRule{rule},
+		FirstTextRetryEnabled:        true,
+		FirstTextRetryTimeoutSeconds: 5,
+	}
+	outerProvider := Provider{ID: 1, Name: "local-relay", APIURL: localRelay.URL, APIKey: "relay-key"}
+	// This is the exact address that the removed local-relay exception used to
+	// recognize, so the outer timer must still own the direct relay attempt.
+	outerRelay := NewProviderRelayService(NewProviderService(), NewProviderPoolService(), nil, nil, nil, localRelay.Listener.Addr().String())
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5","stream":true}`))
+	request = request.WithContext(withProviderPoolContext(request.Context(), outerPool, "user-a"))
+	context.Request = request
+	outerLog := &ReqeustLog{startedAt: time.Now()}
+
+	ok, err := outerRelay.forwardRequestWithLog(
+		context,
+		"openai-responses",
+		outerProvider,
+		"/responses",
+		nil,
+		http.Header{},
+		[]byte(`{"model":"gpt-5","stream":true}`),
+		true,
+		"gpt-5",
+		outerLog,
+	)
+	if ok || !errors.Is(err, errCodexFirstTextTimeout) {
+		t.Fatalf("outer forward result = (%v, %v), want first-text timeout", ok, err)
+	}
+	if outerLog.HttpCode != http.StatusGatewayTimeout || outerLog.ErrorMessage != firstTextTimeoutErrorBody || !json.Valid([]byte(outerLog.ErrorMessage)) {
+		t.Fatalf("outer log = %+v, want JSON 504 first-text timeout", outerLog)
+	}
+
+	// This is the same normal-pool failure accounting used after the direct
+	// attempt above. It must assign the 504 to the outer relay provider only.
+	matchedRule := specialBlacklistRuleForFailure(outerPool, outerLog.HttpCode, outerLog.ErrorMessage)
+	if matchedRule == nil || matchedRule.ID != rule.ID {
+		t.Fatalf("outer matched rule = %+v, want %q", matchedRule, rule.ID)
+	}
+	outerRelay.recordProviderFailureWithRuleForUser("user-a", "openai-responses", outerPool.ID, outerPool, outerProvider, "HTTP 504", matchedRule)
+	outerStatuses := outerRelay.ListProviderBlacklistStatusForUser("user-a", "openai-responses", outerPool.ID)
+	if len(outerStatuses) != 1 || outerStatuses[0].ProviderID != outerProvider.ID || outerStatuses[0].RuleFailureCounts[rule.ID] != 1 {
+		t.Fatalf("outer blacklist statuses = %+v, want one local relay 504 rule failure", outerStatuses)
+	}
+
+	select {
+	case result := <-innerResults:
+		if result.ok || !errors.Is(result.err, errClientAbort) {
+			t.Fatalf("inner forward result = (%v, %v), want client abort", result.ok, result.err)
 		}
+		if result.log.HttpCode != 499 || result.log.ErrorMessage != "client aborted" {
+			t.Fatalf("inner log = %+v, want 499 client abort", result.log)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("inner account-key request did not observe the outer cancellation")
+	}
+	if statuses := innerRelay.ListProviderBlacklistStatusForUser("user-a", "openai-responses", innerPool.ID); len(statuses) != 0 {
+		t.Fatalf("inner key blacklist statuses = %+v, want none after outer cancellation", statuses)
 	}
 }
 
@@ -1091,6 +1382,56 @@ func TestProviderBlacklistChangedEvents(t *testing.T) {
 	}
 	if payload["action"] != "cleared" || payload["platform"] != "claude" || payload["poolID"] != pool.ID {
 		t.Fatalf("unexpected cleared event payload: %#v", payload)
+	}
+}
+
+func TestClearAllProviderBlacklistsForUserOnlyClearsTargetPool(t *testing.T) {
+	relay := NewProviderRelayService(NewProviderService(), NewProviderPoolService(), nil, nil, nil, DefaultRelayBindAddr)
+	now := time.Now()
+	blacklistedUntil := now.Add(10 * time.Minute)
+
+	relay.poolPenalties[penaltyKey("user-1", "openai-responses", "account-pool", 101)] = &ProviderPoolProviderPenalty{
+		UserID:           "user-1",
+		Platform:         "openai-responses",
+		PoolID:           "account-pool",
+		ProviderID:       101,
+		BlacklistedUntil: blacklistedUntil,
+	}
+	relay.poolPenalties[penaltyKey("user-1", "openai-responses", "account-pool", 102)] = &ProviderPoolProviderPenalty{
+		UserID:           "user-1",
+		Platform:         "openai-responses",
+		PoolID:           "account-pool",
+		ProviderID:       102,
+		BlacklistedUntil: blacklistedUntil,
+	}
+	relay.poolPenalties[penaltyKey("user-2", "openai-responses", "account-pool", 101)] = &ProviderPoolProviderPenalty{
+		UserID:           "user-2",
+		Platform:         "openai-responses",
+		PoolID:           "account-pool",
+		ProviderID:       101,
+		BlacklistedUntil: blacklistedUntil,
+	}
+	relay.poolPenalties[penaltyKey("user-1", "openai-responses", "other-pool", 101)] = &ProviderPoolProviderPenalty{
+		UserID:           "user-1",
+		Platform:         "openai-responses",
+		PoolID:           "other-pool",
+		ProviderID:       101,
+		BlacklistedUntil: blacklistedUntil,
+	}
+
+	relay.ClearAllProviderBlacklistsForUser("user-1", "openai-responses", "account-pool")
+
+	if _, ok := relay.poolPenalties[penaltyKey("user-1", "openai-responses", "account-pool", 101)]; ok {
+		t.Fatal("first target blacklist was not cleared")
+	}
+	if _, ok := relay.poolPenalties[penaltyKey("user-1", "openai-responses", "account-pool", 102)]; ok {
+		t.Fatal("second target blacklist was not cleared")
+	}
+	if _, ok := relay.poolPenalties[penaltyKey("user-2", "openai-responses", "account-pool", 101)]; !ok {
+		t.Fatal("other user's blacklist was cleared")
+	}
+	if _, ok := relay.poolPenalties[penaltyKey("user-1", "openai-responses", "other-pool", 101)]; !ok {
+		t.Fatal("other pool's blacklist was cleared")
 	}
 }
 

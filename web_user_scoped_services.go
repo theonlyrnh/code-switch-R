@@ -87,6 +87,14 @@ func (s *userScopedProxyService) UploadProxyConfig(ctx context.Context, fileName
 	return s.base.UploadProxyConfigForUser(fileName, content, user.ID, user.Username)
 }
 
+func (s *userScopedProxyService) ImportProxySubscription(ctx context.Context, subscriptionURL string, configName string) error {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	return s.base.ImportProxySubscriptionForUser(ctx, subscriptionURL, configName, user.ID, user.Username)
+}
+
 func (s *userScopedProxyService) RefreshProxyConfigs(ctx context.Context) ([]services.ProxyConfigSummary, error) {
 	user, err := authenticatedUserFromContext(ctx)
 	if err != nil {
@@ -678,6 +686,27 @@ func (s *userScopedProviderRelayService) ClearProviderBlacklist(ctx context.Cont
 		return err
 	}
 	s.base.ClearProviderBlacklistForUser(user.ID, platform, poolID, providerID)
+	return nil
+}
+
+func (s *userScopedProviderRelayService) ClearAllProviderBlacklists(ctx context.Context, platform string, poolID string) error {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return err
+	}
+
+	pool, err := s.poolService.GetPoolForUser(user.ID, strings.TrimSpace(poolID))
+	if err != nil {
+		return err
+	}
+	if pool == nil || pool.Platform != platform {
+		return errors.New("池子不存在或不属于当前用户")
+	}
+	if pool.PoolType != services.ProviderPoolTypeAccount || pool.AccountPoolConfig == nil {
+		return errors.New("仅号池支持批量清除拉黑")
+	}
+
+	s.base.ClearAllProviderBlacklistsForUser(user.ID, platform, poolID)
 	return nil
 }
 

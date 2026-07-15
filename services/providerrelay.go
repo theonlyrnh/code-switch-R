@@ -89,6 +89,33 @@ var errCodexFirstTextTimeout = errors.New("codex upstream stream timed out befor
 var errProviderEmptyShell = errors.New("provider returned 200 but all token counts are zero")
 var errActiveRequestRetryRequested = errors.New("active request retry requested")
 
+// providerRequestAttempt owns the deadline for exactly one client.Do call.
+// Retries must never retain this state: their direct provider/key HTTP request
+// gets a fresh context, timer and start timestamp.
+type providerRequestAttempt struct {
+	ctx       context.Context
+	startedAt time.Time
+	timedOut  atomic.Bool
+	stopTimer func()
+	cancel    context.CancelFunc
+}
+
+func (attempt *providerRequestAttempt) stop() {
+	if attempt != nil && attempt.stopTimer != nil {
+		attempt.stopTimer()
+	}
+}
+
+func (attempt *providerRequestAttempt) close() {
+	if attempt == nil {
+		return
+	}
+	attempt.stop()
+	if attempt.cancel != nil {
+		attempt.cancel()
+	}
+}
+
 // firstTextTimeoutErrorBody is recorded for every configured first-text timeout.
 // Keep this JSON stable because special blacklist rules can match its fields.
 const firstTextTimeoutErrorBody = `{"error":{"type":"first_text_timeout","code":"first_text_timeout","message":"upstream first text timeout"}}`
@@ -661,32 +688,6 @@ func (prs *ProviderRelayService) shouldUseResponseStreamGuard(c *gin.Context, ki
 	return prs.shouldUseCodexStreamGuard(kind, endpoint)
 }
 
-// isInternalRelayTarget identifies a provider that forwards back into this
-// relay. Its nested request owns account-key selection and must own the
-// first-text timeout too; cancelling it in the outer wrapper would turn the
-// inner key's timeout into a client abort and skip its blacklist counter.
-func (prs *ProviderRelayService) isInternalRelayTarget(targetURL string) bool {
-	if prs == nil || strings.TrimSpace(prs.addr) == "" {
-		return false
-	}
-	target, err := url.Parse(targetURL)
-	if err != nil {
-		return false
-	}
-	host := strings.TrimSpace(target.Hostname())
-	if !strings.EqualFold(host, "localhost") {
-		ip := net.ParseIP(host)
-		if ip == nil || !ip.IsLoopback() {
-			return false
-		}
-	}
-	_, relayPort, err := net.SplitHostPort(prs.addr)
-	if err != nil {
-		return false
-	}
-	return target.Port() == relayPort
-}
-
 func (prs *ProviderRelayService) shouldRequireProviderEnabled(kind string) bool {
 	if kind == "openai-responses" {
 		codexSettings := NewCodexSettingsService(prs.Addr(), prs.codexRelayKeys)
@@ -1143,6 +1144,29 @@ func (prs *ProviderRelayService) clearProviderBlacklistForUser(userID, platform,
 // clearProviderBlacklist manually removes the blacklist for a provider in a pool.
 func (prs *ProviderRelayService) clearProviderBlacklist(platform, poolID string, providerID int64) {
 	prs.clearProviderBlacklistForUser("", platform, poolID, providerID)
+}
+
+// clearAllProviderBlacklistsForUser removes all active blacklist entries for a
+// single user pool. It deliberately reuses clearProviderBlacklistForUser so
+// every cleared provider emits the same blacklist-change notification as an
+// individual manual clear.
+func (prs *ProviderRelayService) clearAllProviderBlacklistsForUser(userID, platform, poolID string) {
+	prefix := penaltyKeyPrefix(userID, platform, poolID)
+	now := time.Now()
+
+	prs.poolPenaltyMu.Lock()
+	providerIDs := make([]int64, 0)
+	for key, penalty := range prs.poolPenalties {
+		if !strings.HasPrefix(key, prefix) || penalty == nil || penalty.BlacklistedUntil.IsZero() || !now.Before(penalty.BlacklistedUntil) {
+			continue
+		}
+		providerIDs = append(providerIDs, penalty.ProviderID)
+	}
+	prs.poolPenaltyMu.Unlock()
+
+	for _, providerID := range providerIDs {
+		prs.clearProviderBlacklistForUser(userID, platform, poolID, providerID)
+	}
 }
 
 // listProviderBlacklistStatusForUser returns penalty entries for providers that are
@@ -2393,17 +2417,15 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 
 	requestCtx, requestCancel := context.WithCancel(c.Request.Context())
 	guardStreamingResponse := prs.shouldUseResponseStreamGuard(c, kind, endpoint)
-	// A nested local relay request reaches the actual account pool in a second
-	// hop. Only that inner hop may cancel for a first-text timeout, otherwise
-	// the account key sees a client abort and cannot be blacklisted.
-	firstTextTimeoutOwnedByAttempt := guardStreamingResponse && !prs.isInternalRelayTarget(targetURL)
+	// A first-text deadline belongs to this direct provider/key attempt. A
+	// local relay is no different from an external upstream here: if this pool
+	// selected it, this pool owns its timeout and failure accounting. A nested
+	// relay observes the resulting client disconnect independently.
+	firstTextTimeoutOwnedByAttempt := guardStreamingResponse
 	firstTextTimeout := time.Duration(0)
-	firstTextAttemptStartedAt := time.Time{}
-	var firstTextAttemptTimedOut atomic.Bool
-	requestAttemptCtx := requestCtx
-	cancelRequestAttempt := func() {}
-	stopFirstTextAttemptTimer := func() {}
-	startFirstTextAttempt := func(ctx context.Context) context.Context { return ctx }
+	startFirstTextAttempt := func(ctx context.Context) *providerRequestAttempt {
+		return &providerRequestAttempt{ctx: ctx}
+	}
 	if requestLog == nil {
 		requestLog = prs.startActiveRequestLog(c, kind, model, isStream)
 		defer prs.finishActiveRequestLog(requestLog)
@@ -2418,29 +2440,28 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 	if firstTextTimeoutOwnedByAttempt {
 		firstTextTimeout = firstTextRetryTimeout(providerPoolFromContext(c.Request.Context()))
 		if firstTextTimeout > 0 {
-			startFirstTextAttempt = func(ctx context.Context) context.Context {
-				if !firstTextAttemptStartedAt.IsZero() {
-					return requestAttemptCtx
-				}
+			startFirstTextAttempt = func(ctx context.Context) *providerRequestAttempt {
 				// Proxy selection and local listener preparation do not belong to a
 				// provider key. Start the deadline only when client.Do is about to send
 				// the first upstream HTTP request for this attempt.
-				firstTextAttemptStartedAt = time.Now()
-				requestLog.startedAt = firstTextAttemptStartedAt
-				defaultActiveRequestTracker.ResetAttemptStart(activeRequestID, requestLog, firstTextAttemptStartedAt)
-				requestAttemptCtx, cancelRequestAttempt = context.WithCancel(ctx)
-				timer := time.AfterFunc(firstTextTimeout, func() {
-					firstTextAttemptTimedOut.Store(true)
-					cancelRequestAttempt()
-				})
-				stopFirstTextAttemptTimer = func() {
-					timer.Stop()
+				startedAt := time.Now()
+				requestLog.startedAt = startedAt
+				defaultActiveRequestTracker.ResetAttemptStart(activeRequestID, requestLog, startedAt)
+				attemptCtx, cancel := context.WithCancel(ctx)
+				attempt := &providerRequestAttempt{
+					ctx:       attemptCtx,
+					startedAt: startedAt,
+					cancel:    cancel,
 				}
-				return requestAttemptCtx
+				timer := time.AfterFunc(firstTextTimeout, func() {
+					attempt.timedOut.Store(true)
+					cancel()
+				})
+				attempt.stopTimer = func() { timer.Stop() }
+				return attempt
 			}
 		}
 	}
-	defer func() { cancelRequestAttempt() }()
 	cancelGeneration := defaultActiveRequestTracker.BeginAttempt(activeRequestID, requestLog, requestCancel)
 	defer func() {
 		retryRequested := defaultActiveRequestTracker.UnregisterCancel(activeRequestID, cancelGeneration)
@@ -2451,9 +2472,12 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 			err = errActiveRequestRetryRequested
 		}
 	}()
-	resp, err := prs.doProviderRequestWithAttemptStart(requestCtx, targetURL, headers, query, bodyBytes, startFirstTextAttempt)
-	stopFirstTextAttemptTimer()
-	if firstTextAttemptTimedOut.Load() {
+	resp, firstTextAttempt, err := prs.doProviderRequestWithAttemptStart(requestCtx, targetURL, headers, query, bodyBytes, startFirstTextAttempt)
+	if firstTextAttempt != nil {
+		firstTextAttempt.stop()
+		defer firstTextAttempt.close()
+	}
+	if firstTextAttempt != nil && firstTextAttempt.timedOut.Load() {
 		if resp != nil && resp.RawResponse != nil && resp.RawResponse.Body != nil {
 			_ = resp.RawResponse.Body.Close()
 		}
@@ -2473,8 +2497,8 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 	requestLog.markUpstreamHeaders()
 	defaultActiveRequestTracker.Update(requestLog.ActiveRequestID, requestLog)
 	remainingFirstTextTimeout := time.Duration(0)
-	if firstTextTimeout > 0 && !firstTextAttemptStartedAt.IsZero() {
-		remainingFirstTextTimeout = firstTextTimeout - time.Since(firstTextAttemptStartedAt)
+	if firstTextTimeout > 0 && firstTextAttempt != nil && !firstTextAttempt.startedAt.IsZero() {
+		remainingFirstTextTimeout = firstTextTimeout - time.Since(firstTextAttempt.startedAt)
 		if remainingFirstTextTimeout <= 0 {
 			if resp != nil && resp.RawResponse != nil && resp.RawResponse.Body != nil {
 				_ = resp.RawResponse.Body.Close()
@@ -2568,7 +2592,7 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 			if prs.shouldUseResponseStreamGuard(c, kind, endpoint) {
 				var responseWritten bool
 				_, responseWritten, copyErr = writeCodexGuardedStreamingResponseWithOptions(c.Writer, resp, requestLog, prs.responseStreamGuardOptions(c, provider, remainingFirstTextTimeout), ReqeustLogHook(c, kind, requestLog))
-				if firstTextAttemptTimedOut.Load() {
+				if firstTextAttempt != nil && firstTextAttempt.timedOut.Load() {
 					requestLog.HttpCode = http.StatusGatewayTimeout
 					requestLog.ErrorMessage = firstTextTimeoutErrorBody
 					return false, errCodexFirstTextTimeout
@@ -2579,6 +2603,10 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 					return false, errCodexFirstTextTimeout
 				}
 				if copyErr != nil && (requestCtx.Err() != nil || c.Request.Context().Err() != nil || errors.Is(copyErr, context.Canceled)) {
+					if streamDeliveredFirstText(responseWritten, requestLog) {
+						logLateStreamClientClose(provider, copyErr)
+						return true, nil
+					}
 					requestLog.HttpCode = 499
 					requestLog.ErrorMessage = "client aborted"
 					return false, fmt.Errorf("%w: %v", errClientAbort, copyErr)
@@ -2691,7 +2719,7 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 			if prs.shouldUseResponseStreamGuard(c, kind, endpoint) {
 				var responseWritten bool
 				_, responseWritten, copyErr = writeCodexGuardedStreamingResponseWithOptions(c.Writer, resp, requestLog, prs.responseStreamGuardOptions(c, provider, remainingFirstTextTimeout), ReqeustLogHook(c, kind, requestLog))
-				if firstTextAttemptTimedOut.Load() {
+				if firstTextAttempt != nil && firstTextAttempt.timedOut.Load() {
 					requestLog.HttpCode = http.StatusGatewayTimeout
 					requestLog.ErrorMessage = firstTextTimeoutErrorBody
 					return false, errCodexFirstTextTimeout
@@ -2702,6 +2730,10 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 					return false, errCodexFirstTextTimeout
 				}
 				if copyErr != nil && (requestCtx.Err() != nil || c.Request.Context().Err() != nil || errors.Is(copyErr, context.Canceled)) {
+					if streamDeliveredFirstText(responseWritten, requestLog) {
+						logLateStreamClientClose(provider, copyErr)
+						return true, nil
+					}
 					requestLog.HttpCode = 499
 					requestLog.ErrorMessage = "client aborted"
 					return false, fmt.Errorf("%w: %v", errClientAbort, copyErr)
@@ -2756,7 +2788,8 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 }
 
 func (prs *ProviderRelayService) doProviderRequest(ctx context.Context, targetURL string, headers http.Header, query url.Values, bodyBytes []byte) (*xrequest.Response, error) {
-	return prs.doProviderRequestWithAttemptStart(ctx, targetURL, headers, query, bodyBytes, nil)
+	response, _, err := prs.doProviderRequestWithAttemptStart(ctx, targetURL, headers, query, bodyBytes, nil)
+	return response, err
 }
 
 func (prs *ProviderRelayService) doProviderRequestWithAttemptStart(
@@ -2765,14 +2798,12 @@ func (prs *ProviderRelayService) doProviderRequestWithAttemptStart(
 	headers http.Header,
 	query url.Values,
 	bodyBytes []byte,
-	startAttempt func(context.Context) context.Context,
-) (*xrequest.Response, error) {
+	startAttempt func(context.Context) *providerRequestAttempt,
+) (*xrequest.Response, *providerRequestAttempt, error) {
 	const maxAttempts = 2
 	var lastErr error
-	requestCtx := ctx
-	attemptStarted := false
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		client, endpoint, clientErr := prs.requestClient(requestCtx)
+		client, endpoint, clientErr := prs.requestClient(ctx)
 		if clientErr != nil {
 			lastErr = clientErr
 			if proxyErr, ok := isProxyRequestError(clientErr); ok {
@@ -2781,15 +2812,21 @@ func (prs *ProviderRelayService) doProviderRequestWithAttemptStart(
 			if _, ok := isProxyRequestError(clientErr); ok && attempt+1 < maxAttempts {
 				continue
 			}
-			return nil, clientErr
+			return nil, nil, clientErr
 		}
-		if !attemptStarted && startAttempt != nil {
-			requestCtx = startAttempt(requestCtx)
-			attemptStarted = true
+
+		var requestAttempt *providerRequestAttempt
+		requestCtx := ctx
+		if startAttempt != nil {
+			requestAttempt = startAttempt(ctx)
+			if requestAttempt != nil && requestAttempt.ctx != nil {
+				requestCtx = requestAttempt.ctx
+			}
 		}
 		req, err := newProviderHTTPRequest(requestCtx, targetURL, headers, query, bodyBytes)
 		if err != nil {
-			return nil, err
+			requestAttempt.close()
+			return nil, requestAttempt, err
 		}
 
 		resp, err := client.Do(req)
@@ -2798,30 +2835,41 @@ func (prs *ProviderRelayService) doProviderRequestWithAttemptStart(
 				_ = resp.Body.Close()
 			}
 			lastErr = err
+			timedOut := requestAttempt != nil && requestAttempt.timedOut.Load()
+			requestAttempt.close()
+			if timedOut {
+				return nil, requestAttempt, err
+			}
 			if proxyErr, ok := isProxyRequestError(err); ok {
 				prs.proxyManager.InvalidateProxy(proxyErr.PoolKey, proxyErr.Node)
 			}
-			if attempt+1 < maxAttempts && waitBeforeProviderRetry(requestCtx) == nil {
+			if attempt+1 < maxAttempts && waitBeforeProviderRetry(ctx) == nil {
 				continue
 			}
-			return nil, err
+			return nil, requestAttempt, err
 		}
 		prs.recordResponsesCloudflareBlock(requestCtx, endpoint, targetURL, resp)
+		if requestAttempt != nil && requestAttempt.timedOut.Load() {
+			_ = resp.Body.Close()
+			requestAttempt.close()
+			return nil, requestAttempt, context.Canceled
+		}
 		if resp != nil && resp.StatusCode >= http.StatusInternalServerError && attempt+1 < maxAttempts {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-			if waitBeforeProviderRetry(requestCtx) == nil {
+			requestAttempt.close()
+			if waitBeforeProviderRetry(ctx) == nil {
 				continue
 			}
 		}
 
-		return xrequest.NewResponse(resp), nil
+		return xrequest.NewResponse(resp), requestAttempt, nil
 	}
 
 	if lastErr != nil {
-		return nil, lastErr
+		return nil, nil, lastErr
 	}
-	return nil, fmt.Errorf("provider request failed")
+	return nil, nil, fmt.Errorf("provider request failed")
 }
 
 func newProviderHTTPRequest(ctx context.Context, targetURL string, headers http.Header, query url.Values, bodyBytes []byte) (*http.Request, error) {
@@ -3124,6 +3172,22 @@ func isStreamResponse(resp *xrequest.Response, requestedStream bool) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(resp.RawResponse.Header.Get("Content-Type")), "text/event-stream")
+}
+
+// streamDeliveredFirstText distinguishes a real response from the guard's
+// initial keepalive. A client may normally close an SSE connection after it
+// has consumed response.completed; that late close must not turn an already
+// delivered response into a synthetic 499 in the Logs page.
+func streamDeliveredFirstText(responseWritten bool, requestLog *ReqeustLog) bool {
+	return responseWritten && requestLog != nil && requestLog.FirstTextSec > 0
+}
+
+func logLateStreamClientClose(provider Provider, copyErr error) {
+	if copyErr == nil {
+		return
+	}
+	message := redactProviderSecret(copyErr.Error(), provider)
+	fmt.Printf("[INFO] 客户端在首字后关闭流，保留供应商成功结果: %s | %s\n", provider.Name, message)
 }
 
 func upstreamHTMLStreamError(resp *xrequest.Response) error {
@@ -5065,4 +5129,9 @@ func (prs *ProviderRelayService) ClearProviderBlacklist(platform, poolID string,
 // ClearProviderBlacklistForUser 手动清除指定用户池子内某个 provider 的拉黑状态。
 func (prs *ProviderRelayService) ClearProviderBlacklistForUser(userID, platform, poolID string, providerID int64) {
 	prs.clearProviderBlacklistForUser(userID, platform, poolID, providerID)
+}
+
+// ClearAllProviderBlacklistsForUser clears all active blacklists in one user pool.
+func (prs *ProviderRelayService) ClearAllProviderBlacklistsForUser(userID, platform, poolID string) {
+	prs.clearAllProviderBlacklistsForUser(userID, platform, poolID)
 }

@@ -14,6 +14,44 @@ func TestUserScopedPoolSaveRejectsEnabledProxyWithoutCatalogNodes(t *testing.T) 
 	testUserScopedPoolSaveRejectsEnabledProxyWithoutCatalogNodes(t, services.ProviderPoolTypeAccount)
 }
 
+func TestUserScopedRelayClearAllProviderBlacklistsOnlyAllowsAccountPools(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	poolService := services.NewProviderPoolService()
+	relay := services.NewProviderRelayService(services.NewProviderService(), poolService, nil, nil, nil, services.DefaultRelayBindAddr)
+	scoped := &userScopedProviderRelayService{base: relay, poolService: poolService}
+	ctx := contextWithAuthenticatedUser(context.Background(), &services.AuthenticatedUser{ID: "user-a", Username: "alice"})
+
+	normalPool := &services.ProviderPool{
+		Platform: "openai-responses",
+		Name:     "normal pool",
+		Mode:     services.ProviderPoolModeManaged,
+	}
+	if _, err := poolService.SavePoolForUser("user-a", normalPool); err != nil {
+		t.Fatalf("save normal pool: %v", err)
+	}
+	if err := scoped.ClearAllProviderBlacklists(ctx, normalPool.Platform, normalPool.ID); err == nil || !strings.Contains(err.Error(), "仅号池") {
+		t.Fatalf("clear normal pool error = %v, want account-pool rejection", err)
+	}
+
+	accountPool := &services.ProviderPool{
+		Platform: "openai-responses",
+		Name:     "account pool",
+		PoolType: services.ProviderPoolTypeAccount,
+		Mode:     services.ProviderPoolModeManaged,
+		AccountPoolConfig: &services.AccountPoolConfig{
+			APIURL:            "https://api.example.com",
+			ResponsesEndpoint: "/v1/responses",
+			Keys:              []services.AccountPoolKey{{APIKey: "sk-test"}},
+		},
+	}
+	if _, err := poolService.SavePoolForUser("user-a", accountPool); err != nil {
+		t.Fatalf("save account pool: %v", err)
+	}
+	if err := scoped.ClearAllProviderBlacklists(ctx, accountPool.Platform, accountPool.ID); err != nil {
+		t.Fatalf("clear account pool: %v", err)
+	}
+}
+
 func TestAggregateCostUsageByAccountPoolCollapsesAccountKeys(t *testing.T) {
 	firstKey := services.AccountPoolKey{ID: -101, APIKey: "sk-account-key-one"}
 	secondKey := services.AccountPoolKey{ID: -202, APIKey: "sk-account-key-two"}
@@ -133,6 +171,17 @@ func newUserScopedProxyServiceForTest(t *testing.T) (*userScopedProxyService, *s
 }
 
 const testSharedProxyYAML = "proxies:\n  - name: Hong Kong 01\n    type: http\n    server: proxy.example\n    port: 443\n"
+
+func TestUserScopedImportProxySubscriptionRequiresAuthenticationAndPublicTarget(t *testing.T) {
+	scoped, _, aliceCtx, _, _ := newUserScopedProxyServiceForTest(t)
+	privateURL := "http://127.0.0.1/subscription"
+	if err := scoped.ImportProxySubscription(aliceCtx, privateURL, "private-test"); err == nil || !strings.Contains(err.Error(), "不允许") {
+		t.Fatalf("authenticated private subscription error = %v", err)
+	}
+	if err := scoped.ImportProxySubscription(context.Background(), privateURL, "private-test"); err == nil || !strings.Contains(err.Error(), "authenticated user missing") {
+		t.Fatal("unauthenticated subscription import was accepted")
+	}
+}
 
 func TestUserScopedProxyConfigOwnershipAndHideIsolation(t *testing.T) {
 	scoped, _, aliceCtx, bobCtx, carolCtx := newUserScopedProxyServiceForTest(t)

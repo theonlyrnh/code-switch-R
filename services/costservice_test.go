@@ -35,7 +35,7 @@ func insertCostLog(t *testing.T, fields map[string]any) {
 		"cache_create_tokens": 3000,
 		"cache_read_tokens":   4000,
 		"reasoning_tokens":    5000,
-		"created_at":          time.Now().In(beijingLocation).Format(timeLayout),
+		"created_at":          time.Now().UTC().Format(timeLayout),
 	}
 	for key, value := range fields {
 		record[key] = value

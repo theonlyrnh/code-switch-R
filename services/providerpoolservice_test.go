@@ -422,6 +422,7 @@ func TestProviderPoolServiceNormalizesLegacyAndNormalPools(t *testing.T) {
 				Keys:              []AccountPoolKey{{ID: -1, APIKey: "ignored"}},
 			},
 			ExcludeFromTotalTraffic: true,
+			HideFromLogs:            true,
 		}},
 	}
 	if err := os.MkdirAll(filepath.Dir(service.path), 0o700); err != nil {
@@ -443,6 +444,9 @@ func TestProviderPoolServiceNormalizesLegacyAndNormalPools(t *testing.T) {
 	}
 	if pool.ExcludeFromTotalTraffic {
 		t.Fatal("normal pool should discard exclude-from-total setting")
+	}
+	if pool.HideFromLogs {
+		t.Fatal("normal pool should discard hide-from-logs setting")
 	}
 
 	pool.AccountPoolConfig = &AccountPoolConfig{APIURL: "https://still-ignored.example.com"}
@@ -474,6 +478,7 @@ func TestProviderPoolServiceSaveAccountPoolNormalizesConfiguration(t *testing.T)
 			},
 		},
 		ExcludeFromTotalTraffic:      true,
+		HideFromLogs:                 true,
 		AutoBlacklistEnabled:         false,
 		AutoBlacklistThreshold:       0,
 		AutoBlacklistDurationMinutes: -1,
@@ -491,6 +496,9 @@ func TestProviderPoolServiceSaveAccountPoolNormalizesConfiguration(t *testing.T)
 	}
 	if !pool.ExcludeFromTotalTraffic {
 		t.Fatal("account pool should retain exclude-from-total setting")
+	}
+	if !pool.HideFromLogs {
+		t.Fatal("account pool should retain hide-from-logs setting")
 	}
 	if pool.AutoBlacklistThreshold != defaultAccountPoolBlacklistThreshold || pool.AutoBlacklistDurationMinutes != defaultAccountPoolBlacklistDurationMinutes {
 		t.Fatalf("blacklist defaults = %d/%d", pool.AutoBlacklistThreshold, pool.AutoBlacklistDurationMinutes)
@@ -521,8 +529,8 @@ func TestProviderPoolServiceSaveAccountPoolNormalizesConfiguration(t *testing.T)
 		}
 	}
 	savedPool, err := service.GetPool(id)
-	if err != nil || savedPool == nil || !savedPool.ExcludeFromTotalTraffic {
-		t.Fatalf("saved exclude-from-total setting = %#v, err = %v", savedPool, err)
+	if err != nil || savedPool == nil || !savedPool.ExcludeFromTotalTraffic || !savedPool.HideFromLogs {
+		t.Fatalf("saved account-pool display settings = %#v, err = %v", savedPool, err)
 	}
 
 	data, err := os.ReadFile(service.path)

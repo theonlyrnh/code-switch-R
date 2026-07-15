@@ -224,6 +224,7 @@ import {
 import type { ChartOptions } from 'chart.js'
 import { Line } from 'vue-chartjs'
 import { showToast } from '../../utils/toast'
+import { ListAllPools, accountPoolKeyDisplayName } from '../../services/providerPool'
 
 Chart.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend)
 
@@ -238,6 +239,8 @@ const filters = reactive<{ platform: LogPlatform | ''; provider: string }>({ pla
 const page = ref(1)
 const PAGE_SIZE = 15
 const providerOptions = ref<string[]>([])
+const hiddenLogProviderKeys = ref<Set<string>>(new Set())
+const hiddenLogProviderNames = ref<Set<string>>(new Set())
 const statsSeries = computed<LogStatsSeries[]>(() => stats.value?.series ?? [])
 const LOG_COLUMN_WIDTH_STORAGE_KEY = 'code-switch-r:logs-table-column-widths:v1'
 
@@ -553,6 +556,44 @@ const stopLogAutoRefresh = () => {
 
 const normalizeProviderName = (value: string) => value.trim()
 
+const providerVisibilityKey = (platform: string, provider: string) =>
+  `${platform.trim()}\u0000${normalizeProviderName(provider)}`
+
+const isHiddenLogProvider = (platform: string, provider: string) => {
+  const normalizedProvider = normalizeProviderName(provider)
+  if (!normalizedProvider) return false
+  if (platform.trim()) {
+    return hiddenLogProviderKeys.value.has(providerVisibilityKey(platform, normalizedProvider))
+  }
+  return hiddenLogProviderNames.value.has(normalizedProvider)
+}
+
+const visibleRequestLogs = (items: RequestLog[]) =>
+  items.filter((item) => !isHiddenLogProvider(item.platform ?? '', item.provider ?? ''))
+
+const loadHiddenLogProviders = async () => {
+  try {
+    const pools = await ListAllPools()
+    const hiddenKeys = new Set<string>()
+    const hiddenNames = new Set<string>()
+    for (const pool of pools ?? []) {
+      if (pool.poolType !== 'account' || pool.hideFromLogs !== true) continue
+      for (const key of pool.accountPoolConfig?.keys ?? []) {
+        const provider = accountPoolKeyDisplayName(key)
+        hiddenKeys.add(providerVisibilityKey(pool.platform, provider))
+        hiddenNames.add(provider)
+      }
+    }
+    hiddenLogProviderKeys.value = hiddenKeys
+    hiddenLogProviderNames.value = hiddenNames
+    if (filters.provider && isHiddenLogProvider(filters.platform, filters.provider)) {
+      filters.provider = ''
+    }
+  } catch (error) {
+    console.error('failed to load hidden log pools', error)
+  }
+}
+
 const syncProviderOptionsFromLogs = (items: RequestLog[]) => {
   if (!items.length) return
   const merged = new Set(providerOptions.value.map(normalizeProviderName).filter(Boolean))
@@ -647,7 +688,7 @@ const loadLogs = async () => {
       provider: filters.provider,
       limit: 200,
     })
-    const nextLogs = data ?? []
+    const nextLogs = visibleRequestLogs(data ?? [])
     reconcileRetryingLogs(nextLogs)
     logs.value = nextLogs
     lastLogsSignature = logsSignature(logs.value)
@@ -686,7 +727,7 @@ const refreshLogsIfChanged = async (force = false) => {
           provider: filters.provider,
           limit: 200,
         })
-        const nextLogs = data ?? []
+        const nextLogs = visibleRequestLogs(data ?? [])
         reconcileRetryingLogs(nextLogs)
         const nextSignature = logsSignature(nextLogs)
         if (nextSignature !== lastLogsSignature) {
@@ -721,6 +762,7 @@ const loadStats = async () => {
 }
 
 const loadDashboard = async () => {
+  await loadHiddenLogProviders()
   await Promise.all([loadLogs(), loadStats(), loadProviderOptions()])
   syncProviderOptionsFromLogs(logs.value)
 }
@@ -1009,7 +1051,9 @@ const statsCards = computed(() => {
 const loadProviderOptions = async () => {
   try {
     const list = await fetchLogProviders(filters.platform)
-    providerOptions.value = (list ?? []).map(normalizeProviderName).filter(Boolean)
+    providerOptions.value = (list ?? [])
+      .map(normalizeProviderName)
+      .filter((provider) => provider && !isHiddenLogProvider(filters.platform, provider))
     providerOptions.value.sort((a, b) => a.localeCompare(b))
   } catch (error) {
     console.error('failed to load provider options', error)

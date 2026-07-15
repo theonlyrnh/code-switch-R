@@ -243,10 +243,43 @@
             </div>
             <div class="account-pool-keys">
               <div class="account-keys-heading">
-                <span class="account-summary-label">{{ t('components.main.pool.accountPoolKeys') }}</span>
-                <span class="account-key-count">{{ t('components.main.pool.accountKeyCount', { count: pool.accountPoolConfig?.keys?.length || 0 }) }}</span>
+                <div class="account-keys-heading-main">
+                  <span class="account-summary-label">{{ t('components.main.pool.accountPoolKeys') }}</span>
+                  <span class="account-key-count">{{ t('components.main.pool.accountKeyCount', { count: pool.accountPoolConfig?.keys?.length || 0 }) }}</span>
+                </div>
+                <div class="account-keys-heading-actions">
+                  <div class="account-key-status" role="status">
+                    <span class="account-key-status-available">
+                      {{ t('components.main.pool.accountKeyAvailable', { count: getAvailableAccountKeys(pool).length }) }}
+                    </span>
+                    <span :class="['account-key-status-blacklisted', { active: getBlacklistedAccountKeys(pool).length > 0 }]">
+                      {{ t('components.main.pool.accountKeyBlacklisted', { count: getBlacklistedAccountKeys(pool).length }) }}
+                    </span>
+                  </div>
+                  <button
+                    v-if="getBlacklistedAccountKeys(pool).length > 0"
+                    type="button"
+                    class="account-key-clear-blacklists-button"
+                    :disabled="isClearingAllBlacklists(pool.id)"
+                    @click="clearAllAccountPoolBlacklists(pool)"
+                  >
+                    {{ t('components.main.pool.clearAllBlacklists') }}
+                  </button>
+                  <button
+                    type="button"
+                    class="account-key-collapse-button"
+                    :aria-expanded="!isAccountKeysCollapsed(pool.id)"
+                    :aria-label="isAccountKeysCollapsed(pool.id) ? t('components.main.pool.expandAccountKeys') : t('components.main.pool.collapseAccountKeys')"
+                    :data-tooltip="isAccountKeysCollapsed(pool.id) ? t('components.main.pool.expandAccountKeys') : t('components.main.pool.collapseAccountKeys')"
+                    @click="toggleAccountKeysCollapsed(pool.id)"
+                  >
+                    <svg :class="{ expanded: !isAccountKeysCollapsed(pool.id) }" viewBox="0 0 20 20" aria-hidden="true">
+                      <path d="m5 7.5 5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                  </button>
+                </div>
               </div>
-              <div class="account-key-list">
+              <div v-if="!isAccountKeysCollapsed(pool.id)" class="account-key-list">
                 <div
                   v-for="key in getAvailableAccountKeys(pool)"
                   :key="key.id"
@@ -536,7 +569,7 @@
                     <button
                       type="button"
                       class="sub-tab-action-btn proxy-bulk-test-button"
-                      :disabled="proxyBulkTestLoading || proxyConfigsLoading || proxyUploadLoading || proxyConfigActionLoading !== null || !hasProxyNodes"
+                      :disabled="proxyBulkTestLoading || proxyConfigsLoading || proxyUploadLoading || proxySubscriptionImportLoading || proxyConfigActionLoading !== null || !hasProxyNodes"
                       @click="testAllProxyLatencies"
                     >
                       {{ proxyBulkTestLoading ? t('components.main.pool.proxyBulkTesting') : t('components.main.pool.testAllProxyLatencies') }}
@@ -659,11 +692,14 @@
                 </section>
 
                 <div class="proxy-upload-row">
-                  <label :class="['sub-tab-action-btn', 'proxy-upload-button', proxyUploadLoading || proxyBulkTestLoading ? 'disabled' : '']">
+                  <label :class="['sub-tab-action-btn', 'proxy-upload-button', proxyUploadLoading || proxySubscriptionImportLoading || proxyBulkTestLoading ? 'disabled' : '']">
                     {{ proxyUploadLoading ? t('components.main.pool.proxyUploading') : t('components.main.pool.uploadProxyConfig') }}
-                    <input type="file" accept=".yaml,.yml" :disabled="proxyUploadLoading || proxyBulkTestLoading" @change="uploadProxyConfig" />
+                    <input type="file" accept=".yaml,.yml" :disabled="proxyUploadLoading || proxySubscriptionImportLoading || proxyBulkTestLoading" @change="uploadProxyConfig" />
                   </label>
-                  <button type="button" class="sub-tab-action-btn" :disabled="proxyConfigsLoading || proxyUploadLoading || proxyBulkTestLoading || proxyConfigActionLoading !== null" @click="loadProxyConfigs">
+                  <button type="button" class="sub-tab-action-btn" :disabled="proxyUploadLoading || proxySubscriptionImportLoading || proxyBulkTestLoading || proxyConfigActionLoading !== null" @click="importProxySubscription">
+                    {{ proxySubscriptionImportLoading ? t('components.main.pool.proxySubscriptionImporting') : t('components.main.pool.importProxySubscription') }}
+                  </button>
+                  <button type="button" class="sub-tab-action-btn" :disabled="proxyConfigsLoading || proxyUploadLoading || proxySubscriptionImportLoading || proxyBulkTestLoading || proxyConfigActionLoading !== null" @click="loadProxyConfigs">
                     {{ proxyConfigsLoading ? t('components.main.pool.proxyRefreshing') : t('components.main.pool.refreshProxyConfigs') }}
                   </button>
                 </div>
@@ -684,7 +720,7 @@
                       type="button"
                       :data-tooltip="t('components.main.pool.deleteProxyConfig')"
                       :aria-label="t('components.main.pool.deleteProxyConfig')"
-                      :disabled="proxyConfigsLoading || proxyUploadLoading || proxyBulkTestLoading || proxyConfigActionLoading !== null"
+                      :disabled="proxyConfigsLoading || proxyUploadLoading || proxySubscriptionImportLoading || proxyBulkTestLoading || proxyConfigActionLoading !== null"
                       @click="deleteProxyConfig(config)"
                     >
                       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -697,7 +733,7 @@
                       type="button"
                       :data-tooltip="t('components.main.pool.hideProxyConfig')"
                       :aria-label="t('components.main.pool.hideProxyConfig')"
-                      :disabled="proxyConfigsLoading || proxyUploadLoading || proxyBulkTestLoading || proxyConfigActionLoading !== null"
+                      :disabled="proxyConfigsLoading || proxyUploadLoading || proxySubscriptionImportLoading || proxyBulkTestLoading || proxyConfigActionLoading !== null"
                       @click="hideProxyConfig(config)"
                     >
                       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -726,7 +762,7 @@
                       type="button"
                       :data-tooltip="t('components.main.pool.unhideProxyConfig')"
                       :aria-label="t('components.main.pool.unhideProxyConfig')"
-                      :disabled="proxyConfigsLoading || proxyUploadLoading || proxyBulkTestLoading || proxyConfigActionLoading !== null"
+                      :disabled="proxyConfigsLoading || proxyUploadLoading || proxySubscriptionImportLoading || proxyBulkTestLoading || proxyConfigActionLoading !== null"
                       @click="unhideProxyConfig(config)"
                     >
                       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -819,11 +855,18 @@
             </div>
           </div>
 
-          <label v-if="poolModalState.form.poolType === 'account'" class="pool-member-checkbox account-traffic-toggle">
-            <input v-model="poolModalState.form.excludeFromTotalTraffic" type="checkbox" />
-            <span class="member-checkbox-label">{{ t('components.main.pool.excludeFromTotalTraffic') }}</span>
-            <span class="form-field-hint">{{ t('components.main.pool.excludeFromTotalTrafficHint') }}</span>
-          </label>
+          <div v-if="poolModalState.form.poolType === 'account'" class="account-log-options">
+            <label class="pool-member-checkbox account-option-toggle">
+              <input v-model="poolModalState.form.excludeFromTotalTraffic" type="checkbox" />
+              <span class="member-checkbox-label">{{ t('components.main.pool.excludeFromTotalTraffic') }}</span>
+              <span class="form-field-hint">{{ t('components.main.pool.excludeFromTotalTrafficHint') }}</span>
+            </label>
+            <label class="pool-member-checkbox account-option-toggle">
+              <input v-model="poolModalState.form.hideFromLogs" type="checkbox" />
+              <span class="member-checkbox-label">{{ t('components.main.pool.hideFromLogs') }}</span>
+              <span class="form-field-hint">{{ t('components.main.pool.hideFromLogsHint') }}</span>
+            </label>
+          </div>
 
           <!-- 普通池成员供应商 -->
           <div v-if="poolModalState.form.poolType === 'normal'" class="form-field">
@@ -898,9 +941,11 @@ import {
   SetPoolBinding,
   ListProviderBlacklistStatus,
   ClearProviderBlacklist,
+  ClearAllProviderBlacklists,
   ListProxyConfigs,
   RefreshProxyConfigs,
   UploadProxyConfig,
+  ImportProxySubscription,
   DeleteProxyConfig,
   HideProxyConfig,
   ListHiddenProxyConfigs,
@@ -948,6 +993,8 @@ const emit = defineEmits<{
 
 const subTab = ref<'providers' | 'pools'>('providers')
 const pools = ref<ProviderPool[]>([])
+const collapsedAccountPoolKeys = ref<Set<string>>(new Set())
+const clearingAllBlacklistsPoolIDs = ref<Set<string>>(new Set())
 let poolLoadGeneration = 0
 let unsubscribeBlacklistChanged: (() => void) | undefined
 
@@ -976,6 +1023,7 @@ interface PoolFormState {
   firstTextRetryEnabled: boolean
   firstTextRetryTimeoutSeconds: number
   excludeFromTotalTraffic: boolean
+  hideFromLogs: boolean
 }
 
 const createEmptyPoolForm = (): PoolFormState => ({
@@ -999,6 +1047,7 @@ const createEmptyPoolForm = (): PoolFormState => ({
   firstTextRetryEnabled: false,
   firstTextRetryTimeoutSeconds: 100,
   excludeFromTotalTraffic: false,
+  hideFromLogs: false,
 })
 
 const poolModalState = reactive<{
@@ -1015,6 +1064,7 @@ const proxyConfigs = ref<ProxyConfigSummary[]>([])
 const hiddenProxyConfigs = ref<ProxyConfigSummary[]>([])
 const proxyConfigsLoading = ref(false)
 const proxyUploadLoading = ref(false)
+const proxySubscriptionImportLoading = ref(false)
 const proxyBulkTestLoading = ref(false)
 const proxyBulkTestCompleted = ref(false)
 const proxyNodeLatencyResults = ref<Record<string, ProxyNodeLatencyResult>>({})
@@ -1258,7 +1308,7 @@ const updateProxyConfigLists = async (loadVisibleConfigs: () => Promise<ProxyCon
 }
 
 const loadProxyConfigs = () => {
-  if (proxyBulkTestLoading.value || proxyUploadLoading.value || proxyConfigActionLoading.value !== null) return
+  if (proxyBulkTestLoading.value || proxyUploadLoading.value || proxySubscriptionImportLoading.value || proxyConfigActionLoading.value !== null) return
   invalidateAllProxyTests()
   return updateProxyConfigLists(RefreshProxyConfigs)
 }
@@ -1290,7 +1340,7 @@ const loadSharedProxySpeedTests = async (isCurrent = () => true) => {
 }
 
 const uploadProxyConfig = async (event: Event) => {
-  if (proxyBulkTestLoading.value) return
+  if (proxyBulkTestLoading.value || proxySubscriptionImportLoading.value) return
   const input = event.target as HTMLInputElement
 	const file = input.files?.[0]
 	input.value = ''
@@ -1315,8 +1365,30 @@ const uploadProxyConfig = async (event: Event) => {
   }
 }
 
+const importProxySubscription = async () => {
+  if (proxyBulkTestLoading.value || proxyUploadLoading.value || proxySubscriptionImportLoading.value || proxyConfigActionLoading.value !== null) return
+  const subscriptionURL = window.prompt(t('components.main.pool.proxySubscriptionURLPrompt'))
+  if (!subscriptionURL?.trim()) return
+  const subscriptionName = window.prompt(t('components.main.pool.proxySubscriptionNamePrompt'))
+  if (subscriptionName === null) return
+  if (!window.confirm(t('components.main.pool.proxySubscriptionWarning'))) return
+
+  invalidateAllProxyTests()
+  proxySubscriptionImportLoading.value = true
+  try {
+    await ImportProxySubscription(subscriptionURL.trim(), subscriptionName.trim())
+    showToast(t('components.main.pool.proxySubscriptionImportSuccess'), 'success')
+    await listProxyConfigs()
+  } catch (error: any) {
+    console.error('Failed to import proxy subscription:', error)
+    showToast(error?.message || t('components.main.pool.proxySubscriptionImportFailed'), 'error')
+  } finally {
+    proxySubscriptionImportLoading.value = false
+  }
+}
+
 const deleteProxyConfig = async (config: ProxyConfigSummary) => {
-  if (proxyBulkTestLoading.value || proxyUploadLoading.value) return
+  if (proxyBulkTestLoading.value || proxyUploadLoading.value || proxySubscriptionImportLoading.value) return
   const name = proxyConfigFileName(config)
   if (!window.confirm(t('components.main.pool.deleteProxyConfigConfirm', { name }))) return
 
@@ -1335,7 +1407,7 @@ const deleteProxyConfig = async (config: ProxyConfigSummary) => {
 }
 
 const hideProxyConfig = async (config: ProxyConfigSummary) => {
-  if (proxyBulkTestLoading.value || proxyUploadLoading.value) return
+  if (proxyBulkTestLoading.value || proxyUploadLoading.value || proxySubscriptionImportLoading.value) return
   const name = proxyConfigFileName(config)
   if (!window.confirm(t('components.main.pool.hideProxyConfigConfirm', { name }))) return
 
@@ -1354,7 +1426,7 @@ const hideProxyConfig = async (config: ProxyConfigSummary) => {
 }
 
 const unhideProxyConfig = async (config: ProxyConfigSummary) => {
-  if (proxyBulkTestLoading.value || proxyUploadLoading.value) return
+  if (proxyBulkTestLoading.value || proxyUploadLoading.value || proxySubscriptionImportLoading.value) return
   invalidateAllProxyTests()
   proxyConfigActionLoading.value = config.id
   try {
@@ -1370,7 +1442,7 @@ const unhideProxyConfig = async (config: ProxyConfigSummary) => {
 }
 
 const testAllProxyLatencies = async () => {
-  if (proxyBulkTestLoading.value || !hasProxyNodes.value) return
+  if (proxyBulkTestLoading.value || proxySubscriptionImportLoading.value || !hasProxyNodes.value) return
   const targetURL = responsesProbeURL()
   if (!targetURL) {
     showToast(t('components.main.pool.proxyBaseUrlRequired'), 'warning')
@@ -1745,6 +1817,7 @@ const openEditPool = (pool: ProviderPool) => {
     firstTextRetryEnabled: pool.firstTextRetryEnabled ?? false,
     firstTextRetryTimeoutSeconds: pool.firstTextRetryTimeoutSeconds || 100,
     excludeFromTotalTraffic: pool.excludeFromTotalTraffic ?? false,
+    hideFromLogs: pool.hideFromLogs ?? false,
   }
   poolModalState.open = true
   if (resumeBulkTest) void loadSharedProxySpeedTests()
@@ -1857,6 +1930,7 @@ const poolConfigSignature = (pool: Partial<ProviderPool>) => {
     firstTextRetryEnabled: pool.firstTextRetryEnabled === true,
     firstTextRetryTimeoutSeconds: pool.firstTextRetryTimeoutSeconds ?? 100,
     excludeFromTotalTraffic: poolType === 'account' ? pool.excludeFromTotalTraffic === true : false,
+    hideFromLogs: poolType === 'account' ? pool.hideFromLogs === true : false,
     proxyConfig: poolType === 'account'
       ? {
           enabled: pool.proxyConfig?.enabled === true,
@@ -1929,6 +2003,7 @@ const submitPoolModal = async (closeAfterSave = true): Promise<boolean> => {
     poolData.members = []
     poolData.autoBlacklistEnabled = true
     poolData.excludeFromTotalTraffic = poolModalState.form.excludeFromTotalTraffic
+    poolData.hideFromLogs = poolModalState.form.hideFromLogs
     poolData.proxyConfig = poolModalState.form.proxyEnabled
       ? {
           enabled: true,
@@ -2024,6 +2099,28 @@ const unblacklistProvider = async (poolID: string, providerID: number) => {
   }
 }
 
+const isClearingAllBlacklists = (poolID: string): boolean => clearingAllBlacklistsPoolIDs.value.has(poolID)
+
+const clearAllAccountPoolBlacklists = async (pool: ProviderPool) => {
+  if (!window.confirm(t('components.main.pool.clearAllBlacklistsConfirm'))) return
+
+  const pending = new Set(clearingAllBlacklistsPoolIDs.value)
+  pending.add(pool.id)
+  clearingAllBlacklistsPoolIDs.value = pending
+  try {
+    await ClearAllProviderBlacklists(props.platform, pool.id)
+    showToast(t('components.main.pool.allBlacklistsCleared'), 'success')
+    await loadBlacklistStatus()
+  } catch (error: any) {
+    console.error('Failed to clear account-pool blacklists:', error)
+    showToast(error?.message || t('components.main.pool.updateFailed'), 'error')
+  } finally {
+    const next = new Set(clearingAllBlacklistsPoolIDs.value)
+    next.delete(pool.id)
+    clearingAllBlacklistsPoolIDs.value = next
+  }
+}
+
 // 获取 provider 的拉黑剩余时间
 const getBlacklistRemainingMinutes = (penalty: ProviderPoolProviderPenalty): number => {
   if (!penalty.blacklistedUntil) return 0
@@ -2054,6 +2151,18 @@ const getAvailableAccountKeys = (pool: ProviderPool): AccountPoolKey[] =>
 
 const getBlacklistedAccountKeys = (pool: ProviderPool): AccountPoolKey[] =>
   (pool.accountPoolConfig?.keys ?? []).filter((key) => getBlacklistPenalty(pool, key.id))
+
+const isAccountKeysCollapsed = (poolID: string): boolean => collapsedAccountPoolKeys.value.has(poolID)
+
+const toggleAccountKeysCollapsed = (poolID: string) => {
+  const next = new Set(collapsedAccountPoolKeys.value)
+  if (next.has(poolID)) {
+    next.delete(poolID)
+  } else {
+    next.add(poolID)
+  }
+  collapsedAccountPoolKeys.value = next
+}
 
 // 根据 provider ID 获取 provider 名称
 const getProviderNameById = (providerID: number): string => {
@@ -2918,8 +3027,97 @@ watch(
 .account-keys-heading {
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 7px;
+}
+
+.account-keys-heading-main,
+.account-keys-heading-actions,
+.account-key-status {
+  display: flex;
+  align-items: center;
+}
+
+.account-keys-heading-main {
+  min-width: 0;
+  gap: 8px;
+}
+
+.account-keys-heading-actions {
+  margin-left: auto;
+  gap: 10px;
+}
+
+.account-key-status {
+  gap: 12px;
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.account-key-status-available {
+  color: var(--color-success, #16803c);
+}
+
+.account-key-status-blacklisted.active {
+  color: var(--color-danger, #ef4444);
+}
+
+.account-key-collapse-button {
+  display: inline-flex;
+  width: 26px;
+  height: 26px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 6px;
+  background: var(--color-bg, #fff);
+  color: var(--color-text-secondary, #6b7280);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.account-key-clear-blacklists-button {
+  border: 0;
+  background: transparent;
+  color: var(--color-danger, #ef4444);
+  font-size: 11px;
+  padding: 3px 0;
+  cursor: pointer;
+}
+
+.account-key-clear-blacklists-button:focus-visible {
+  outline: 2px solid var(--color-primary, #3b82f6);
+  outline-offset: 2px;
+}
+
+.account-key-clear-blacklists-button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.account-key-collapse-button:hover {
+  border-color: var(--color-border-hover, #c4c8d0);
+  background: var(--color-bg-hover, rgba(0, 0, 0, 0.04));
+  color: var(--color-text, #1f2937);
+}
+
+.account-key-collapse-button:focus-visible {
+  outline: 2px solid var(--color-primary, #3b82f6);
+  outline-offset: 2px;
+}
+
+.account-key-collapse-button svg {
+  width: 15px;
+  height: 15px;
+  transition: transform 0.15s ease;
+}
+
+.account-key-collapse-button svg.expanded {
+  transform: rotate(180deg);
 }
 
 .account-key-count {
@@ -3264,13 +3462,27 @@ watch(
   margin: 0;
 }
 
-.account-traffic-toggle {
-  align-items: flex-start;
+.account-log-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
   padding-top: 12px;
   border-top: 1px solid var(--color-border, #e5e7eb);
 }
 
-.account-traffic-toggle .form-field-hint {
+.account-option-toggle {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.account-option-toggle input {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.account-option-toggle .form-field-hint {
+  flex-basis: 100%;
+  padding-left: 26px;
   margin-top: 2px;
 }
 
@@ -3391,6 +3603,10 @@ watch(
 }
 
 @media (max-width: 760px) {
+  .account-log-options {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .proxy-strategy-group-heading {
     align-items: stretch;
     flex-direction: column;

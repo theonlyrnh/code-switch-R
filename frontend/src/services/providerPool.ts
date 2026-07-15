@@ -65,6 +65,13 @@ export interface AccountPoolKey {
   apiKey: string
 }
 
+/** Mirrors the relay's secret-safe account-key provider label. */
+export function accountPoolKeyDisplayName(key: AccountPoolKey): string {
+  const apiKey = key.apiKey.trim()
+  const maskedKey = apiKey.length <= 4 ? '****' : `****${apiKey.slice(-4)}`
+  return `Account Key ${maskedKey} (#${Math.abs(key.id)})`
+}
+
 export interface AccountPoolConfig {
   apiUrl: string
   responsesEndpoint: string
@@ -100,6 +107,7 @@ export interface ProviderPool {
   accountPoolConfig?: AccountPoolConfig
   proxyConfig?: AccountPoolProxyConfig
   excludeFromTotalTraffic?: boolean
+  hideFromLogs?: boolean
   createdAt: string
   updatedAt: string
   /** 自动拉黑配置（仅 managed 模式生效） */
@@ -167,6 +175,10 @@ export async function ListProxyConfigs(): Promise<ProxyConfigSummary[]> {
 
 export async function UploadProxyConfig(fileName: string, content: string): Promise<void> {
   return Call.ByName('codeswitch/services.ProxyService.UploadProxyConfig', fileName, content)
+}
+
+export async function ImportProxySubscription(subscriptionURL: string, configName: string): Promise<void> {
+  return Call.ByName('codeswitch/services.ProxyService.ImportProxySubscription', subscriptionURL, configName)
 }
 
 export async function DeleteProxyConfig(configID: string): Promise<void> {
@@ -248,6 +260,13 @@ export async function ListProviderBlacklistStatus(platform: string, poolID: stri
  */
 export async function ClearProviderBlacklist(platform: string, poolID: string, providerID: number): Promise<void> {
   return Call.ByName('codeswitch/services.ProviderRelayService.ClearProviderBlacklist', platform, poolID, providerID)
+}
+
+/**
+ * 清除号池内所有已拉黑的密钥
+ */
+export async function ClearAllProviderBlacklists(platform: string, poolID: string): Promise<void> {
+  return Call.ByName('codeswitch/services.ProviderRelayService.ClearAllProviderBlacklists', platform, poolID)
 }
 
 /**

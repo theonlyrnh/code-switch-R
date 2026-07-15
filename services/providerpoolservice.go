@@ -55,9 +55,12 @@ type ProviderPool struct {
 	ProxyConfig       *AccountPoolProxyConfig `json:"proxyConfig,omitempty"`
 	// ExcludeFromTotalTraffic keeps account-pool request logs but excludes their
 	// token usage from aggregate traffic and cost totals.
-	ExcludeFromTotalTraffic bool   `json:"excludeFromTotalTraffic,omitempty"`
-	CreatedAt               string `json:"createdAt"`
-	UpdatedAt               string `json:"updatedAt"`
+	ExcludeFromTotalTraffic bool `json:"excludeFromTotalTraffic,omitempty"`
+	// HideFromLogs is a UI preference. The relay still records and returns all
+	// request logs; the logs page uses this flag to hide account-pool entries.
+	HideFromLogs bool   `json:"hideFromLogs,omitempty"`
+	CreatedAt    string `json:"createdAt"`
+	UpdatedAt    string `json:"updatedAt"`
 
 	// 自动拉黑配置（仅 managed 模式生效）
 	AutoBlacklistEnabled         bool                   `json:"autoBlacklistEnabled"`
@@ -406,6 +409,7 @@ func normalizeAndValidatePoolForSave(pool *ProviderPool, existing *ProviderPool,
 		pool.AccountPoolConfig = nil
 		pool.ProxyConfig = nil
 		pool.ExcludeFromTotalTraffic = false
+		pool.HideFromLogs = false
 		return nil
 	}
 
@@ -942,6 +946,7 @@ func (s *ProviderPoolService) loadLocked() (*providerPoolStore, error) {
 			store.Pools[i].AccountPoolConfig = nil
 			store.Pools[i].ProxyConfig = nil
 			store.Pools[i].ExcludeFromTotalTraffic = false
+			store.Pools[i].HideFromLogs = false
 		} else if store.Pools[i].ProxyConfig == nil {
 			store.Pools[i].ProxyConfig = &AccountPoolProxyConfig{Selection: AccountPoolProxySelectionNone}
 		}
