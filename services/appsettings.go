@@ -22,7 +22,7 @@ type AppSettings struct {
 	AutoStart                        bool `json:"auto_start"`
 	AutoConnectivityTest             bool `json:"auto_connectivity_test"`
 	EnableSwitchNotify               bool `json:"enable_switch_notify"`      // 供应商切换通知开关
-	EnableCodexStreamGuard           bool `json:"enable_codex_stream_guard"` // Codex 流式空响应保护开关
+	EnableCodexStreamGuard           bool `json:"enable_codex_stream_guard"` // Deprecated: retained for settings-file compatibility; Responses guarding is mandatory.
 	EnableProxyLatencyMultithreading bool `json:"enable_proxy_latency_multithreading"`
 	ProxyLatencyMaxConcurrency       int  `json:"proxy_latency_max_concurrency"`
 }

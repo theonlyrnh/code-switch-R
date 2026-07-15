@@ -26,7 +26,6 @@ const homeTitleVisible = ref(getCachedValue('homeTitle', true))
 const autoStartEnabled = ref(getCachedValue('autoStart', false))
 const autoConnectivityTestEnabled = ref(getCachedValue('autoConnectivityTest', false))
 const switchNotifyEnabled = ref(getCachedValue('switchNotify', true)) // 切换通知开关
-const codexStreamGuardEnabled = ref(getCachedValue('codexStreamGuard', true))
 const proxyLatencyMultithreadingEnabled = ref(true)
 const proxyLatencyMaxConcurrency = ref(3)
 const settingsLoading = ref(true)
@@ -59,7 +58,6 @@ const loadAppSettings = async () => {
     autoStartEnabled.value = data?.auto_start ?? false
     autoConnectivityTestEnabled.value = data?.auto_connectivity_test ?? false
     switchNotifyEnabled.value = data?.enable_switch_notify ?? true
-    codexStreamGuardEnabled.value = data?.enable_codex_stream_guard ?? true
     proxyLatencyMultithreadingEnabled.value = data?.enable_proxy_latency_multithreading ?? true
     proxyLatencyMaxConcurrency.value = data?.proxy_latency_max_concurrency ?? 3
 
@@ -68,14 +66,12 @@ const loadAppSettings = async () => {
     localStorage.setItem('app-settings-autoStart', String(autoStartEnabled.value))
     localStorage.setItem('app-settings-autoConnectivityTest', String(autoConnectivityTestEnabled.value))
     localStorage.setItem('app-settings-switchNotify', String(switchNotifyEnabled.value))
-    localStorage.setItem('app-settings-codexStreamGuard', String(codexStreamGuardEnabled.value))
   } catch (error) {
     console.error('failed to load app settings', error)
     homeTitleVisible.value = true
     autoStartEnabled.value = false
     autoConnectivityTestEnabled.value = false
     switchNotifyEnabled.value = true
-    codexStreamGuardEnabled.value = true
     proxyLatencyMultithreadingEnabled.value = true
     proxyLatencyMaxConcurrency.value = 3
   } finally {
@@ -93,7 +89,6 @@ const persistAppSettings = async () => {
       auto_start: autoStartEnabled.value,
       auto_connectivity_test: autoConnectivityTestEnabled.value,
       enable_switch_notify: switchNotifyEnabled.value,
-      enable_codex_stream_guard: codexStreamGuardEnabled.value,
       enable_proxy_latency_multithreading: proxyLatencyMultithreadingEnabled.value,
       proxy_latency_max_concurrency: proxyLatencyMaxConcurrency.value,
     }
@@ -110,7 +105,6 @@ const persistAppSettings = async () => {
     localStorage.setItem('app-settings-autoStart', String(autoStartEnabled.value))
     localStorage.setItem('app-settings-autoConnectivityTest', String(autoConnectivityTestEnabled.value))
     localStorage.setItem('app-settings-switchNotify', String(switchNotifyEnabled.value))
-    localStorage.setItem('app-settings-codexStreamGuard', String(codexStreamGuardEnabled.value))
 
     window.dispatchEvent(new CustomEvent('app-settings-updated'))
   } catch (error) {
@@ -184,20 +178,6 @@ onMounted(async () => {
                 <span></span>
               </label>
               <span class="hint-text">{{ $t('components.general.label.switchNotifyHint') }}</span>
-            </div>
-          </ListItem>
-          <ListItem :label="$t('components.general.label.codexStreamGuard')">
-            <div class="toggle-with-hint">
-              <label class="mac-switch">
-                <input
-                  type="checkbox"
-                  :disabled="settingsLoading || saveBusy"
-                  v-model="codexStreamGuardEnabled"
-                  @change="persistAppSettings"
-                />
-                <span></span>
-              </label>
-              <span class="hint-text">{{ $t('components.general.label.codexStreamGuardHint') }}</span>
             </div>
           </ListItem>
         </div>

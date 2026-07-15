@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,44 +21,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
-
-func TestCodexEmptyStreamRetryDelayCanBeCancelledByUserRetry(t *testing.T) {
-	oldTracker := defaultActiveRequestTracker
-	defaultActiveRequestTracker = newActiveRequestTracker()
-	t.Cleanup(func() {
-		defaultActiveRequestTracker = oldTracker
-	})
-
-	requestLog := &ReqeustLog{Platform: "openai-responses", Provider: "provider-a"}
-	requestLog.startedAt = time.Now()
-	requestLog.ActiveRequestID = defaultActiveRequestTracker.Start(requestLog, requestLog.startedAt)
-
-	done := make(chan error, 1)
-	go func() {
-		done <- waitBeforeCodexEmptyStreamRetryForRequest(context.Background(), requestLog)
-	}()
-
-	deadline := time.Now().Add(time.Second)
-	for {
-		result := defaultActiveRequestTracker.Retry(-requestLog.ActiveRequestID, "")
-		if result.Status == activeRequestRetryTriggered {
-			break
-		}
-		if result.Status != activeRequestRetryIgnoredTransition || time.Now().After(deadline) {
-			t.Fatalf("retry delay status = %q, want eventual %q", result.Status, activeRequestRetryTriggered)
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	select {
-	case err := <-done:
-		if !errors.Is(err, errActiveRequestRetryRequested) {
-			t.Fatalf("retry delay error = %v, want %v", err, errActiveRequestRetryRequested)
-		}
-	case <-time.After(250 * time.Millisecond):
-		t.Fatal("user retry did not interrupt the empty-stream retry delay")
-	}
-}
 
 func TestStreamingLineDoesNotWriteAfterUserRetryWins(t *testing.T) {
 	oldTracker := defaultActiveRequestTracker
@@ -442,7 +405,7 @@ func TestUpstreamHTMLStreamErrorAllowsSSE(t *testing.T) {
 	}
 }
 
-func TestWriteCodexGuardedStreamingResponseRejectsEmptyStreamAfterKeepAlive(t *testing.T) {
+func TestWriteCodexGuardedStreamingResponseRejectsEmptyStreamWithoutCommittingResponse(t *testing.T) {
 	resp := xrequest.NewResponse(&http.Response{
 		StatusCode: http.StatusOK,
 		Header: http.Header{
@@ -457,17 +420,232 @@ func TestWriteCodexGuardedStreamingResponseRejectsEmptyStreamAfterKeepAlive(t *t
 	if !errors.Is(err, errCodexEmptyStream) {
 		t.Fatalf("err = %v, want errCodexEmptyStream", err)
 	}
-	if !responseWritten {
-		t.Fatalf("responseWritten = false, want true for keepalive")
+	if responseWritten {
+		t.Fatal("empty stream committed an HTTP response before the relay could return 502")
 	}
 	if written != 0 {
 		t.Fatalf("written = %d, want 0", written)
 	}
-	if body := recorder.BodyString(); body != codexStreamGuardKeepAliveComment {
-		t.Fatalf("body = %q, want keepalive only", body)
+	if body := recorder.BodyString(); body != "" {
+		t.Fatalf("body = %q, want no committed body", body)
 	}
-	if recorder.status != http.StatusOK {
-		t.Fatalf("status = %d, want 200 for keepalive", recorder.status)
+	if recorder.status != 0 {
+		t.Fatalf("status = %d, want no committed status", recorder.status)
+	}
+}
+
+func TestWriteCodexGuardedStreamingResponseRejectsCompletedWithoutUsefulContent(t *testing.T) {
+	resp := xrequest.NewResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"type\":\"response.created\"}\n\n" +
+				"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_empty\",\"output\":[],\"usage\":{\"input_tokens\":12,\"output_tokens\":0}}}\n\n" +
+				"data: [DONE]\n\n",
+		)),
+	})
+
+	recorder := newStreamingRecorder()
+	written, responseWritten, err := writeCodexGuardedStreamingResponse(recorder, resp, &ReqeustLog{startedAt: time.Now()})
+	if !errors.Is(err, errCodexEmptyStream) {
+		t.Fatalf("err = %v, want errCodexEmptyStream", err)
+	}
+	if written != 0 || responseWritten || recorder.status != 0 || recorder.BodyString() != "" {
+		t.Fatalf("completed empty response was committed: written=%d responseWritten=%v status=%d body=%q", written, responseWritten, recorder.status, recorder.BodyString())
+	}
+}
+
+func TestWriteCodexGuardedStreamingResponseAcceptsCompletedWithEmbeddedOutput(t *testing.T) {
+	resp := xrequest.NewResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_full\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"embedded output\"}]}]}}\n\n" +
+				"data: [DONE]\n\n",
+		)),
+	})
+
+	recorder := newStreamingRecorder()
+	requestLog := &ReqeustLog{startedAt: time.Now()}
+	_, responseWritten, err := writeCodexGuardedStreamingResponse(recorder, resp, requestLog, ReqeustLogHook(nil, "openai-responses", requestLog))
+	if err != nil {
+		t.Fatalf("guard returned error: %v", err)
+	}
+	if !responseWritten || recorder.status != http.StatusOK || !strings.Contains(recorder.BodyString(), "embedded output") {
+		t.Fatalf("completed response with embedded output was not forwarded: written=%v status=%d body=%q", responseWritten, recorder.status, recorder.BodyString())
+	}
+	if requestLog.FirstTextSec <= 0 {
+		t.Fatal("embedded completed output did not mark first useful content")
+	}
+}
+
+func TestWriteCodexGuardedStreamingResponseAcceptsCompletedCodexOutputItems(t *testing.T) {
+	tests := []struct {
+		name string
+		item string
+	}{
+		{
+			name: "image generation",
+			item: `{"type":"image_generation_call","id":"ig_1","status":"completed","revised_prompt":"a blue square","result":"Zm9v"}`,
+		},
+		{
+			name: "compaction",
+			item: `{"type":"compaction","encrypted_content":"encrypted-summary"}`,
+		},
+		{
+			name: "compaction summary alias",
+			item: `{"type":"compaction_summary","encrypted_content":"encrypted-summary"}`,
+		},
+		{
+			name: "reasoning with encrypted content",
+			item: `{"type":"reasoning","id":"reasoning_1","summary":[],"encrypted_content":"encrypted-reasoning"}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload := fmt.Sprintf(
+				"data: {\"type\":\"response.output_item.done\",\"item\":%s}\n\n"+
+					"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_item\"}}\n\n",
+				test.item,
+			)
+			resp := xrequest.NewResponse(&http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(payload)),
+			})
+			recorder := newStreamingRecorder()
+			requestLog := &ReqeustLog{startedAt: time.Now()}
+			_, responseWritten, err := writeCodexGuardedStreamingResponse(recorder, resp, requestLog, ReqeustLogHook(nil, "openai-responses", requestLog))
+			if err != nil {
+				t.Fatalf("guard returned error: %v", err)
+			}
+			if !responseWritten || recorder.status != http.StatusOK || !strings.Contains(recorder.BodyString(), "response.output_item.done") {
+				t.Fatalf("valid Codex output item was not forwarded: written=%v status=%d body=%q", responseWritten, recorder.status, recorder.BodyString())
+			}
+			if requestLog.FirstTextSec <= 0 {
+				t.Fatal("valid Codex output item did not mark first useful content")
+			}
+		})
+	}
+}
+
+func TestWriteCodexGuardedStreamingResponseDoesNotReleaseEmptyReasoningPlaceholder(t *testing.T) {
+	tests := []struct {
+		name    string
+		trailer string
+		wantErr error
+	}{
+		{
+			name:    "followed by terminal failure",
+			trailer: "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\"}}\n\n",
+			wantErr: errCodexTerminalStreamFailure,
+		},
+		{
+			name:    "followed by EOF",
+			wantErr: errCodexEmptyStream,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload := "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"reasoning_empty\",\"summary\":[]}}\n\n" + test.trailer
+			resp := xrequest.NewResponse(&http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(payload)),
+			})
+			recorder := newStreamingRecorder()
+			requestLog := &ReqeustLog{startedAt: time.Now()}
+			written, responseWritten, err := writeCodexGuardedStreamingResponse(recorder, resp, requestLog, ReqeustLogHook(nil, "openai-responses", requestLog))
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("err = %v, want %v", err, test.wantErr)
+			}
+			if written != 0 || responseWritten || recorder.status != 0 || recorder.BodyString() != "" || requestLog.FirstTextSec != 0 {
+				t.Fatalf("empty reasoning placeholder was released: written=%d responseWritten=%v status=%d firstText=%f body=%q", written, responseWritten, recorder.status, requestLog.FirstTextSec, recorder.BodyString())
+			}
+		})
+	}
+}
+
+func TestWriteCodexGuardedStreamingResponseReleasesOnToolCallAdded(t *testing.T) {
+	tests := []struct {
+		name string
+		item string
+	}{
+		{
+			name: "web search",
+			item: `{"type":"web_search_call","id":"web_1","status":"in_progress"}`,
+		},
+		{
+			name: "function call",
+			item: `{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":""}`,
+		},
+		{
+			name: "local shell",
+			item: `{"type":"local_shell_call","call_id":"shell_1","status":"in_progress","action":{"type":"exec","command":["pwd"]}}`,
+		},
+		{
+			name: "custom tool",
+			item: `{"type":"custom_tool_call","call_id":"custom_1","name":"apply_patch","input":""}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload := fmt.Sprintf(
+				"data: {\"type\":\"response.output_item.added\",\"item\":%s}\n\n"+
+					"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool\"}}\n\n",
+				test.item,
+			)
+			resp := xrequest.NewResponse(&http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(payload)),
+			})
+			recorder := newStreamingRecorder()
+			requestLog := &ReqeustLog{startedAt: time.Now()}
+			_, responseWritten, err := writeCodexGuardedStreamingResponseWithOptions(
+				recorder,
+				resp,
+				requestLog,
+				codexStreamGuardOptions{
+					deferInitialKeepAlive:        true,
+					disableKeepAliveUntilRelease: true,
+					firstUsefulContentTimeout:    25 * time.Millisecond,
+				},
+				ReqeustLogHook(nil, "openai-responses", requestLog),
+			)
+			if err != nil {
+				t.Fatalf("guard returned error: %v", err)
+			}
+			if !responseWritten || recorder.status != http.StatusOK || !strings.Contains(recorder.BodyString(), "response.output_item.added") {
+				t.Fatalf("tool call added event was not forwarded: written=%v status=%d body=%q", responseWritten, recorder.status, recorder.BodyString())
+			}
+			if requestLog.FirstTextSec <= 0 {
+				t.Fatal("tool call added event did not mark first useful content")
+			}
+		})
+	}
+}
+
+func TestWriteCodexGuardedStreamingResponseRejectsTerminalBeforeUsefulContent(t *testing.T) {
+	for _, eventType := range []string{"response.failed", "response.incomplete"} {
+		t.Run(eventType, func(t *testing.T) {
+			resp := xrequest.NewResponse(&http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("data: {\"type\":%q,\"response\":{\"id\":\"resp_terminal\"}}\n\n", eventType))),
+			})
+			recorder := newStreamingRecorder()
+			written, responseWritten, err := writeCodexGuardedStreamingResponse(recorder, resp, &ReqeustLog{startedAt: time.Now()})
+			if !errors.Is(err, errCodexTerminalStreamFailure) {
+				t.Fatalf("err = %v, want errCodexTerminalStreamFailure", err)
+			}
+			if written != 0 || responseWritten || recorder.status != 0 || recorder.BodyString() != "" {
+				t.Fatalf("terminal response was committed: written=%d responseWritten=%v status=%d body=%q", written, responseWritten, recorder.status, recorder.BodyString())
+			}
+		})
 	}
 }
 
@@ -476,6 +654,7 @@ func TestWriteCodexGuardedStreamingResponseCommitsOnlyCompletedResponseID(t *tes
 		name       string
 		payload    string
 		wantCommit string
+		wantErr    error
 	}{
 		{
 			name: "completed",
@@ -488,11 +667,13 @@ func TestWriteCodexGuardedStreamingResponseCommitsOnlyCompletedResponseID(t *tes
 			name: "failed",
 			payload: "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\"}}\n\n" +
 				"data: [DONE]\n\n",
+			wantErr: errCodexTerminalStreamFailure,
 		},
 		{
 			name: "incomplete",
 			payload: "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\"}}\n\n" +
 				"data: [DONE]\n\n",
+			wantErr: errCodexTerminalStreamFailure,
 		},
 	}
 
@@ -515,8 +696,8 @@ func TestWriteCodexGuardedStreamingResponseCommitsOnlyCompletedResponseID(t *tes
 					},
 				},
 			)
-			if err != nil {
-				t.Fatalf("guard returned error: %v", err)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("guard error = %v, want %v", err, test.wantErr)
 			}
 			if committed != test.wantCommit {
 				t.Fatalf("committed response id = %q, want %q", committed, test.wantCommit)
@@ -567,20 +748,18 @@ func TestWriteCodexGuardedStreamingResponseReleasesOnUsefulContent(t *testing.T)
 
 	select {
 	case <-recorder.wroteCh:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatalf("guard did not write initial keepalive")
-	}
-	if body := recorder.BodyString(); body != codexStreamGuardKeepAliveComment {
-		t.Fatalf("body = %q, want initial keepalive only", body)
+		t.Fatal("guard committed a response before useful content")
+	case <-time.After(50 * time.Millisecond):
 	}
 
 	if _, err := pw.Write([]byte("data: {\"type\":\"response.created\"}\n\n")); err != nil {
 		t.Fatalf("write created event: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-	if body := recorder.BodyString(); strings.Contains(body, "response.created") {
-		t.Fatalf("guard leaked buffered event before useful content, body=%q", body)
+	select {
+	case <-recorder.wroteCh:
+		t.Fatalf("guard released metadata before useful content: %q", recorder.BodyString())
+	case <-time.After(50 * time.Millisecond):
 	}
 
 	if _, err := pw.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n")); err != nil {
@@ -1435,46 +1614,6 @@ func TestClearAllProviderBlacklistsForUserOnlyClearsTargetPool(t *testing.T) {
 	}
 }
 
-func TestSelectCodexEmptyStreamRetryProviderDoesNotFallbackToOtherProvider(t *testing.T) {
-	testHome := t.TempDir()
-	t.Setenv("HOME", testHome)
-
-	configDir := filepath.Join(testHome, ".code-switch")
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		t.Fatalf("create config dir: %v", err)
-	}
-	payload, err := json.Marshal(providerEnvelope{Providers: []Provider{
-		{
-			ID:      1,
-			Name:    "other-provider",
-			APIURL:  "https://other.example.com",
-			APIKey:  "other-key",
-			Enabled: true,
-		},
-	}})
-	if err != nil {
-		t.Fatalf("marshal providers: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(configDir, "openai-responses.json"), payload, 0o600); err != nil {
-		t.Fatalf("write providers: %v", err)
-	}
-
-	relay := NewProviderRelayService(NewProviderService(), NewProviderPoolService(), nil, nil, nil, DefaultRelayBindAddr)
-
-	// 创建测试用的 pool
-	_, _ = relay.poolService.EnsureDefaultPool("openai-responses", []Provider{
-		{ID: 1, Name: "other-provider", Enabled: true},
-	}, DefaultPoolSeed{Mode: ProviderPoolModeManaged})
-
-	provider, ok, err := relay.selectCodexEmptyStreamRetryProvider("openai-responses", "pool_openai-responses_default", "current-provider", "gpt-5.5")
-	if err != nil {
-		t.Fatalf("select retry provider returned error: %v", err)
-	}
-	if ok {
-		t.Fatalf("expected no fallback provider, got %#v", provider)
-	}
-}
-
 func TestCodexDirectAppliedProviderIDDetectedInManualMode(t *testing.T) {
 	testHome := t.TempDir()
 	t.Setenv("HOME", testHome)
@@ -2072,6 +2211,28 @@ func TestHasContentInResponseOpenAIChatWithToolCalls(t *testing.T) {
 
 	if !hasContentInResponse(body, "openai-chat") {
 		t.Fatal("expected hasContent=true for OpenAI Chat with tool_calls")
+	}
+}
+
+func TestHasContentInResponseOpenAIResponsesCodexOutputItems(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		item string
+	}{
+		{name: "image generation", item: `{"type":"image_generation_call","status":"completed","result":"Zm9v"}`},
+		{name: "compaction", item: `{"type":"compaction","encrypted_content":"encrypted-summary"}`},
+		{name: "compaction summary", item: `{"type":"compaction_summary","encrypted_content":"encrypted-summary"}`},
+		{name: "reasoning encrypted", item: `{"type":"reasoning","summary":[],"encrypted_content":"encrypted-reasoning"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if !hasContentInResponse([]byte(fmt.Sprintf(`{"output":[%s]}`, test.item)), "openai-responses") {
+				t.Fatalf("expected valid Responses output item to contain useful content: %s", test.item)
+			}
+		})
+	}
+
+	if hasContentInResponse([]byte(`{"output":[{"type":"reasoning","summary":[]}]}`), "openai-responses") {
+		t.Fatal("empty reasoning placeholder should not count as useful content")
 	}
 }
 

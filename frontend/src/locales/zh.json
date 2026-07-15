@@ -775,8 +775,6 @@
         "autoStart": "开机自启动",
         "switchNotify": "切换通知",
         "switchNotifyHint": "供应商切换时发送系统通知",
-        "codexStreamGuard": "Codex 流式空响应保护",
-        "codexStreamGuardHint": "拦截 200 但开头无有效内容的 Codex 流式响应，并在客户端感知前自动重试",
         "firstTextRetryTimeout": "首字超时重试",
         "firstTextRetryHint": "开启后，未在规定时间收到有效输出的请求将自动重试并计入 HTTP 错误次数",
         "firstTextRetryTimeoutSeconds": "首字重试时间（秒）",

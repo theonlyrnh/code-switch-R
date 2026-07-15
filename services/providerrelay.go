@@ -120,6 +120,135 @@ func (attempt *providerRequestAttempt) close() {
 // Keep this JSON stable because special blacklist rules can match its fields.
 const firstTextTimeoutErrorBody = `{"error":{"type":"first_text_timeout","code":"first_text_timeout","message":"upstream first text timeout"}}`
 
+const (
+	emptyStreamErrorCode           = "empty_stream"
+	terminalStreamFailureErrorCode = "terminal_stream_failure"
+	initialBufferLimitErrorCode    = "initial_buffer_limit"
+	streamPreflightErrorCode       = "stream_preflight_error"
+	invalidStreamContentTypeCode   = "invalid_stream_content_type"
+)
+
+// upstreamProtocolError represents a syntactically successful HTTP response
+// that is unusable at the relay protocol layer. The relay status/body are what
+// clients and blacklist rules should observe; upstreamStatus preserves the
+// original transport result for diagnostics.
+type upstreamProtocolError struct {
+	statusCode     int
+	upstreamStatus int
+	code           string
+	message        string
+	body           []byte
+	cause          error
+}
+
+func newUpstreamProtocolError(upstreamStatus int, code, message string, cause error) *upstreamProtocolError {
+	body := []byte(fmt.Sprintf(
+		`{"error":{"type":"upstream_protocol_error","code":%q,"message":%q,"upstream_status":%d}}`,
+		code,
+		message,
+		upstreamStatus,
+	))
+	return &upstreamProtocolError{
+		statusCode:     http.StatusBadGateway,
+		upstreamStatus: upstreamStatus,
+		code:           code,
+		message:        message,
+		body:           body,
+		cause:          cause,
+	}
+}
+
+func newEmptyStreamProtocolError(upstreamStatus int) *upstreamProtocolError {
+	return newUpstreamProtocolError(
+		upstreamStatus,
+		emptyStreamErrorCode,
+		errCodexEmptyStream.Error(),
+		errCodexEmptyStream,
+	)
+}
+
+func newCodexStreamPreflightProtocolError(upstreamStatus int, cause error) *upstreamProtocolError {
+	switch {
+	case errors.Is(cause, errCodexEmptyStream):
+		return newEmptyStreamProtocolError(upstreamStatus)
+	case errors.Is(cause, errCodexTerminalStreamFailure):
+		return newUpstreamProtocolError(
+			upstreamStatus,
+			terminalStreamFailureErrorCode,
+			errCodexTerminalStreamFailure.Error(),
+			errCodexTerminalStreamFailure,
+		)
+	case errors.Is(cause, errCodexInitialBufferLimit):
+		return newUpstreamProtocolError(
+			upstreamStatus,
+			initialBufferLimitErrorCode,
+			errCodexInitialBufferLimit.Error(),
+			errCodexInitialBufferLimit,
+		)
+	default:
+		return newUpstreamProtocolError(
+			upstreamStatus,
+			streamPreflightErrorCode,
+			"codex upstream stream failed before useful content",
+			cause,
+		)
+	}
+}
+
+func newInvalidStreamContentTypeProtocolError(upstreamStatus int, cause error) *upstreamProtocolError {
+	return newUpstreamProtocolError(
+		upstreamStatus,
+		invalidStreamContentTypeCode,
+		"codex upstream returned HTML instead of an SSE stream",
+		cause,
+	)
+}
+
+func (e *upstreamProtocolError) Error() string {
+	if e == nil {
+		return "upstream protocol error"
+	}
+	return fmt.Sprintf("upstream protocol error %s: %s (upstream HTTP %d)", e.code, e.message, e.upstreamStatus)
+}
+
+func (e *upstreamProtocolError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func writeUpstreamProtocolError(c *gin.Context, protocolErr *upstreamProtocolError) {
+	if c == nil || protocolErr == nil {
+		return
+	}
+	c.Data(protocolErr.statusCode, "application/json; charset=utf-8", protocolErr.body)
+}
+
+func setRequestLogProtocolError(requestLog *ReqeustLog, protocolErr *upstreamProtocolError) {
+	if requestLog == nil || protocolErr == nil {
+		return
+	}
+	requestLog.HttpCode = protocolErr.statusCode
+	requestLog.ErrorMessage = string(protocolErr.body)
+}
+
+func protocolErrorFromError(err error) (*upstreamProtocolError, bool) {
+	var protocolErr *upstreamProtocolError
+	if !errors.As(err, &protocolErr) || protocolErr == nil {
+		return nil, false
+	}
+	return protocolErr, true
+}
+
+func emptyStreamProtocolError(err error) (*upstreamProtocolError, bool) {
+	protocolErr, ok := protocolErrorFromError(err)
+	if !ok || protocolErr.code != emptyStreamErrorCode {
+		return nil, false
+	}
+	return protocolErr, true
+}
+
 // upstreamClientRequestError preserves a request-scoped upstream 4xx response
 // so an account pool can return it without trying every account key.
 type upstreamClientRequestError struct {
@@ -200,7 +329,6 @@ func isProxyRequestError(err error) (*proxyRequestError, bool) {
 	return nil, false
 }
 
-const codexEmptyStreamRetryDelay = time.Second
 const relayTrustedProxiesEnv = "CODE_SWITCH_TRUSTED_PROXIES"
 
 func NewProviderRelayService(providerService *ProviderService, poolService *ProviderPoolService, codexRelayKeys *CodexRelayKeyService, notificationService *NotificationService, appSettings *AppSettingsService, addr string) *ProviderRelayService {
@@ -638,18 +766,6 @@ func (prs *ProviderRelayService) GetAllLastUsedProviders() []*LastUsedProvider {
 	return result
 }
 
-// isCodexStreamGuardEnabled 检查 Codex 流式空响应保护是否启用
-func (prs *ProviderRelayService) isCodexStreamGuardEnabled() bool {
-	if prs.appSettings == nil {
-		return true
-	}
-	settings, err := prs.appSettings.GetAppSettings()
-	if err != nil {
-		return true
-	}
-	return settings.EnableCodexStreamGuard
-}
-
 func firstTextRetryTimeout(pool *ProviderPool) time.Duration {
 	if pool == nil || !pool.FirstTextRetryEnabled {
 		return 0
@@ -661,28 +777,19 @@ func firstTextRetryTimeout(pool *ProviderPool) time.Duration {
 }
 
 func (prs *ProviderRelayService) shouldUseCodexStreamGuard(kind, endpoint string) bool {
-	// openai-responses 走 stream guard（Codex 客户端走这个端点）
-	// openai-chat 不走 stream guard
+	// Delayed commitment is now a Responses protocol invariant. The legacy
+	// setting remains readable for configuration compatibility, but disabling it
+	// must not restore HTTP 200 + empty stream behavior.
 	if kind == "openai-responses" {
-		return prs.isCodexStreamGuardEnabled()
-	}
-	return strings.EqualFold(kind, "codex") && isResponsesEndpoint(endpoint) && prs.isCodexStreamGuardEnabled()
-}
-
-// Account-pool failover needs a preflight guard even when the optional normal
-// Codex stream guard is disabled. Without it, a 200 SSE failure would be
-// written to the client before another account key can be attempted.
-func (prs *ProviderRelayService) shouldUseResponseStreamGuard(c *gin.Context, kind, endpoint string) bool {
-	if c != nil && c.Request != nil && accountPoolStickyRequestFromContext(c.Request.Context()) != nil {
 		return true
 	}
-	// 首字超时重试必须独立于旧的空流保护开关。开启后，Responses
-	// 流需要在写给客户端前等待真正的首个有效输出。
-	var pool *ProviderPool
-	if c != nil && c.Request != nil {
-		pool = providerPoolFromContext(c.Request.Context())
-	}
-	if (kind == "openai-responses" || (strings.EqualFold(kind, "codex") && isResponsesEndpoint(endpoint))) && firstTextRetryTimeout(pool) > 0 {
+	return strings.EqualFold(kind, "codex") && isResponsesEndpoint(endpoint)
+}
+
+// Responses streams always use a preflight guard. This is a protocol invariant:
+// HTTP 200 is not committed until the upstream has produced useful output.
+func (prs *ProviderRelayService) shouldUseResponseStreamGuard(c *gin.Context, kind, endpoint string) bool {
+	if c != nil && c.Request != nil && accountPoolStickyRequestFromContext(c.Request.Context()) != nil {
 		return true
 	}
 	return prs.shouldUseCodexStreamGuard(kind, endpoint)
@@ -855,19 +962,20 @@ func (prs *ProviderRelayService) commitAccountPoolStickyResponse(c *gin.Context,
 
 func (prs *ProviderRelayService) responseStreamGuardOptions(c *gin.Context, provider Provider, firstUsefulContentTimeout time.Duration) codexStreamGuardOptions {
 	options := codexStreamGuardOptions{
-		firstUsefulContentTimeout: firstUsefulContentTimeout,
+		firstUsefulContentTimeout:    firstUsefulContentTimeout,
+		deferInitialKeepAlive:        true,
+		disableKeepAliveUntilRelease: true,
 	}
 	if prs == nil || c == nil || accountPoolStickyRequestFromContext(c.Request.Context()) == nil {
 		return options
 	}
 	return codexStreamGuardOptions{
 		firstUsefulContentTimeout: options.firstUsefulContentTimeout,
-		// The normal guard writes an immediate keepalive. For an account pool,
-		// defer that first write so an empty upstream can fail over without
-		// committing a 200 response before another key is tried.
-		deferInitialKeepAlive:        true,
-		disableKeepAliveUntilRelease: true,
-		failOnTerminalBeforeWrite:    true,
+		// Every guarded Responses stream stays uncommitted until useful content
+		// arrives. Account pools additionally commit the successful response ID
+		// for sticky continuation routing.
+		deferInitialKeepAlive:        options.deferInitialKeepAlive,
+		disableKeepAliveUntilRelease: options.disableKeepAliveUntilRelease,
 		onSuccessfulCompleted: func(responseID string) {
 			prs.commitAccountPoolStickyResponse(c, provider, responseID)
 		},
@@ -1859,22 +1967,6 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 						break
 					}
 
-					failedFromEmptyStreamRetry := false
-					if !ok && !accountPool && isCodexStreamPreflightRetryError(err) {
-						var retryAttempts int
-						var retryDuration time.Duration
-						ok, provider, err, retryAttempts, retryDuration, failedFromEmptyStreamRetry = prs.retryCodexEmptyStreamSameProvider(c, kind, poolID, pool, provider, endpoint, query, clientHeaders, bodyBytes, isStream, requestedModel, currentLog, err)
-						totalAttempts += retryAttempts
-						duration += retryDuration
-						if errors.Is(err, errActiveRequestRetryRequested) {
-							fmt.Printf("[INFO] 用户在空流保护重试期间触发重试，按当前池优先级重新选择 provider: Provider=%s\n", provider.Name)
-							releaseProviderSlot(true)
-							retrySelectingPoolPriority = true
-							retryRequested = true
-							break
-						}
-					}
-
 					if ok {
 						releaseProviderSlot(true)
 						fmt.Printf("[INFO]   ✓ Level %d 成功: %s | 耗时: %.2fs\n", level, provider.Name, duration.Seconds())
@@ -1948,20 +2040,23 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 					if errorBody != "" {
 						attemptLogMessage = errorBody
 					}
-					if !failedFromEmptyStreamRetry {
-						prs.recordPoolAttemptError(userID, pool, provider, statusCode, matchedRule, attemptLogMessage)
-					}
+					prs.recordPoolAttemptError(userID, pool, provider, statusCode, matchedRule, attemptLogMessage)
 					failureReason := errorMsg
-					if matchedRule == nil && statusCode > 0 {
+					if protocolErr, ok := protocolErrorFromError(err); ok {
+						failureReason = protocolErr.code
+					} else if matchedRule == nil && statusCode > 0 {
 						failureReason = fmt.Sprintf("HTTP %d", statusCode)
 					}
 
-					// 记录 provider 失败（自动拉黑逻辑）。流预提交重试路径已在内部计数，跳过。
-					blacklistedAfterFailure := false
-					if !failedFromEmptyStreamRetry {
-						blacklistedAfterFailure = prs.recordProviderFailureWithRuleForUser(userID, kind, poolID, pool, provider, failureReason, matchedRule)
-					} else {
-						blacklistedAfterFailure = prs.isProviderBlacklistedForUser(userID, kind, poolID, provider.ID)
+					// 每个实际 provider/key 尝试只向普通或高级拉黑机制提交一次失败。
+					blacklistedAfterFailure := prs.recordProviderFailureWithRuleForUser(userID, kind, poolID, pool, provider, failureReason, matchedRule)
+					if _, emptyStreamFailure := emptyStreamProtocolError(err); emptyStreamFailure && !blacklistedAfterFailure {
+						// 空流是可重试的请求级协议故障，但不能在同一个逻辑请求中
+						// 反复消耗全局失败阈值。未达到拉黑条件时直接把标准化
+						// 502 返回客户端；后续独立请求可再次尝试这个粘性 key。
+						releaseProviderSlot(true)
+						stopOnStickyFailure = true
+						break
 					}
 					if strictAccountStickiness {
 						// Rebuild the attempt plan after every key failure. While the
@@ -2034,6 +2129,12 @@ func (prs *ProviderRelayService) proxyHandler(kind string, endpoint string) gin.
 			}
 			fmt.Printf("[ERROR] 所有 %d 个 provider 均失败，最后尝试: %s | 错误: %s\n",
 				totalAttempts, lastProvider, errorMsg)
+
+			if protocolErr, ok := protocolErrorFromError(lastError); ok {
+				setRequestLogProtocolError(requestLog, protocolErr)
+				writeUpstreamProtocolError(c, protocolErr)
+				return
+			}
 
 			if accountPool {
 				if _, proxyFailure := isProxyRequestError(lastError); !proxyFailure {
@@ -2611,12 +2712,14 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 					requestLog.ErrorMessage = "client aborted"
 					return false, fmt.Errorf("%w: %v", errClientAbort, copyErr)
 				}
-				if copyErr != nil && (isCodexStreamPreflightRetryError(copyErr) || !responseWritten) {
+				if copyErr != nil && !responseWritten {
 					if defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
 						requestLog.markRetryRequested()
 						return false, errActiveRequestRetryRequested
 					}
-					return false, copyErr
+					protocolErr := newCodexStreamPreflightProtocolError(status, copyErr)
+					setRequestLogProtocolError(requestLog, protocolErr)
+					return false, protocolErr
 				}
 			} else {
 				_, copyErr = writeStreamingResponse(c.Writer, resp, requestLog, ReqeustLogHook(c, kind, requestLog))
@@ -2640,7 +2743,9 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 	if status >= http.StatusOK && status < http.StatusMultipleChoices {
 		if isStream {
 			if err := upstreamHTMLStreamError(resp); err != nil {
-				return false, err
+				protocolErr := newInvalidStreamContentTypeProtocolError(status, err)
+				setRequestLogProtocolError(requestLog, protocolErr)
+				return false, protocolErr
 			}
 		}
 
@@ -2738,12 +2843,14 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 					requestLog.ErrorMessage = "client aborted"
 					return false, fmt.Errorf("%w: %v", errClientAbort, copyErr)
 				}
-				if copyErr != nil && (isCodexStreamPreflightRetryError(copyErr) || !responseWritten) {
+				if copyErr != nil && !responseWritten {
 					if defaultActiveRequestTracker.IsRetryRequested(activeRequestID) {
 						requestLog.markRetryRequested()
 						return false, errActiveRequestRetryRequested
 					}
-					return false, copyErr
+					protocolErr := newCodexStreamPreflightProtocolError(status, copyErr)
+					setRequestLogProtocolError(requestLog, protocolErr)
+					return false, protocolErr
 				}
 			} else {
 				_, copyErr = writeStreamingResponse(c.Writer, resp, requestLog, ReqeustLogHook(c, kind, requestLog))
@@ -2950,39 +3057,6 @@ func waitBeforeProviderRetry(ctx context.Context) error {
 	}
 }
 
-func waitBeforeCodexEmptyStreamRetry(ctx context.Context) error {
-	timer := time.NewTimer(codexEmptyStreamRetryDelay)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
-func waitBeforeCodexEmptyStreamRetryForRequest(ctx context.Context, requestLog *ReqeustLog) error {
-	waitCtx, cancel := context.WithCancel(ctx)
-	activeRequestID := int64(0)
-	if requestLog != nil {
-		activeRequestID = requestLog.ActiveRequestID
-	}
-	generation := defaultActiveRequestTracker.RegisterCancel(activeRequestID, cancel)
-	waitErr := waitBeforeCodexEmptyStreamRetry(waitCtx)
-	retryRequested := defaultActiveRequestTracker.UnregisterCancel(activeRequestID, generation)
-	cancel()
-	if retryRequested {
-		requestLog.markRetryRequested()
-		return errActiveRequestRetryRequested
-	}
-	return waitErr
-}
-
-func isCodexStreamPreflightRetryError(err error) bool {
-	return errors.Is(err, errCodexEmptyStream) || errors.Is(err, errCodexFirstTextTimeout)
-}
-
 func codexStreamPreflightFailureReason(err error) string {
 	if errors.Is(err, errCodexFirstTextTimeout) {
 		return "HTTP 504 (first text timeout)"
@@ -3011,153 +3085,6 @@ func (prs *ProviderRelayService) recordCodexStreamPreflightFailureForUser(userID
 	}
 	prs.recordPoolAttemptError(userID, pool, provider, statusCode, matchedRule, logBody)
 	return prs.recordProviderFailureWithRuleForUser(userID, kind, poolID, pool, provider, reason, matchedRule)
-}
-
-func (prs *ProviderRelayService) retryCodexEmptyStreamSameProvider(
-	c *gin.Context,
-	kind string,
-	poolID string,
-	pool *ProviderPool,
-	initialProvider Provider,
-	endpoint string,
-	query url.Values,
-	clientHeaders http.Header,
-	originalBodyBytes []byte,
-	isStream bool,
-	requestedModel string,
-	requestLog *ReqeustLog,
-	initialErr error,
-) (bool, Provider, error, int, time.Duration, bool) {
-	provider := initialProvider
-	attempts := 0
-	totalDuration := time.Duration(0)
-	userID := relayUserIDFromContext(c)
-
-	if c.Request.Context().Err() != nil {
-		return false, provider, fmt.Errorf("%w: %v", errClientAbort, c.Request.Context().Err()), attempts, totalDuration, false
-	}
-
-	// 第一次流预提交失败已由 forwardRequest 检测到，计入失败。
-	blacklisted := prs.recordCodexStreamPreflightFailureForUser(userID, kind, poolID, pool, provider, initialErr)
-	if blacklisted {
-		fmt.Printf("[INFO] Codex 流预提交保护: Provider %s 因首次输出超时或空流被自动拉黑，停止同 provider 重试\n", provider.Name)
-		return false, provider, fmt.Errorf("provider %s blacklisted after stream preflight failure", provider.Name), attempts, totalDuration, true
-	}
-
-	for {
-		if err := waitBeforeCodexEmptyStreamRetryForRequest(c.Request.Context(), requestLog); err != nil {
-			if errors.Is(err, errActiveRequestRetryRequested) {
-				return false, provider, err, attempts, totalDuration, true
-			}
-			return false, provider, fmt.Errorf("%w: %v", errClientAbort, err), attempts, totalDuration, true
-		}
-
-		nextProvider, ok, err := prs.selectCodexEmptyStreamRetryProviderForUser(userID, kind, poolID, provider.Name, requestedModel)
-		if err != nil {
-			return false, provider, err, attempts, totalDuration, true
-		}
-		if !ok {
-			fmt.Printf("[INFO] Codex 空流保护: Provider %s 当前不可用，继续等待恢复，不切换到其他 provider\n", provider.Name)
-			continue
-		}
-		provider = nextProvider
-
-		effectiveModel := provider.GetEffectiveModel(requestedModel)
-		currentBodyBytes := originalBodyBytes
-		if effectiveModel != requestedModel && requestedModel != "" {
-			modifiedBody, err := ReplaceModelInRequestBody(originalBodyBytes, effectiveModel)
-			if err != nil {
-				return false, provider, err, attempts, totalDuration, true
-			}
-			currentBodyBytes = modifiedBody
-		}
-
-		effectiveEndpoint := prs.resolveRelayEndpoint(kind, provider, endpoint)
-		attempts++
-		fmt.Printf("[INFO] Codex 空流保护: 同 provider 后台重试 #%d | Provider: %s | Model: %s\n",
-			attempts, provider.Name, effectiveModel)
-
-		startTime := time.Now()
-		requestOK, requestErr := prs.forwardRequestWithLog(c, kind, provider, effectiveEndpoint, query, clientHeaders, currentBodyBytes, isStream, effectiveModel, requestLog)
-		duration := time.Since(startTime)
-		totalDuration += duration
-
-		if requestOK {
-			fmt.Printf("[INFO] Codex 空流保护: 重试成功 | Provider: %s | 后台重试 %d 次 | 耗时: %.2fs\n",
-				provider.Name, attempts, totalDuration.Seconds())
-			// 成功：清空失败计数
-			prs.recordProviderSuccessForUser(userID, kind, poolID, provider)
-			return true, provider, nil, attempts, totalDuration, false
-		}
-		if isCodexStreamPreflightRetryError(requestErr) {
-			fmt.Printf("[WARN] Codex 流预提交保护: Provider %s 在首次输出前失败，继续后台重试 | 耗时: %.2fs\n",
-				provider.Name, duration.Seconds())
-			// 每次首次输出前失败都计入 HTTP 失败次数。
-			if prs.recordCodexStreamPreflightFailureForUser(userID, kind, poolID, pool, provider, requestErr) {
-				fmt.Printf("[INFO] Codex 流预提交保护: Provider %s 因连续首次输出超时或空流被自动拉黑，停止同 provider 重试\n", provider.Name)
-				return false, provider, fmt.Errorf("provider %s blacklisted after repeated stream preflight failures", provider.Name), attempts, totalDuration, true
-			}
-			continue
-		}
-		return false, provider, requestErr, attempts, totalDuration, false
-	}
-}
-
-// selectCodexEmptyStreamRetryProvider 空流重试时查找当前 provider 是否仍然可用
-// fail-closed: 必须在当前 pool 内查找，不能跳到其他 pool
-// same platform + same pool + same provider
-func (prs *ProviderRelayService) selectCodexEmptyStreamRetryProvider(kind, poolID, currentProviderName, requestedModel string) (Provider, bool, error) {
-	return prs.selectCodexEmptyStreamRetryProviderForUser("", kind, poolID, currentProviderName, requestedModel)
-}
-
-func (prs *ProviderRelayService) selectCodexEmptyStreamRetryProviderForUser(userID, kind, poolID, currentProviderName, requestedModel string) (Provider, bool, error) {
-	if prs.providerService == nil || prs.poolService == nil {
-		return Provider{}, false, fmt.Errorf("provider/pool service unavailable")
-	}
-
-	// 只在当前 pool 内查找
-	var pool *ProviderPool
-	var err error
-	if strings.TrimSpace(userID) != "" {
-		pool, err = prs.poolService.ResolvePoolByIDForUser(userID, poolID)
-	} else {
-		pool, err = prs.poolService.ResolvePoolByID(poolID)
-	}
-	if err != nil || pool == nil {
-		return Provider{}, false, fmt.Errorf("池子 %s 不存在", poolID)
-	}
-
-	var providers []Provider
-	if strings.TrimSpace(userID) != "" {
-		providers, err = prs.providerService.LoadProvidersForUser(userID, kind)
-	} else {
-		providers, err = prs.providerService.LoadProviders(kind)
-	}
-	if err != nil {
-		return Provider{}, false, err
-	}
-
-	selected, selectErr := SelectProvidersFromPool(pool, providers)
-	if selectErr != nil {
-		return Provider{}, false, selectErr
-	}
-
-	for _, provider := range selected {
-		if provider.APIURL == "" || provider.APIKey == "" {
-			continue
-		}
-		if errs := provider.ValidateConfiguration(); len(errs) > 0 {
-			continue
-		}
-		if requestedModel != "" && !provider.IsModelSupported(requestedModel) {
-			continue
-		}
-		if provider.Name == currentProviderName {
-			return provider, true, nil
-		}
-	}
-
-	return Provider{}, false, nil
 }
 
 func isResponsesEndpoint(endpoint string) bool {
@@ -3294,10 +3221,6 @@ type codexStreamGuardState struct {
 	sawIncomplete    bool
 	sawUsefulContent bool
 	responseID       string
-	inputTokens      int64
-	outputTokens     int64
-	cacheTokens      int64
-	reasoningTokens  int64
 }
 
 func (s *codexStreamGuardState) observeLine(line []byte) {
@@ -3314,16 +3237,22 @@ func (s *codexStreamGuardState) observeLine(line []byte) {
 	switch eventType {
 	case "response.completed":
 		s.sawCompleted = true
+		if responsesOutputHasUsefulContent(gjson.Get(data, "response.output")) {
+			s.sawUsefulContent = true
+		}
 	case "response.failed":
 		s.sawFailed = true
 	case "response.incomplete":
 		s.sawIncomplete = true
-	case "response.output_text.delta":
-		if strings.TrimSpace(gjson.Get(data, "delta").String()) != "" {
+	case "response.output_text.delta", "response.output_text.done",
+		"response.function_call_arguments.delta", "response.function_call_arguments.done",
+		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+		"response.reasoning_text.delta", "response.reasoning_text.done":
+		if strings.TrimSpace(gjson.Get(data, "delta").String()) != "" || strings.TrimSpace(gjson.Get(data, "text").String()) != "" || strings.TrimSpace(gjson.Get(data, "arguments").String()) != "" {
 			s.sawUsefulContent = true
 		}
-	case "response.function_call_arguments.delta":
-		if strings.TrimSpace(gjson.Get(data, "delta").String()) != "" {
+	case "response.output_item.added", "response.output_item.done":
+		if responseOutputItemHasUsefulContent(gjson.Get(data, "item"), eventType == "response.output_item.done") {
 			s.sawUsefulContent = true
 		}
 	}
@@ -3331,44 +3260,83 @@ func (s *codexStreamGuardState) observeLine(line []byte) {
 		s.responseID = responseID
 	}
 
-	usage := gjson.Get(data, "response.usage")
-	if usage.Exists() {
-		s.inputTokens += usage.Get("input_tokens").Int()
-		s.outputTokens += usage.Get("output_tokens").Int()
-		s.cacheTokens += usage.Get("input_tokens_details.cached_tokens").Int()
-		s.reasoningTokens += usage.Get("output_tokens_details.reasoning_tokens").Int()
-	}
-}
-
-func (s codexStreamGuardState) shouldRelease() bool {
-	return s.sawUsefulContent || s.sawCompleted || s.sawFailed || s.sawIncomplete || s.totalTokens() > 0
-}
-
-func (s codexStreamGuardState) totalTokens() int64 {
-	return s.inputTokens + s.outputTokens + s.cacheTokens + s.reasoningTokens
-}
-
-func (s codexStreamGuardState) isEmptyFailure() bool {
-	if s.sawFailed || s.sawIncomplete || s.sawCompleted {
-		return false
-	}
-	return !s.sawUsefulContent && s.totalTokens() == 0
 }
 
 func (s codexStreamGuardState) completedSuccessfully() bool {
-	return s.sawCompleted && !s.sawFailed && !s.sawIncomplete && strings.TrimSpace(s.responseID) != ""
+	return s.sawUsefulContent && s.sawCompleted && !s.sawFailed && !s.sawIncomplete && strings.TrimSpace(s.responseID) != ""
+}
+
+func responsesOutputHasUsefulContent(output gjson.Result) bool {
+	if !output.IsArray() {
+		return false
+	}
+	for _, item := range output.Array() {
+		if responseOutputItemHasUsefulContent(item, true) {
+			return true
+		}
+	}
+	return false
+}
+
+func responseOutputItemHasUsefulContent(item gjson.Result, final bool) bool {
+	switch item.Get("type").String() {
+	case "message":
+		for _, content := range item.Get("content").Array() {
+			if strings.TrimSpace(content.Get("text").String()) != "" || strings.TrimSpace(content.Get("refusal").String()) != "" {
+				return true
+			}
+		}
+		return false
+	case "reasoning":
+		for _, summary := range item.Get("summary").Array() {
+			if strings.TrimSpace(summary.Get("text").String()) != "" {
+				return true
+			}
+		}
+		for _, content := range item.Get("content").Array() {
+			if strings.TrimSpace(content.Get("text").String()) != "" {
+				return true
+			}
+		}
+		return strings.TrimSpace(item.Get("encrypted_content").String()) != ""
+	case "function_call":
+		return true
+	case "custom_tool_call":
+		return true
+	case "local_shell_call", "computer_call", "web_search_call", "file_search_call", "code_interpreter_call", "mcp_call":
+		return true
+	case "image_generation_call":
+		return final && (strings.TrimSpace(item.Get("result").String()) != "" || strings.TrimSpace(item.Get("revised_prompt").String()) != "" || strings.EqualFold(item.Get("status").String(), "completed"))
+	case "compaction", "compaction_summary":
+		return strings.TrimSpace(item.Get("encrypted_content").String()) != ""
+	case "ghost_snapshot":
+		return item.Get("ghost_commit").Exists()
+	default:
+		// A completed output item is model output even when this relay does not
+		// yet know its concrete schema. Keep added/partial items conservative so
+		// metadata placeholders cannot prematurely commit HTTP 200.
+		return final && strings.TrimSpace(item.Get("type").String()) != ""
+	}
 }
 
 type codexStreamGuardOptions struct {
 	deferInitialKeepAlive        bool
 	disableKeepAliveUntilRelease bool
-	failOnTerminalBeforeWrite    bool
 	firstUsefulContentTimeout    time.Duration
 	onSuccessfulCompleted        func(responseID string)
 }
 
 func writeCodexGuardedStreamingResponse(w http.ResponseWriter, resp *xrequest.Response, requestLog *ReqeustLog, hooks ...xrequest.ResponseHook) (int64, bool, error) {
-	return writeCodexGuardedStreamingResponseWithOptions(w, resp, requestLog, codexStreamGuardOptions{}, hooks...)
+	return writeCodexGuardedStreamingResponseWithOptions(
+		w,
+		resp,
+		requestLog,
+		codexStreamGuardOptions{
+			deferInitialKeepAlive:        true,
+			disableKeepAliveUntilRelease: true,
+		},
+		hooks...,
+	)
 }
 
 func writeCodexGuardedStreamingResponseWithOptions(w http.ResponseWriter, resp *xrequest.Response, requestLog *ReqeustLog, options codexStreamGuardOptions, hooks ...xrequest.ResponseHook) (int64, bool, error) {
@@ -3527,31 +3495,26 @@ func writeCodexGuardedStreamingResponseWithOptions(w http.ResponseWriter, resp *
 				}
 			} else {
 				initialBuffer.Write(line)
-				terminalFailure := state.sawFailed || state.sawIncomplete
-				// Account pools must not commit an SSE response before a key has
-				// produced useful content or a completed response. If an upstream
-				// sends unbounded non-useful events, fail this key internally rather
-				// than flushing the preflight buffer and making failover impossible.
-				if options.failOnTerminalBeforeWrite && initialBuffer.Len() >= codexStreamGuardMaxInitialBufferBytes && !state.sawUsefulContent && !state.sawCompleted {
-					return totalBytes, clientStarted, errCodexInitialBufferLimit
-				}
-				canReleaseInitialBuffer := state.shouldRelease()
-				if options.firstUsefulContentTimeout > 0 && !state.sawUsefulContent {
-					// Input-token usage, response.created and other metadata are not
-					// a first output. Keep them buffered until text/function output,
-					// so they cannot disable the configured first-text timeout.
-					canReleaseInitialBuffer = state.sawCompleted
-				}
-				if options.firstUsefulContentTimeout > 0 && initialBuffer.Len() >= codexStreamGuardMaxInitialBufferBytes && !state.sawUsefulContent {
-					return totalBytes, clientStarted, errCodexFirstTextTimeout
-				}
-				if (!options.failOnTerminalBeforeWrite || !terminalFailure) && (canReleaseInitialBuffer || initialBuffer.Len() >= codexStreamGuardMaxInitialBufferBytes) {
-					if stopFirstUsefulContentTimer != nil && state.sawUsefulContent {
-						stopFirstUsefulContentTimer()
+				if !state.sawUsefulContent {
+					switch {
+					case state.sawFailed || state.sawIncomplete:
+						return totalBytes, clientStarted, errCodexTerminalStreamFailure
+					case state.sawCompleted:
+						// A syntactically completed response with no text, reasoning or
+						// tool output is still unusable to the caller.
+						return totalBytes, clientStarted, errCodexEmptyStream
+					case initialBuffer.Len() >= codexStreamGuardMaxInitialBufferBytes && options.firstUsefulContentTimeout > 0:
+						return totalBytes, clientStarted, errCodexFirstTextTimeout
+					case initialBuffer.Len() >= codexStreamGuardMaxInitialBufferBytes:
+						return totalBytes, clientStarted, errCodexInitialBufferLimit
 					}
-					if writeErr := flushInitialBuffer(); writeErr != nil {
-						return totalBytes, clientStarted, writeErr
-					}
+					continue
+				}
+				if stopFirstUsefulContentTimer != nil {
+					stopFirstUsefulContentTimer()
+				}
+				if writeErr := flushInitialBuffer(); writeErr != nil {
+					return totalBytes, clientStarted, writeErr
 				}
 			}
 		}
@@ -3562,15 +3525,10 @@ func writeCodexGuardedStreamingResponseWithOptions(w http.ResponseWriter, resp *
 			}
 			if err == io.EOF {
 				if !released {
-					if options.failOnTerminalBeforeWrite && (state.sawFailed || state.sawIncomplete) {
+					if state.sawFailed || state.sawIncomplete {
 						return totalBytes, clientStarted, errCodexTerminalStreamFailure
 					}
-					if state.isEmptyFailure() {
-						return totalBytes, clientStarted, errCodexEmptyStream
-					}
-					if writeErr := flushInitialBuffer(); writeErr != nil {
-						return totalBytes, clientStarted, writeErr
-					}
+					return totalBytes, clientStarted, errCodexEmptyStream
 				}
 				return totalBytes, clientStarted, nil
 			}
@@ -3998,6 +3956,12 @@ func markFirstTextFromSSEPayload(payload string, usage *ReqeustLog) {
 }
 
 func ssePayloadHasText(data string) bool {
+	responsesState := codexStreamGuardState{}
+	responsesState.observeLine([]byte("data: " + data))
+	if responsesState.sawUsefulContent {
+		return true
+	}
+
 	eventType := gjson.Get(data, "type").String()
 	switch eventType {
 	case "response.output_text.delta", "response.function_call_arguments.delta":
@@ -4236,23 +4200,8 @@ func hasContentInResponse(body []byte, kind string) bool {
 
 	// OpenAI Responses format
 	output := result.Get("output")
-	if output.IsArray() && len(output.Array()) > 0 {
-		for _, item := range output.Array() {
-			t := item.Get("type").String()
-			switch t {
-			case "message":
-				for _, c := range item.Get("content").Array() {
-					if strings.TrimSpace(c.Get("text").String()) != "" {
-						return true
-					}
-				}
-			case "function_call":
-				return true
-			case "reasoning":
-				return true
-			}
-		}
-		return false
+	if output.IsArray() {
+		return responsesOutputHasUsefulContent(output)
 	}
 
 	// Unknown format: treat as having content (conservative)

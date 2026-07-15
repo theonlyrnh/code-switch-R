@@ -774,8 +774,6 @@
         "autoStart": "Launch at login",
         "switchNotify": "Switch Notification",
         "switchNotifyHint": "Send system notification when provider switches",
-        "codexStreamGuard": "Codex Empty Stream Guard",
-        "codexStreamGuardHint": "Intercept Codex 200 streams with no initial useful content and retry before the client sees them",
         "firstTextRetryTimeout": "First-text timeout retry",
         "firstTextRetryHint": "Retry requests with no useful output before the deadline and count each retry as an HTTP error",
         "firstTextRetryTimeoutSeconds": "First-text retry timeout (seconds)",
