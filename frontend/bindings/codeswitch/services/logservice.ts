@@ -9,34 +9,33 @@ import { Call as $Call, CancellablePromise as $CancellablePromise, Create as $Cr
 // @ts-ignore: Unused imports
 import * as $models from "./models.js";
 
-export function ListProviders(platform: string): $CancellablePromise<string[]> {
-    return $Call.ByID(790916236, platform).then(($result: any) => {
-        return $$createType0($result);
+export function ListActiveRequestLogs(): $CancellablePromise<$models.ReqeustLog[]> {
+    return $Call.ByName("codeswitch/services.LogService.ListActiveRequestLogs").then(($result: any) => {
+        return $$createType1($result);
     });
 }
 
-export function ListRequestLogs(platform: string, provider: string, limit: number): $CancellablePromise<$models.ReqeustLog[]> {
-    return $Call.ByID(1199056012, platform, provider, limit).then(($result: any) => {
-        return $$createType2($result);
+export function ListCompletedRequestLogs(afterID: number, limit: number): $CancellablePromise<$models.ReqeustLog[]> {
+    return $Call.ByName("codeswitch/services.LogService.ListCompletedRequestLogs", afterID, limit).then(($result: any) => {
+        return $$createType1($result);
     });
 }
 
 export function ProviderDailyStats(platform: string): $CancellablePromise<$models.ProviderDailyStat[]> {
     return $Call.ByID(974013659, platform).then(($result: any) => {
-        return $$createType4($result);
+        return $$createType3($result);
     });
 }
 
 export function StatsSince(platform: string): $CancellablePromise<$models.LogStats> {
     return $Call.ByID(2831143405, platform).then(($result: any) => {
-        return $$createType5($result);
+        return $$createType4($result);
     });
 }
 
 // Private type creation functions
-const $$createType0 = $Create.Array($Create.Any);
-const $$createType1 = $models.ReqeustLog.createFrom;
-const $$createType2 = $Create.Array($$createType1);
-const $$createType3 = $models.ProviderDailyStat.createFrom;
-const $$createType4 = $Create.Array($$createType3);
-const $$createType5 = $models.LogStats.createFrom;
+const $$createType0 = $models.ReqeustLog.createFrom;
+const $$createType1 = $Create.Array($$createType0);
+const $$createType2 = $models.ProviderDailyStat.createFrom;
+const $$createType3 = $Create.Array($$createType2);
+const $$createType4 = $models.LogStats.createFrom;

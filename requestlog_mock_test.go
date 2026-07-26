@@ -1,37 +1,37 @@
 package main
 
 import (
-	"fmt"
+	"codeswitch/services"
 	"math"
 	"math/rand"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/daodao97/xgo/xdb"
-	_ "modernc.org/sqlite"
 )
 
 const timeLayout = "2006-01-02 15:04:05"
 
-func init() {
-	home, _ := os.UserHomeDir()
-
-	if err := xdb.Inits([]xdb.Config{
-		{
-			Name:   "default",
-			Driver: "sqlite",
-			DSN:    filepath.Join(home, ".code-switch", "app.db?cache=shared&mode=rwc&_busy_timeout=10000&_journal_mode=WAL"),
-		},
-	}); err != nil {
-		fmt.Printf("初始化 request_log 表失败: %v\n", err)
-	}
-}
-
 func TestSeedMockRequestLogs(t *testing.T) {
-	db, _ := xdb.DB("default")
-	xdb.New("request_log").Delete()
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+	t.Setenv("USERPROFILE", testHome)
+	if err := services.InitDatabase(); err != nil {
+		t.Fatalf("InitDatabase failed: %v", err)
+	}
+	db, err := xdb.DB("default")
+	if err != nil {
+		t.Fatalf("get test database: %v", err)
+	}
+	var databaseSeq int
+	var databaseName, databasePath string
+	if err := db.QueryRow("PRAGMA database_list").Scan(&databaseSeq, &databaseName, &databasePath); err != nil {
+		t.Fatalf("resolve test database path: %v", err)
+	}
+	if got, want := filepath.Clean(databasePath), filepath.Join(testHome, ".code-switch", "app.db"); got != want {
+		t.Fatalf("test database path = %q, want isolated path %q", got, want)
+	}
 	if err := SeedMockRequestLogs(16); err != nil {
 		t.Fatalf("seed failed: %v", err)
 	}

@@ -240,10 +240,10 @@
           },
           "logs": {
             "title": "日志",
-            "body": "日志页面用于查看代理请求记录、错误、token 明细和供应商命中情况。",
+            "body": "日志页面用于查看正在处理的代理请求，以及最多 105 条最近完成记录。",
             "items": [
-              "可按平台、供应商、条数筛选，也可以切换到仅错误视图定位失败请求。",
-              "摘要区域展示今日请求量、失败次数、token 流量和缓存命中。",
+              "排队中、处理中和重试中的请求从内存刷新，并显示在每页已完成记录上方。",
+              "已完成记录仅保留最新 105 条，每页 15 条；平台和供应商继续作为表格列显示。",
               "表格中的调用密钥、模型、HTTP 状态、首 token 和耗时可以帮助判断问题来自客户端、代理还是上游。"
             ]
           },
@@ -669,36 +669,16 @@
       }
     },
     "logs": {
-      "eyebrow": "请求追踪",
-      "title": "代理请求日志",
-      "subtitle": "查看 Claude Code 与 OpenAI 代理的最新访问记录。",
       "loading": "加载中...",
       "refresh": "刷新",
-      "applyFilters": "应用筛选",
       "empty": "暂无日志记录",
-      "lastUpdated": "最近更新：{time}",
-      "filters": {
-        "platform": "平台",
-        "allPlatforms": "全部平台",
-        "provider": "供应商",
-        "allProviders": "全部供应商",
-        "providerPlaceholder": "输入供应商名称",
-        "limit": "条数上限"
-      },
-      "tabs": {
-        "all": "全部日志",
-        "errors": "仅错误"
-      },
       "summary": {
         "total": "请求量",
         "requests": "累计请求次数",
-        "errors": "失败次数",
-        "errorHint": "数量与失败率",
         "tokens": "Token 流量",
         "tokenHint": "输入 + 输出 + 缓存写入 Tokens",
         "cache": "缓存命中",
-        "cacheHint": "缓存读取 / 输入侧 Tokens",
-        "todayScope": "今日 · {date}"
+        "cacheHint": "缓存读取 / 输入侧 Tokens"
       },
       "table": {
         "time": "时间",
@@ -741,8 +721,6 @@
       "streamOn": "流式",
       "streamOff": "非流",
       "back": "返回主页",
-      "nextRefresh": "距离下次刷新 {seconds}s",
-      "query": "查询",
       "tokenDetail": {
         "title": "今日 Token 明细"
       }
@@ -884,7 +862,14 @@
       "eyebrow": "今日费用",
       "title": "费用",
       "description": "根据日志中的 token 用量和供应商价格估算今日成功请求费用。",
-      "refresh": "刷新",
+      "query": "查询",
+      "queryPrompt": "请设置筛选条件，然后点击“查询”加载费用数据。",
+      "filters": {
+        "platform": "平台",
+        "allPlatforms": "全部平台",
+        "provider": "供应商",
+        "allProviders": "全部供应商"
+      },
       "empty": "今天暂无可计费的成功请求。",
       "loadFailed": "费用加载失败",
       "missingPrice": "缺少价格",

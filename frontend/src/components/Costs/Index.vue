@@ -13,40 +13,34 @@
         <BaseButton variant="outline" type="button" @click="backToHome">
           {{ t('components.logs.back') }}
         </BaseButton>
-        <div class="refresh-indicator">
-          <span>{{ t('components.logs.nextRefresh', { seconds: countdown }) }}</span>
-          <BaseButton type="button" :disabled="loading" @click="manualRefresh">
-            {{ t('components.costs.refresh') }}
-          </BaseButton>
-        </div>
       </div>
     </div>
 
     <form class="costs-filter-row" @submit.prevent="applyFilters">
       <label class="filter-field">
-        <span>{{ t('components.logs.filters.platform') }}</span>
+        <span>{{ t('components.costs.filters.platform') }}</span>
         <select v-model="filters.platform" class="mac-select">
-          <option value="">{{ t('components.logs.filters.allPlatforms') }}</option>
+          <option value="">{{ t('components.costs.filters.allPlatforms') }}</option>
           <option value="claude">Claude</option>
           <option value="openai-responses">OpenAI Responses</option>
           <option value="openai-chat">OpenAI Chat</option>
         </select>
       </label>
       <label class="filter-field">
-        <span>{{ t('components.logs.filters.provider') }}</span>
+        <span>{{ t('components.costs.filters.provider') }}</span>
         <select v-model="filters.provider" class="mac-select">
-          <option value="">{{ t('components.logs.filters.allProviders') }}</option>
+          <option value="">{{ t('components.costs.filters.allProviders') }}</option>
           <option v-for="provider in availableProviderOptions" :key="provider" :value="provider">
             {{ provider }}
           </option>
         </select>
       </label>
       <BaseButton type="submit" :disabled="loading">
-        {{ t('components.logs.query') }}
+        {{ t('components.costs.query') }}
       </BaseButton>
     </form>
 
-    <section class="costs-summary-grid">
+    <section v-if="hasQueried" class="costs-summary-grid">
       <article class="cost-summary-card highlight">
         <span>{{ t('components.costs.summary.totalCost') }}</span>
         <strong>{{ formatTotalCost(summary.totalCost) }}</strong>
@@ -78,6 +72,7 @@
       </div>
 
       <div v-if="loading" class="empty-state">{{ t('components.logs.loading') }}</div>
+      <div v-else-if="!hasQueried" class="empty-state">{{ t('components.costs.queryPrompt') }}</div>
       <div v-else-if="!groups.length" class="empty-state">{{ t('components.costs.empty') }}</div>
       <div v-else class="cost-detail-groups">
         <article v-for="group in groups" :key="group.key" class="provider-group">
@@ -182,7 +177,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import BaseButton from '../common/BaseButton.vue'
@@ -212,6 +207,7 @@ const router = useRouter()
 const loading = ref(false)
 const saving = ref(false)
 const priceEditorOpen = ref(false)
+const hasQueried = ref(false)
 const usageItems = ref<CostUsageItem[]>([])
 const settings = ref<CostSettings>(defaultCostSettings())
 const providerOptions = ref<string[]>([])
@@ -219,16 +215,10 @@ const COST_PROVIDER_PLATFORMS: LogPlatform[] = ['claude', 'openai-responses', 'o
 type ModelPriceDraft = { id: string; model: string; input: string; output: string; cache_read: string }
 const modelPriceDrafts = ref<ModelPriceDraft[]>([])
 const filters = reactive<{ platform: LogPlatform | ''; provider: string }>({ platform: '', provider: '' })
-const REFRESH_INTERVAL = 30
-const countdown = ref(REFRESH_INTERVAL)
-let timer: number | undefined
-let initialLoadDone = false
-
-type DraftSyncMode = 'reset' | 'preserve' | false
-type LoadCostsOptions = {
-  draftSync?: DraftSyncMode
-  silent?: boolean
-}
+let isUnmounted = false
+let providerLoadVersion = 0
+let settingsLoadVersion = 0
+let costQueryPromise: Promise<void> | null = null
 
 const showProviderGroups = computed(() => filters.provider === '')
 const availableProviderOptions = computed(() => {
@@ -357,7 +347,15 @@ const loadConfiguredProviderNames = async (platform: LogPlatform | '') => {
 }
 
 const loadProviders = async () => {
-  const configuredProviders = await loadConfiguredProviderNames(filters.platform)
+  const requestedPlatform = filters.platform
+  const requestVersion = ++providerLoadVersion
+  const configuredProviders = await loadConfiguredProviderNames(requestedPlatform)
+  if (
+    isUnmounted
+    || requestVersion !== providerLoadVersion
+    || requestedPlatform !== filters.platform
+  ) return
+
   const merged = new Set<string>()
   for (const provider of configuredProviders) {
     const name = normalizeProviderOption(provider)
@@ -371,57 +369,56 @@ const loadProviders = async () => {
   }
 }
 
-const loadDashboard = async (options: LoadCostsOptions = {}) => {
-  await loadProviders()
-  await loadData(options)
-}
-
-const loadData = async (options: LoadCostsOptions = {}) => {
-  if (!options.silent) {
-    loading.value = true
-  }
+const loadSettings = async () => {
+  const requestVersion = ++settingsLoadVersion
   try {
-    const [nextSettings, nextUsage] = await Promise.all([
-      fetchCostSettings(),
-      fetchTodayCostUsage(filters.platform, filters.provider),
-    ])
-    settings.value = nextSettings
-    usageItems.value = nextUsage
+    const nextSettings = await fetchCostSettings()
+    if (!isUnmounted && requestVersion === settingsLoadVersion) {
+      settings.value = nextSettings
+    }
   } catch (error: any) {
-    showToast(error?.message || t('components.costs.loadFailed'), 'error')
-  } finally {
-    if (!options.silent) {
-      loading.value = false
+    if (!isUnmounted && requestVersion === settingsLoadVersion) {
+      showToast(error?.message || t('components.costs.loadFailed'), 'error')
     }
   }
 }
 
-const resetTimer = () => {
-  countdown.value = REFRESH_INTERVAL
+const clearUsageResults = () => {
+  usageItems.value = []
+  hasQueried.value = false
 }
 
-const startCountdown = () => {
-  stopCountdown()
-  timer = window.setInterval(() => {
-    if (countdown.value <= 1) {
-      countdown.value = REFRESH_INTERVAL
-      void loadDashboard({ draftSync: 'preserve', silent: true })
-    } else {
-      countdown.value -= 1
+const runCostQuery = async () => {
+  if (costQueryPromise) return costQueryPromise
+
+  const requestedPlatform = filters.platform
+  const requestedProvider = filters.provider
+  loading.value = true
+  costQueryPromise = (async () => {
+    try {
+      const nextUsage = await fetchTodayCostUsage(requestedPlatform, requestedProvider)
+      if (
+        isUnmounted
+        || requestedPlatform !== filters.platform
+        || requestedProvider !== filters.provider
+      ) return
+
+      usageItems.value = nextUsage
+      hasQueried.value = true
+    } catch (error: any) {
+      if (
+        !isUnmounted
+        && requestedPlatform === filters.platform
+        && requestedProvider === filters.provider
+      ) {
+        showToast(error?.message || t('components.costs.loadFailed'), 'error')
+      }
     }
-  }, 1000)
-}
-
-const stopCountdown = () => {
-  if (timer) {
-    clearInterval(timer)
-    timer = undefined
-  }
-}
-
-const manualRefresh = () => {
-  resetTimer()
-  void loadDashboard({ draftSync: 'preserve', silent: true })
+  })().finally(() => {
+    costQueryPromise = null
+    loading.value = false
+  })
+  return costQueryPromise
 }
 
 const openPriceEditor = () => {
@@ -434,8 +431,7 @@ const closePriceEditor = () => {
 }
 
 const applyFilters = () => {
-  resetTimer()
-  void loadDashboard({ draftSync: 'preserve' })
+  void runCostQuery()
 }
 
 const newModelPriceDraft = (): ModelPriceDraft => ({
@@ -525,34 +521,24 @@ const savePriceEditor = async () => {
   }
 }
 
-watch(() => filters.platform, async () => {
-  resetTimer()
-  await loadDashboard({ draftSync: 'reset' })
+watch(() => filters.platform, () => {
+  clearUsageResults()
+  void loadProviders()
 })
 
-watch(() => filters.provider, async () => {
-  resetTimer()
-  await loadData({ draftSync: 'reset' })
+watch(() => filters.provider, () => {
+  clearUsageResults()
 })
 
 onMounted(async () => {
-  await loadDashboard({ draftSync: 'reset' })
-  initialLoadDone = true
-  startCountdown()
-})
-
-onActivated(() => {
-  if (!initialLoadDone) return
-  startCountdown()
-  void loadDashboard({ draftSync: 'preserve', silent: true })
-})
-
-onDeactivated(() => {
-  stopCountdown()
+  isUnmounted = false
+  await Promise.all([loadSettings(), loadProviders()])
 })
 
 onUnmounted(() => {
-  stopCountdown()
+  isUnmounted = true
+  providerLoadVersion += 1
+  settingsLoadVersion += 1
 })
 </script>
 

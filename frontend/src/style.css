@@ -665,67 +665,10 @@ html.dark .mac-sidebar-item:hover {
 .logs-chart {
   height: 240px;
   border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 16px;
+  border-radius: 8px;
   padding: 16px;
   background: transparent;
   box-shadow: none;
-}
-
-.refresh-indicator {
-  display: inline-flex;
-  align-items: center;
-  gap: 12px;
-  font-size: 0.9rem;
-  color: var(--mac-text-secondary);
-}
-
-.logs-filter-row {
-  display: flex;
-  gap: 20px;
-  align-items: flex-end;
-  flex-wrap: wrap;
-}
-
-.logs-filter-row .filter-fields {
-  flex: 1;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 16px;
-}
-
-.logs-filter-row .filter-field {
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  font-size: 0.9rem;
-  color: var(--mac-text-secondary);
-}
-
-.logs-filter-row .filter-field span {
-  white-space: nowrap;
-}
-
-.logs-filter-row .filter-field select,
-.logs-filter-row .filter-field input {
-  flex: 1;
-}
-
-.logs-filter-row .filter-actions {
-  display: inline-flex;
-  gap: 10px;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  align-items: center;
-}
-
-.logs-filter-row .filter-actions button {
-  height: 40px;
-  min-height: 40px;
-  padding-inline: 18px;
-  display: inline-flex;
-  align-items: center;
 }
 
 .logs-table-wrapper {
@@ -1992,39 +1935,14 @@ html.dark .secondary-btn:active:not(:disabled) {
     gap: 10px;
   }
 
-  .logs-header > *,
-  .refresh-indicator {
+  .logs-header > * {
     width: 100%;
-  }
-
-  .refresh-indicator {
-    justify-content: space-between;
-    gap: 8px;
-    font-size: 0.82rem;
   }
 
   .logs-chart {
     height: 180px;
     padding: 10px;
-    border-radius: 12px;
-  }
-
-  .logs-filter-row,
-  .logs-filter-row .filter-field {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 10px;
-  }
-
-  .logs-filter-row .filter-fields {
-    grid-template-columns: 1fr;
-    gap: 10px;
-  }
-
-  .logs-filter-row .filter-actions,
-  .logs-filter-row .filter-actions button {
-    width: 100%;
-    justify-content: center;
+    border-radius: 8px;
   }
 
   .logs-table-wrapper {

@@ -30,17 +30,15 @@ export type RequestLog = {
   queue_started_at?: string
 }
 
-type RequestLogQuery = {
-  platform?: LogPlatform | ''
-  provider?: string
-  limit?: number
+export const fetchActiveRequestLogs = async (): Promise<RequestLog[]> => {
+  return Call.ByName('codeswitch/services.LogService.ListActiveRequestLogs')
 }
 
-export const fetchRequestLogs = async (query: RequestLogQuery = {}): Promise<RequestLog[]> => {
-  const platform = query.platform ?? ''
-  const provider = query.provider ?? ''
-  const limit = query.limit ?? 100
-  return Call.ByName('codeswitch/services.LogService.ListRequestLogs', platform, provider, limit)
+export const fetchCompletedRequestLogs = async (
+  afterID: number,
+  limit: number,
+): Promise<RequestLog[]> => {
+  return Call.ByName('codeswitch/services.LogService.ListCompletedRequestLogs', afterID, limit)
 }
 
 export type RetryActiveRequestResult = {
@@ -59,10 +57,6 @@ export type RetryActiveRequestResult = {
 
 export const retryActiveRequest = async (id: number): Promise<RetryActiveRequestResult> => {
   return Call.ByName('codeswitch/services.LogService.RetryActiveRequest', id)
-}
-
-export const fetchLogProviders = async (platform: LogPlatform | '' = ''): Promise<string[]> => {
-  return Call.ByName('codeswitch/services.LogService.ListProviders', platform)
 }
 
 export type LogStatsSeries = {

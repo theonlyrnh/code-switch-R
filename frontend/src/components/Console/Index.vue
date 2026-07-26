@@ -1,5 +1,12 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, nextTick } from 'vue'
+import {
+  ref,
+  nextTick,
+  onActivated,
+  onDeactivated,
+  onMounted,
+  onUnmounted,
+} from 'vue'
 import { useRouter } from 'vue-router'
 import { Call } from '@wailsio/runtime'
 
@@ -15,6 +22,19 @@ const autoScroll = ref(true)
 const loading = ref(false)
 const logsContainer = ref<HTMLElement>()
 let refreshInterval: number | null = null
+let loadLogsPromise: Promise<void> | null = null
+let isPageActive = false
+let isUnmounted = false
+let initialLoadDone = false
+let clearInProgress = false
+let logsViewGeneration = 0
+
+const canPoll = () =>
+  isPageActive
+  && initialLoadDone
+  && !isUnmounted
+  && !clearInProgress
+  && document.visibilityState === 'visible'
 
 const hasSelectedConsoleText = () => {
   const selection = window.getSelection()
@@ -25,20 +45,64 @@ const goBack = () => {
   router.push('/')
 }
 
-const loadLogs = async () => {
-  try {
-    const result = await Call.ByName('codeswitch/services.ConsoleService.GetLogs')
-    // Vue replaces the log rows when this value changes. Preserve a user's
-    // native text selection so Ctrl/Cmd+C can copy any individual entry.
-    if (hasSelectedConsoleText()) return
-    logs.value = result as ConsoleLog[]
+const loadLogs = (): Promise<void> => {
+  if (clearInProgress) return Promise.resolve()
+  if (!loadLogsPromise) {
+    const requestGeneration = logsViewGeneration
+    loadLogsPromise = (async () => {
+      try {
+        const result = await Call.ByName('codeswitch/services.ConsoleService.GetLogs')
+        if (isUnmounted || requestGeneration !== logsViewGeneration) return
+        // Vue replaces the log rows when this value changes. Preserve a user's
+        // native text selection so Ctrl/Cmd+C can copy any individual entry.
+        if (hasSelectedConsoleText()) return
+        logs.value = result as ConsoleLog[]
 
-    if (autoScroll.value) {
-      await nextTick()
-      scrollToBottom()
+        if (autoScroll.value && isPageActive) {
+          await nextTick()
+          if (!isUnmounted && isPageActive) {
+            scrollToBottom()
+          }
+        }
+      } catch (error) {
+        console.error('加载控制台日志失败:', error)
+      }
+    })().finally(() => {
+      loadLogsPromise = null
+    })
+  }
+  return loadLogsPromise
+}
+
+const stopPolling = () => {
+  if (refreshInterval !== null) {
+    clearInterval(refreshInterval)
+    refreshInterval = null
+  }
+}
+
+const startPolling = () => {
+  stopPolling()
+  if (!canPoll()) return
+  refreshInterval = window.setInterval(() => {
+    if (canPoll()) {
+      void loadLogs()
     }
-  } catch (error) {
-    console.error('加载控制台日志失败:', error)
+  }, 1000)
+}
+
+const syncPollingState = () => {
+  if (canPoll()) {
+    startPolling()
+  } else {
+    stopPolling()
+  }
+}
+
+const handleVisibilityChange = () => {
+  syncPollingState()
+  if (canPoll()) {
+    void loadLogs()
   }
 }
 
@@ -47,12 +111,19 @@ const clearLogs = async () => {
     return
   }
 
+  clearInProgress = true
+  logsViewGeneration += 1
+  syncPollingState()
   try {
     await Call.ByName('codeswitch/services.ConsoleService.ClearLogs')
+    logsViewGeneration += 1
     logs.value = []
   } catch (error) {
     console.error('清空日志失败:', error)
     alert('清空失败：' + (error as Error).message)
+  } finally {
+    clearInProgress = false
+    syncPollingState()
   }
 }
 
@@ -79,18 +150,36 @@ const getLevelClass = (level: string) => {
 }
 
 onMounted(async () => {
+  isUnmounted = false
+  isPageActive = true
+  document.addEventListener('visibilitychange', handleVisibilityChange)
   loading.value = true
   await loadLogs()
+  if (isUnmounted) return
   loading.value = false
+  initialLoadDone = true
+  syncPollingState()
+})
 
-  // 每秒刷新一次日志
-  refreshInterval = window.setInterval(loadLogs, 1000)
+onActivated(() => {
+  const wasActive = isPageActive
+  isPageActive = true
+  syncPollingState()
+  if (!wasActive && canPoll()) {
+    void loadLogs()
+  }
+})
+
+onDeactivated(() => {
+  isPageActive = false
+  syncPollingState()
 })
 
 onUnmounted(() => {
-  if (refreshInterval) {
-    clearInterval(refreshInterval)
-  }
+  isUnmounted = true
+  isPageActive = false
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+  syncPollingState()
 })
 </script>
 

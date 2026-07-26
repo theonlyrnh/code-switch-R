@@ -112,6 +112,15 @@ func TestSpecialBlacklistRuleValidation(t *testing.T) {
 	if !strings.HasPrefix(pool.SpecialBlacklistRules[0].ID, "rule_") {
 		t.Fatalf("rule id was not generated: %q", pool.SpecialBlacklistRules[0].ID)
 	}
+
+	pool.SpecialBlacklistRules[0].DurationMinutes = maxSpecialBlacklistDurationMinutes
+	if err := normalizeAndValidateSpecialBlacklistRules(pool); err != nil {
+		t.Fatalf("maximum special blacklist duration was rejected: %v", err)
+	}
+	pool.SpecialBlacklistRules[0].DurationMinutes = maxSpecialBlacklistDurationMinutes + 1
+	if err := normalizeAndValidateSpecialBlacklistRules(pool); err == nil {
+		t.Fatal("special blacklist duration above maximum was accepted")
+	}
 }
 
 func TestPoolAttemptLogsAreUserScopedAndRedactAccountKeys(t *testing.T) {

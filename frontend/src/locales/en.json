@@ -239,10 +239,10 @@
           },
           "logs": {
             "title": "Logs",
-            "body": "The Logs page shows relay request records, errors, token breakdowns, and provider hits.",
+            "body": "The Logs page shows active relay requests and up to 105 recent completed records.",
             "items": [
-              "Filter by platform, provider, and limit, or switch to the errors-only view to find failed requests.",
-              "The summary shows today's request count, failures, token traffic, and cache reads.",
+              "Queued, processing, and retrying requests refresh from memory and appear above each completed-record page.",
+              "Completed records are limited to the latest 105 at 15 per page; platform and provider remain visible as table columns.",
               "Relay key, model, HTTP status, first-token latency, and duration help identify whether an issue is in the client, relay, or upstream."
             ]
           },
@@ -668,36 +668,16 @@
       }
     },
     "logs": {
-      "eyebrow": "Request diagnostics",
-      "title": "Request logs",
-      "subtitle": "Inspect recent relay activity for Claude Code and OpenAI providers.",
       "loading": "Loading...",
       "refresh": "Refresh",
-      "applyFilters": "Apply filters",
       "empty": "No logs yet",
-      "lastUpdated": "Last updated {time}",
-      "filters": {
-        "platform": "Platform",
-        "allPlatforms": "All platforms",
-        "provider": "Provider",
-        "allProviders": "All providers",
-        "providerPlaceholder": "Provider name",
-        "limit": "Limit"
-      },
-      "tabs": {
-        "all": "All logs",
-        "errors": "Errors only"
-      },
       "summary": {
         "total": "Requests",
         "requests": "Total requests",
-        "errors": "Failures",
-        "errorHint": "Count & failure rate",
         "tokens": "Tokens moved",
         "tokenHint": "Input + output + cache write tokens",
         "cache": "Cache reads",
-        "cacheHint": "Cache reads / input-side tokens",
-        "todayScope": "Today · {date}"
+        "cacheHint": "Cache reads / input-side tokens"
       },
       "table": {
         "time": "Time",
@@ -740,8 +720,6 @@
       "streamOn": "Streaming",
       "streamOff": "Single response",
       "back": "Back to home",
-      "nextRefresh": "Next refresh in {seconds}s",
-      "query": "Query",
       "tokenDetail": {
         "title": "Today's Token Breakdown"
       }
@@ -883,7 +861,14 @@
       "eyebrow": "Today cost",
       "title": "Costs",
       "description": "Estimate today's successful request cost from log tokens and provider pricing.",
-      "refresh": "Refresh",
+      "query": "Query",
+      "queryPrompt": "Set the filters, then click Query to load cost data.",
+      "filters": {
+        "platform": "Platform",
+        "allPlatforms": "All platforms",
+        "provider": "Provider",
+        "allProviders": "All providers"
+      },
       "empty": "No billable successful requests today.",
       "loadFailed": "Failed to load costs",
       "missingPrice": "Missing price",

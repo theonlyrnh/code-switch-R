@@ -14,6 +14,8 @@ const timeLayout = "2006-01-02 15:04:05"
 
 var beijingLocation = loadBeijingLocation()
 
+const maxCompletedRequestLogs = 105
+
 type LogService struct {
 	relayKeys *CodexRelayKeyService
 }
@@ -24,10 +26,6 @@ func NewLogService() *LogService {
 	}
 }
 
-func (ls *LogService) ListRequestLogs(platform string, provider string, limit int) ([]ReqeustLog, error) {
-	return ls.ListRequestLogsForUser("", platform, provider, limit)
-}
-
 func (ls *LogService) RetryActiveRequest(id int64) ActiveRequestRetryResult {
 	return ls.RetryActiveRequestForUser("", id)
 }
@@ -36,31 +34,15 @@ func (ls *LogService) RetryActiveRequestForUser(userID string, id int64) ActiveR
 	return defaultActiveRequestTracker.Retry(id, userID)
 }
 
-func (ls *LogService) ListRequestLogsForUser(userID string, platform string, provider string, limit int) ([]ReqeustLog, error) {
-	if limit <= 0 {
-		limit = 100
+func (ls *LogService) ListActiveRequestLogsForUser(userID string) ([]ReqeustLog, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil, errors.New("用户 ID 不能为空")
 	}
-	if limit > 1000 {
-		limit = 1000
-	}
-	activeLogs := defaultActiveRequestTracker.List(platform, provider, userID)
-	model := xdb.New("request_log")
-	options := []xdb.Option{
-		xdb.OrderByDesc("id"),
-		xdb.Limit(limit),
-	}
-	if platform != "" {
-		options = append(options, xdb.WhereEq("platform", platform))
-	}
-	if provider != "" {
-		options = append(options, xdb.WhereEq("provider", provider))
-	}
-	if strings.TrimSpace(userID) != "" {
-		options = append(options, xdb.WhereEq("user_id", userID))
-	}
-	records, err := model.Selects(options...)
-	if err != nil {
-		return nil, err
+
+	activeLogs := defaultActiveRequestTracker.List("", "", userID)
+	if len(activeLogs) == 0 {
+		return activeLogs, nil
 	}
 	keyNames := ls.relayKeyNameMapForUser(userID)
 	for i := range activeLogs {
@@ -68,6 +50,35 @@ func (ls *LogService) ListRequestLogsForUser(userID string, platform string, pro
 		activeLogs[i].RelayKeyID = relayKeyID
 		activeLogs[i].RelayKeyName = relayKeyDisplayName(relayKeyID, keyNames)
 	}
+	return activeLogs, nil
+}
+
+func (ls *LogService) ListCompletedRequestLogsForUser(userID string, afterID int64, limit int) ([]ReqeustLog, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil, errors.New("用户 ID 不能为空")
+	}
+	if limit <= 0 || limit > maxCompletedRequestLogs {
+		limit = maxCompletedRequestLogs
+	}
+
+	options := []xdb.Option{
+		xdb.WhereEq("user_id", userID),
+		xdb.OrderByDesc("id"),
+		xdb.Limit(limit),
+	}
+	if afterID >= 0 {
+		options = append(options, xdb.WhereGt("id", afterID))
+	}
+	records, err := xdb.New("request_log").Selects(options...)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return []ReqeustLog{}, nil
+	}
+
+	keyNames := ls.relayKeyNameMapForUser(userID)
 	logs := make([]ReqeustLog, 0, len(records))
 	for _, record := range records {
 		relayKeyID := strings.TrimSpace(record.GetString("relay_key_id"))
@@ -110,20 +121,7 @@ func (ls *LogService) ListRequestLogsForUser(userID string, platform string, pro
 		}
 		logs = append(logs, logEntry)
 	}
-	if len(activeLogs) == 0 {
-		return logs, nil
-	}
-	merged := make([]ReqeustLog, 0, len(activeLogs)+len(logs))
-	merged = append(merged, activeLogs...)
-	merged = append(merged, logs...)
-	if len(merged) > limit {
-		merged = merged[:limit]
-	}
-	return merged, nil
-}
-
-func (ls *LogService) relayKeyNameMap() map[string]string {
-	return ls.relayKeyNameMapForUser("")
+	return logs, nil
 }
 
 func (ls *LogService) relayKeyNameMapForUser(userID string) map[string]string {
@@ -161,147 +159,104 @@ func relayKeyDisplayName(id string, names map[string]string) string {
 	return id
 }
 
-func (ls *LogService) ListProviders(platform string) ([]string, error) {
-	return ls.ListProvidersForUser("", platform)
-}
-
-func (ls *LogService) ListProvidersForUser(userID string, platform string) ([]string, error) {
-	model := xdb.New("request_log")
-	options := []xdb.Option{
-		xdb.Field("DISTINCT provider as provider"),
-		xdb.WhereNotEq("provider", ""),
-		xdb.OrderByAsc("provider"),
-	}
-	if platform != "" {
-		options = append(options, xdb.WhereEq("platform", platform))
-	}
-	if strings.TrimSpace(userID) != "" {
-		options = append(options, xdb.WhereEq("user_id", userID))
-	}
-	records, err := model.Selects(options...)
-	if err != nil {
-		return nil, err
-	}
-	providers := make([]string, 0, len(records))
-	for _, record := range records {
-		name := strings.TrimSpace(record.GetString("provider"))
-		if name != "" {
-			providers = append(providers, name)
-		}
-	}
-	return providers, nil
-}
-
 func (ls *LogService) StatsSince(platform string) (LogStats, error) {
 	return ls.StatsSinceForUser("", platform)
 }
 
 func (ls *LogService) StatsSinceForUser(userID string, platform string) (LogStats, error) {
-	const seriesHours = 24
+	const (
+		seriesBuckets  = 48
+		bucketDuration = 30 * time.Minute
+	)
 
 	stats := LogStats{
-		Series: make([]LogStatsSeries, 0, seriesHours),
+		Series: make([]LogStatsSeries, 0, seriesBuckets),
 	}
 	loc := beijingLocation
 	now := time.Now().In(loc)
-	model := xdb.New("request_log")
 	seriesStart := startOfDay(now)
-	seriesEnd := seriesStart.Add(seriesHours * time.Hour)
+	seriesEnd := seriesStart.Add(24 * time.Hour)
 	queryStart := seriesStart.In(time.UTC).Format(timeLayout)
 	queryEnd := seriesEnd.In(time.UTC).Format(timeLayout)
-	options := []xdb.Option{
-		xdb.WhereGte("created_at", queryStart),
-		xdb.WhereLt("created_at", queryEnd),
-		xdb.Field(
-			"model",
-			"input_tokens",
-			"output_tokens",
-			"reasoning_tokens",
-			"cache_create_tokens",
-			"cache_read_tokens",
-			"exclude_from_total",
-			"created_at",
-		),
-		xdb.OrderByAsc("created_at"),
-	}
-	if platform != "" {
-		options = append(options, xdb.WhereEq("platform", platform))
-	}
-	if strings.TrimSpace(userID) != "" {
-		options = append(options, xdb.WhereEq("user_id", userID))
-	}
-	records, err := model.Selects(options...)
+
+	db, err := xdb.DB("default")
 	if err != nil {
-		if errors.Is(err, xdb.ErrNotFound) || isNoSuchTableErr(err) {
-			return stats, nil
-		}
+		return stats, err
+	}
+	if err := requireRequestLogRollupReady(db); err != nil {
 		return stats, err
 	}
 
-	seriesBuckets := make([]*LogStatsSeries, seriesHours)
-	for i := 0; i < seriesHours; i++ {
-		bucketTime := seriesStart.Add(time.Duration(i) * time.Hour)
-		seriesBuckets[i] = &LogStatsSeries{
-			Day: bucketTime.Format(timeLayout),
-		}
+	query := `
+		SELECT
+			bucket_start_utc,
+			COALESCE(SUM(total_requests), 0) AS total_requests,
+			COALESCE(SUM(input_tokens), 0) AS input_tokens,
+			COALESCE(SUM(output_tokens), 0) AS output_tokens,
+			COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+			COALESCE(SUM(cache_create_tokens), 0) AS cache_create_tokens,
+			COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens
+		FROM request_log_rollup_30m
+		WHERE bucket_start_utc >= ?
+			AND bucket_start_utc < ?`
+	args := []any{queryStart, queryEnd}
+	if platform != "" {
+		query += " AND platform = ?"
+		args = append(args, platform)
+	}
+	if strings.TrimSpace(userID) != "" {
+		query += " AND user_id = ?"
+		args = append(args, userID)
+	}
+	query += " GROUP BY bucket_start_utc ORDER BY bucket_start_utc ASC"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return stats, err
+	}
+	defer rows.Close()
+
+	series := make([]LogStatsSeries, seriesBuckets)
+	for i := 0; i < seriesBuckets; i++ {
+		bucketTime := seriesStart.Add(time.Duration(i) * bucketDuration)
+		series[i].Day = bucketTime.Format(timeLayout)
 	}
 
-	for _, record := range records {
-		createdAt, hasTime := parseCreatedAt(record)
-		dayKey := dayFromTimestamp(record.GetString("created_at"))
-		isToday := dayKey == seriesStart.Format("2006-01-02")
-
-		if hasTime {
-			if createdAt.Before(seriesStart) || !createdAt.Before(seriesEnd) {
-				continue
-			}
-		} else {
-			if !isToday {
-				continue
-			}
-			createdAt = seriesStart
+	for rows.Next() {
+		var bucketStartRaw string
+		var bucket LogStatsSeries
+		if err := rows.Scan(
+			&bucketStartRaw,
+			&bucket.TotalRequests,
+			&bucket.InputTokens,
+			&bucket.OutputTokens,
+			&bucket.ReasoningTokens,
+			&bucket.CacheCreateTokens,
+			&bucket.CacheReadTokens,
+		); err != nil {
+			return stats, err
 		}
-
-		bucketIndex := 0
-		if hasTime {
-			bucketIndex = int(createdAt.Sub(seriesStart) / time.Hour)
-			if bucketIndex < 0 {
-				bucketIndex = 0
-			}
-			if bucketIndex >= seriesHours {
-				bucketIndex = seriesHours - 1
-			}
+		bucketStart, err := time.ParseInLocation(timeLayout, bucketStartRaw, time.UTC)
+		if err != nil {
+			return stats, fmt.Errorf("解析 request_log rollup bucket %q 失败: %w", bucketStartRaw, err)
 		}
-		bucket := seriesBuckets[bucketIndex]
-		input, output, reasoning, cacheCreate, cacheRead := trafficTokensForTotals(record)
-		bucket.TotalRequests++
-		bucket.InputTokens += int64(input)
-		bucket.OutputTokens += int64(output)
-		bucket.ReasoningTokens += int64(reasoning)
-		bucket.CacheCreateTokens += int64(cacheCreate)
-		bucket.CacheReadTokens += int64(cacheRead)
-
-		if createdAt.IsZero() {
+		bucketIndex := int(bucketStart.Sub(seriesStart.UTC()) / bucketDuration)
+		if bucketIndex < 0 || bucketIndex >= seriesBuckets {
 			continue
 		}
-		stats.TotalRequests++
-		stats.InputTokens += int64(input)
-		stats.OutputTokens += int64(output)
-		stats.ReasoningTokens += int64(reasoning)
-		stats.CacheCreateTokens += int64(cacheCreate)
-		stats.CacheReadTokens += int64(cacheRead)
+		bucket.Day = series[bucketIndex].Day
+		series[bucketIndex] = bucket
+		stats.TotalRequests += bucket.TotalRequests
+		stats.InputTokens += bucket.InputTokens
+		stats.OutputTokens += bucket.OutputTokens
+		stats.ReasoningTokens += bucket.ReasoningTokens
+		stats.CacheCreateTokens += bucket.CacheCreateTokens
+		stats.CacheReadTokens += bucket.CacheReadTokens
 	}
-
-	for i := 0; i < seriesHours; i++ {
-		if bucket := seriesBuckets[i]; bucket != nil {
-			stats.Series = append(stats.Series, *bucket)
-		} else {
-			bucketTime := seriesStart.Add(time.Duration(i) * time.Hour)
-			stats.Series = append(stats.Series, LogStatsSeries{
-				Day: bucketTime.Format(timeLayout),
-			})
-		}
+	if err := rows.Err(); err != nil {
+		return stats, err
 	}
+	stats.Series = append(stats.Series, series...)
 
 	return stats, nil
 }
@@ -316,73 +271,87 @@ func (ls *LogService) ProviderDailyStatsForUser(userID string, platform string) 
 	end := start.Add(24 * time.Hour)
 	queryStart := start.In(time.UTC).Format(timeLayout)
 	queryEnd := end.In(time.UTC).Format(timeLayout)
-	model := xdb.New("request_log")
-	options := []xdb.Option{
-		xdb.WhereGte("created_at", queryStart),
-		xdb.WhereLt("created_at", queryEnd),
-		xdb.Field(
-			"provider",
-			"model",
-			"http_code",
-			"input_tokens",
-			"output_tokens",
-			"reasoning_tokens",
-			"cache_create_tokens",
-			"cache_read_tokens",
-			"exclude_from_total",
-			"created_at",
-		),
-	}
+	query := `
+		SELECT
+			COALESCE(provider, '') AS provider,
+			COUNT(*) AS total_requests,
+			COALESCE(SUM(CASE WHEN http_code >= 200 AND http_code < 300 THEN 1 ELSE 0 END), 0) AS successful_requests,
+			COALESCE(SUM(CASE WHEN http_code >= 200 AND http_code < 300 THEN 0 ELSE 1 END), 0) AS failed_requests,
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN COALESCE(input_tokens, 0) ELSE 0 END), 0) AS input_tokens,
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN COALESCE(output_tokens, 0) ELSE 0 END), 0) AS output_tokens,
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN COALESCE(reasoning_tokens, 0) ELSE 0 END), 0) AS reasoning_tokens,
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN COALESCE(cache_create_tokens, 0) ELSE 0 END), 0) AS cache_create_tokens,
+			COALESCE(SUM(CASE WHEN COALESCE(exclude_from_total, 0) = 0 THEN COALESCE(cache_read_tokens, 0) ELSE 0 END), 0) AS cache_read_tokens
+		FROM request_log
+		WHERE created_at >= ?
+			AND created_at < ?
+			AND (
+				(DATETIME(created_at) IS NOT NULL AND DATETIME(created_at) >= ? AND DATETIME(created_at) < ?)
+				OR (DATETIME(created_at) IS NULL AND SUBSTR(TRIM(COALESCE(created_at, '')), 1, 10) = ?)
+			)`
+	args := []any{queryStart, queryEnd, queryStart, queryEnd, start.Format("2006-01-02")}
 	if platform != "" {
-		options = append(options, xdb.WhereEq("platform", platform))
+		query += " AND platform = ?"
+		args = append(args, platform)
 	}
 	if strings.TrimSpace(userID) != "" {
-		options = append(options, xdb.WhereEq("user_id", userID))
+		query += " AND user_id = ?"
+		args = append(args, userID)
 	}
-	records, err := model.Selects(options...)
+	query += " GROUP BY provider"
+
+	db, err := xdb.DB("default")
 	if err != nil {
-		if errors.Is(err, xdb.ErrNotFound) || isNoSuchTableErr(err) {
+		return nil, err
+	}
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		if isNoSuchTableErr(err) {
 			return []ProviderDailyStat{}, nil
 		}
 		return nil, err
 	}
+	defer rows.Close()
+
 	statMap := map[string]*ProviderDailyStat{}
-	for _, record := range records {
-		provider := strings.TrimSpace(record.GetString("provider"))
+	for rows.Next() {
+		var provider string
+		var rowStat ProviderDailyStat
+		if err := rows.Scan(
+			&provider,
+			&rowStat.TotalRequests,
+			&rowStat.SuccessfulRequests,
+			&rowStat.FailedRequests,
+			&rowStat.InputTokens,
+			&rowStat.OutputTokens,
+			&rowStat.ReasoningTokens,
+			&rowStat.CacheCreateTokens,
+			&rowStat.CacheReadTokens,
+		); err != nil {
+			return nil, err
+		}
+		provider = strings.TrimSpace(provider)
 		if provider == "" {
 			provider = "(unknown)"
-		}
-		createdAt, hasTime := parseCreatedAt(record)
-		if hasTime {
-			if createdAt.Before(start) || !createdAt.Before(end) {
-				continue
-			}
-		} else {
-			dayKey := dayFromTimestamp(record.GetString("created_at"))
-			if dayKey != start.Format("2006-01-02") {
-				continue
-			}
 		}
 		stat := statMap[provider]
 		if stat == nil {
 			stat = &ProviderDailyStat{Provider: provider}
 			statMap[provider] = stat
 		}
-		httpCode := record.GetInt("http_code")
-		input, output, reasoning, cacheCreate, cacheRead := trafficTokensForTotals(record)
-		stat.TotalRequests++
-		// 只有 HTTP 200-299 才算成功，其他（包括 0）都算失败
-		if httpCode >= 200 && httpCode < 300 {
-			stat.SuccessfulRequests++
-		} else {
-			stat.FailedRequests++
-		}
-		stat.InputTokens += int64(input)
-		stat.OutputTokens += int64(output)
-		stat.ReasoningTokens += int64(reasoning)
-		stat.CacheCreateTokens += int64(cacheCreate)
-		stat.CacheReadTokens += int64(cacheRead)
+		stat.TotalRequests += rowStat.TotalRequests
+		stat.SuccessfulRequests += rowStat.SuccessfulRequests
+		stat.FailedRequests += rowStat.FailedRequests
+		stat.InputTokens += rowStat.InputTokens
+		stat.OutputTokens += rowStat.OutputTokens
+		stat.ReasoningTokens += rowStat.ReasoningTokens
+		stat.CacheCreateTokens += rowStat.CacheCreateTokens
+		stat.CacheReadTokens += rowStat.CacheReadTokens
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
 	stats := make([]ProviderDailyStat, 0, len(statMap))
 	for _, stat := range statMap {
 		if stat.TotalRequests > 0 {
@@ -411,32 +380,71 @@ func (ls *LogService) ListHTTPErrorConsoleLogsForUser(userID string, limit int, 
 		limit = 1000
 	}
 
-	options := []xdb.Option{
-		xdb.WhereEq("user_id", userID),
-		xdb.WhereGte("http_code", 400),
-		xdb.OrderByDesc("id"),
-		xdb.Limit(limit),
-		xdb.Field(
-			"id",
-			"platform",
-			"model",
-			"provider",
-			"relay_key_id",
-			"http_code",
-			"error_message",
-			"duration_sec",
-			"created_at",
-		),
-	}
+	query := `
+		SELECT
+			id,
+			COALESCE(platform, ''),
+			COALESCE(model, ''),
+			COALESCE(provider, ''),
+			COALESCE(relay_key_id, ''),
+			COALESCE(http_code, 0),
+			COALESCE(error_message, ''),
+			COALESCE(duration_sec, 0),
+			COALESCE(created_at, '')
+		FROM request_log
+		WHERE user_id = ?
+			AND http_code >= 400`
+	args := []any{userID}
 	if !since.IsZero() {
-		options = append(options, xdb.WhereGte("created_at", since.UTC().Format(timeLayout)))
+		query += " AND created_at >= ?"
+		args = append(args, since.UTC().Format(timeLayout))
 	}
+	query += " ORDER BY id DESC LIMIT ?"
+	args = append(args, limit)
 
-	records, err := xdb.New("request_log").Selects(options...)
+	db, err := xdb.DB("default")
 	if err != nil {
-		if errors.Is(err, xdb.ErrNotFound) || isNoSuchTableErr(err) {
+		return nil, err
+	}
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		if isNoSuchTableErr(err) {
 			return []ConsoleLog{}, nil
 		}
+		return nil, err
+	}
+	defer rows.Close()
+
+	type consoleRequestLog struct {
+		id           int64
+		platform     string
+		model        string
+		provider     string
+		relayKeyID   string
+		httpCode     int
+		errorMessage string
+		durationSec  float64
+		createdAt    string
+	}
+	records := make([]consoleRequestLog, 0, limit)
+	for rows.Next() {
+		var record consoleRequestLog
+		if err := rows.Scan(
+			&record.id,
+			&record.platform,
+			&record.model,
+			&record.provider,
+			&record.relayKeyID,
+			&record.httpCode,
+			&record.errorMessage,
+			&record.durationSec,
+			&record.createdAt,
+		); err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
@@ -444,27 +452,26 @@ func (ls *LogService) ListHTTPErrorConsoleLogsForUser(userID string, limit int, 
 	logs := make([]ConsoleLog, 0, len(records))
 	for i := len(records) - 1; i >= 0; i-- {
 		record := records[i]
-		createdAt, ok := parseCreatedAt(record)
-		if !ok || createdAt.IsZero() {
+		createdAt, _ := parseLogTimestamp(record.createdAt)
+		if createdAt.IsZero() {
 			createdAt = time.Now().In(beijingLocation)
 		}
-		httpCode := record.GetInt("http_code")
 		level := "WARN"
-		if httpCode >= 500 {
+		if record.httpCode >= 500 {
 			level = "ERROR"
 		}
-		relayKeyID := strings.TrimSpace(record.GetString("relay_key_id"))
+		relayKeyID := strings.TrimSpace(record.relayKeyID)
 		relayKeyName := relayKeyDisplayName(relayKeyID, keyNames)
 		message := fmt.Sprintf(
 			"HTTP %d | platform=%s provider=%s model=%s key=%s duration=%.2fs request_id=%d | %s",
-			httpCode,
-			emptyAsUnknown(record.GetString("platform")),
-			emptyAsUnknown(record.GetString("provider")),
-			emptyAsUnknown(record.GetString("model")),
+			record.httpCode,
+			emptyAsUnknown(record.platform),
+			emptyAsUnknown(record.provider),
+			emptyAsUnknown(record.model),
 			emptyAsUnknown(relayKeyName),
-			record.GetFloat64("duration_sec"),
-			record.GetInt64("id"),
-			emptyAsUnknown(record.GetString("error_message")),
+			record.durationSec,
+			record.id,
+			emptyAsUnknown(record.errorMessage),
 		)
 		logs = append(logs, ConsoleLog{
 			Timestamp: createdAt,
@@ -481,19 +488,6 @@ func emptyAsUnknown(value string) string {
 		return "(unknown)"
 	}
 	return value
-}
-
-// trafficTokensForTotals leaves request counts and raw request logs intact
-// while suppressing token aggregation for account pools that opt out.
-func trafficTokensForTotals(record xdb.Record) (input, output, reasoning, cacheCreate, cacheRead int) {
-	if record.GetBool("exclude_from_total") {
-		return 0, 0, 0, 0, 0
-	}
-	return record.GetInt("input_tokens"),
-		record.GetInt("output_tokens"),
-		record.GetInt("reasoning_tokens"),
-		record.GetInt("cache_create_tokens"),
-		record.GetInt("cache_read_tokens")
 }
 
 func parseCreatedAt(record xdb.Record) (time.Time, bool) {

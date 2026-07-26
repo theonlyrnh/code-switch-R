@@ -4,15 +4,12 @@
       <BaseButton variant="outline" type="button" @click="backToHome">
         {{ t('components.logs.back') }}
       </BaseButton>
-      <div class="refresh-indicator">
-        <span>{{ t('components.logs.nextRefresh', { seconds: countdown }) }}</span>
-        <BaseButton size="sm" :disabled="loading" @click="manualRefresh">
-          {{ t('components.logs.refresh') }}
-        </BaseButton>
-      </div>
+      <BaseButton size="sm" :disabled="loading" @click="manualRefresh">
+        {{ t('components.logs.refresh') }}
+      </BaseButton>
     </div>
 
-    <section class="logs-summary" v-if="statsCards.length">
+    <section class="logs-summary">
       <article
         v-for="card in statsCards"
         :key="card.key"
@@ -31,34 +28,6 @@
     <section class="logs-chart">
       <Line :data="chartData" :options="chartOptions" />
     </section>
-
-    <form class="logs-filter-row" @submit.prevent="applyFilters">
-      <div class="filter-fields">
-        <label class="filter-field">
-          <span>{{ t('components.logs.filters.platform') }}</span>
-          <select v-model="filters.platform" class="mac-select">
-            <option value="">{{ t('components.logs.filters.allPlatforms') }}</option>
-            <option value="claude">Claude</option>
-            <option value="openai-responses">OpenAI Responses</option>
-            <option value="openai-chat">OpenAI Chat</option>
-          </select>
-        </label>
-        <label class="filter-field">
-          <span>{{ t('components.logs.filters.provider') }}</span>
-          <select v-model="filters.provider" class="mac-select">
-            <option value="">{{ t('components.logs.filters.allProviders') }}</option>
-            <option v-for="provider in providerOptions" :key="provider" :value="provider">
-              {{ provider }}
-            </option>
-          </select>
-        </label>
-      </div>
-      <div class="filter-actions">
-        <BaseButton type="submit" :disabled="loading">
-          {{ t('components.logs.query') }}
-        </BaseButton>
-      </div>
-    </form>
 
     <section class="logs-table-wrapper">
       <table ref="logsTableRef" class="logs-table">
@@ -162,7 +131,6 @@
       </div>
     </div>
 
-    <!-- Token 明细弹窗 -->
     <BaseModal
       :open="tokenDetailModal.open"
       :title="t('components.logs.tokenDetail.title')"
@@ -197,20 +165,26 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref, onMounted, watch, onUnmounted } from 'vue'
+import {
+  computed,
+  ref,
+  onActivated,
+  onDeactivated,
+  onMounted,
+  onUnmounted,
+} from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import BaseButton from '../common/BaseButton.vue'
 import BaseModal from '../common/BaseModal.vue'
 import {
-  fetchRequestLogs,
-  fetchLogProviders,
+  fetchActiveRequestLogs,
+  fetchCompletedRequestLogs,
   fetchLogStats,
   retryActiveRequest,
-  type RequestLog,
   type LogStats,
   type LogStatsSeries,
-  type LogPlatform,
+  type RequestLog,
 } from '../../services/logs'
 import {
   Chart,
@@ -225,22 +199,24 @@ import type { ChartOptions } from 'chart.js'
 import { Line } from 'vue-chartjs'
 import { showToast } from '../../utils/toast'
 import { ListAllPools, accountPoolKeyDisplayName } from '../../services/providerPool'
+import {
+  MAX_COMPLETED_REQUEST_LOGS,
+  mergeCompletedRequestLogs,
+} from '../../services/logMerge'
 
 Chart.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend)
 
 const { t } = useI18n()
 const router = useRouter()
 
-const logs = ref<RequestLog[]>([])
+const activeLogs = ref<RequestLog[]>([])
+const completedLogs = ref<RequestLog[]>([])
 const stats = ref<LogStats | null>(null)
 const loading = ref(false)
 const retryingLogIds = ref<Set<number>>(new Set())
-const filters = reactive<{ platform: LogPlatform | ''; provider: string }>({ platform: '', provider: '' })
 const page = ref(1)
 const PAGE_SIZE = 15
-const providerOptions = ref<string[]>([])
 const hiddenLogProviderKeys = ref<Set<string>>(new Set())
-const hiddenLogProviderNames = ref<Set<string>>(new Set())
 const statsSeries = computed<LogStatsSeries[]>(() => stats.value?.series ?? [])
 const LOG_COLUMN_WIDTH_STORAGE_KEY = 'code-switch-r:logs-table-column-widths:v1'
 
@@ -365,28 +341,16 @@ const startLogColumnResize = (index: number, event: PointerEvent) => {
   window.addEventListener('pointercancel', stopLogColumnResize)
 }
 
-// Token 明细弹窗状态
-const tokenDetailModal = reactive<{
-  open: boolean
-}>({
-  open: false,
-})
+const tokenDetailModal = ref({ open: false })
 
-// 处理卡片点击
 const handleCardClick = (key: string) => {
   if (key === 'tokens') {
-    openTokenDetailModal()
+    tokenDetailModal.value.open = true
   }
 }
 
-// 打开 Token 明细弹窗
-const openTokenDetailModal = () => {
-  tokenDetailModal.open = true
-}
-
-// 关闭 Token 明细弹窗
 const closeTokenDetailModal = () => {
-  tokenDetailModal.open = false
+  tokenDetailModal.value.open = false
 }
 
 const parseLogDate = (value?: string) => {
@@ -409,6 +373,23 @@ const parseLogDate = (value?: string) => {
     }
   }
   return null
+}
+
+const formatSeriesLabel = (value?: string) => {
+  if (!value) return ''
+  const bucketTime = value.match(/^\d{4}-\d{2}-\d{2}[ T](\d{2}):(\d{2})/)
+  if (bucketTime) {
+    return `${bucketTime[1]}:${bucketTime[2]}`
+  }
+  const parsed = parseLogDate(value)
+  if (parsed) {
+    return `${padHour(parsed.getHours())}:${padHour(parsed.getMinutes())}`
+  }
+  const time = value.match(/(\d{2}):(\d{2})/)
+  if (time) {
+    return `${time[1]}:${time[2]}`
+  }
+  return value
 }
 
 const chartData = computed(() => {
@@ -481,7 +462,12 @@ const chartOptions: ChartOptions<'line'> = {
   scales: {
     x: {
       grid: { display: false },
-      ticks: { color: '#94a3b8' },
+      ticks: {
+        color: '#94a3b8',
+        autoSkip: true,
+        maxTicksLimit: 8,
+        maxRotation: 0,
+      },
     },
     y: {
       beginAtZero: true,
@@ -490,67 +476,49 @@ const chartOptions: ChartOptions<'line'> = {
     },
   },
 }
-const formatSeriesLabel = (value?: string) => {
-  if (!value) return ''
-  const beijingTime = value.match(/^\d{4}-\d{2}-\d{2}[ T](\d{2}):(\d{2})/)
-  if (beijingTime) {
-    return `${beijingTime[1]}:${beijingTime[2]}`
-  }
-  const parsed = parseLogDate(value)
-  if (parsed) {
-    return `${padHour(parsed.getHours())}:00`
-  }
-  const match = value.match(/(\d{2}):(\d{2})/)
-  if (match) {
-    return `${match[1]}:${match[2]}`
-  }
-  return value
-}
 
-const REFRESH_INTERVAL = 30
 const LOG_AUTO_REFRESH_INTERVAL_MS = 1000
-const countdown = ref(REFRESH_INTERVAL)
-let timer: number | undefined
 let logAutoRefreshTimer: number | undefined
-let logAutoRefreshBusy = false
-let logRefreshPending = false
-let logRefreshWaiters: Array<() => void> = []
-let lastLogsSignature = ''
+let refreshPromise: Promise<boolean> | null = null
+let refreshPending = false
+let statsPromise: Promise<void> | null = null
+let statsPending = false
+let lastSeenCompletedID = 0
+let isPageActive = false
+let isUnmounted = false
+let initialLoadDone = false
 
-const resetTimer = () => {
-  countdown.value = REFRESH_INTERVAL
-}
-
-const startCountdown = () => {
-  stopCountdown()
-  timer = window.setInterval(() => {
-    if (countdown.value <= 1) {
-      countdown.value = REFRESH_INTERVAL
-      void loadDashboard()
-    } else {
-      countdown.value -= 1
-    }
-  }, 1000)
-}
-
-const stopCountdown = () => {
-  if (timer) {
-    clearInterval(timer)
-    timer = undefined
-  }
-}
+const canPoll = () =>
+  isPageActive && initialLoadDone && !isUnmounted && document.visibilityState === 'visible'
 
 const startLogAutoRefresh = () => {
   stopLogAutoRefresh()
+  if (!canPoll()) return
   logAutoRefreshTimer = window.setInterval(() => {
-    void refreshLogsIfChanged()
+    if (!canPoll()) return
+    void refreshLogs()
   }, LOG_AUTO_REFRESH_INTERVAL_MS)
 }
 
 const stopLogAutoRefresh = () => {
-  if (logAutoRefreshTimer) {
+  if (logAutoRefreshTimer !== undefined) {
     clearInterval(logAutoRefreshTimer)
     logAutoRefreshTimer = undefined
+  }
+}
+
+const syncPollingState = () => {
+  if (canPoll()) {
+    startLogAutoRefresh()
+    return
+  }
+  stopLogAutoRefresh()
+}
+
+const handleVisibilityChange = () => {
+  syncPollingState()
+  if (canPoll()) {
+    void refreshLogs()
   }
 }
 
@@ -562,80 +530,35 @@ const providerVisibilityKey = (platform: string, provider: string) =>
 const isHiddenLogProvider = (platform: string, provider: string) => {
   const normalizedProvider = normalizeProviderName(provider)
   if (!normalizedProvider) return false
-  if (platform.trim()) {
-    return hiddenLogProviderKeys.value.has(providerVisibilityKey(platform, normalizedProvider))
-  }
-  return hiddenLogProviderNames.value.has(normalizedProvider)
+  return hiddenLogProviderKeys.value.has(providerVisibilityKey(platform, normalizedProvider))
 }
 
-const visibleRequestLogs = (items: RequestLog[]) =>
+const visibleRequestLogs = (items: readonly RequestLog[]) =>
   items.filter((item) => !isHiddenLogProvider(item.platform ?? '', item.provider ?? ''))
+
+// The cursor and 105-row completed quota intentionally apply to the raw DB
+// window. hideFromLogs is display-only: backfilling until 105 visible rows could
+// turn a bounded query into an unbounded historical scan.
+const visibleActiveLogs = computed(() => visibleRequestLogs(activeLogs.value))
+const visibleCompletedLogs = computed(() => visibleRequestLogs(completedLogs.value))
 
 const loadHiddenLogProviders = async () => {
   try {
     const pools = await ListAllPools()
     const hiddenKeys = new Set<string>()
-    const hiddenNames = new Set<string>()
     for (const pool of pools ?? []) {
       if (pool.poolType !== 'account' || pool.hideFromLogs !== true) continue
       for (const key of pool.accountPoolConfig?.keys ?? []) {
         const provider = accountPoolKeyDisplayName(key)
         hiddenKeys.add(providerVisibilityKey(pool.platform, provider))
-        hiddenNames.add(provider)
       }
     }
     hiddenLogProviderKeys.value = hiddenKeys
-    hiddenLogProviderNames.value = hiddenNames
-    if (filters.provider && isHiddenLogProvider(filters.platform, filters.provider)) {
-      filters.provider = ''
-    }
+    page.value = Math.min(page.value, totalPages.value)
   } catch (error) {
     console.error('failed to load hidden log pools', error)
   }
 }
-
-const syncProviderOptionsFromLogs = (items: RequestLog[]) => {
-  if (!items.length) return
-  const merged = new Set(providerOptions.value.map(normalizeProviderName).filter(Boolean))
-  for (const item of items) {
-    const name = normalizeProviderName(item.provider ?? '')
-    if (name) {
-      merged.add(name)
-    }
-  }
-  const next = Array.from(merged)
-  next.sort((a, b) => a.localeCompare(b))
-  providerOptions.value = next
-}
-
-const logSignature = (item: RequestLog) => [
-  item.status ?? '',
-  item.id,
-  item.created_at ?? '',
-  item.platform ?? '',
-  item.provider ?? '',
-  item.relay_key_id ?? '',
-  item.relay_key_name ?? '',
-  item.model ?? '',
-  item.client_ip ?? '',
-  item.http_code ?? '',
-  item.is_stream ?? '',
-  item.duration_sec ?? '',
-  item.first_token_duration_sec ?? '',
-  item.first_text_sec ?? '',
-  item.queue_position ?? '',
-  item.queue_started_at ?? '',
-  item.input_tokens ?? '',
-  item.output_tokens ?? '',
-  item.cache_create_tokens ?? '',
-  item.cache_read_tokens ?? '',
-  item.reasoning_tokens ?? '',
-  item.error_message ?? '',
-  item.retry_requested ? 'retry' : '',
-  retryingLogIds.value.has(item.id) ? 'retrying' : '',
-].join('|')
-
-const logsSignature = (items: RequestLog[]) => items.map(logSignature).join('\n')
 
 const isPositiveDuration = (value?: number): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0
 
@@ -680,113 +603,143 @@ const reconcileRetryingLogs = (items: RequestLog[]) => {
   }
 }
 
-const loadLogs = async () => {
+const newestCompletedID = (items: readonly RequestLog[]) => {
+  let newestID = 0
+  for (const item of items) {
+    if (item.id > newestID) newestID = item.id
+  }
+  return newestID
+}
+
+const applyActiveLogs = (items: readonly RequestLog[]) => {
+  const nextActive = [...items]
+  reconcileRetryingLogs(nextActive)
+  activeLogs.value = nextActive
+}
+
+const loadStats = (): Promise<void> => {
+  if (statsPromise) {
+    statsPending = true
+    return statsPromise
+  }
+
+  statsPromise = (async () => {
+    do {
+      statsPending = false
+      try {
+        const data = await fetchLogStats('')
+        if (!isUnmounted) {
+          stats.value = data ?? null
+        }
+      } catch (error) {
+        console.error('failed to load log stats', error)
+      }
+    } while (statsPending && !isUnmounted)
+  })().finally(() => {
+    statsPromise = null
+  })
+  return statsPromise
+}
+
+const loadInitialLogs = async () => {
   loading.value = true
   try {
-    const data = await fetchRequestLogs({
-      platform: filters.platform,
-      provider: filters.provider,
-      limit: 200,
-    })
-    const nextLogs = visibleRequestLogs(data ?? [])
-    reconcileRetryingLogs(nextLogs)
-    logs.value = nextLogs
-    lastLogsSignature = logsSignature(logs.value)
+    await loadHiddenLogProviders()
+    const [activeResult, completedResult] = await Promise.allSettled([
+      fetchActiveRequestLogs(),
+      fetchCompletedRequestLogs(-1, MAX_COMPLETED_REQUEST_LOGS),
+      loadStats(),
+    ])
+    if (isUnmounted) return
+
+    if (activeResult.status === 'fulfilled') {
+      applyActiveLogs(activeResult.value ?? [])
+    } else {
+      console.error('failed to load active request logs', activeResult.reason)
+    }
+    if (completedResult.status === 'fulfilled') {
+      const initialCompleted = completedResult.value ?? []
+      lastSeenCompletedID = newestCompletedID(initialCompleted)
+      completedLogs.value = mergeCompletedRequestLogs([], initialCompleted)
+    } else {
+      console.error('failed to load completed request logs', completedResult.reason)
+    }
     page.value = Math.min(page.value, totalPages.value)
   } catch (error) {
     console.error('failed to load request logs', error)
   } finally {
     loading.value = false
-    if (logRefreshPending) {
-      void refreshLogsIfChanged()
-    }
   }
 }
 
-const refreshLogsIfChanged = async (force = false) => {
-  let forceRefreshCompleted: Promise<void> | undefined
-  if (force) {
-    logRefreshPending = true
-    forceRefreshCompleted = new Promise((resolve) => {
-      logRefreshWaiters.push(resolve)
-    })
+const refreshLogSnapshot = async () => {
+  const afterID = lastSeenCompletedID
+  const [activeResult, completedResult] = await Promise.allSettled([
+    fetchActiveRequestLogs(),
+    fetchCompletedRequestLogs(afterID, MAX_COMPLETED_REQUEST_LOGS),
+  ])
+  if (isUnmounted) return false
+
+  if (activeResult.status === 'fulfilled') {
+    applyActiveLogs(activeResult.value ?? [])
+  } else {
+    console.error('failed to refresh active request logs', activeResult.reason)
   }
-  if (logAutoRefreshBusy || loading.value) {
-    await forceRefreshCompleted
-    return
+  if (completedResult.status === 'fulfilled') {
+    const incomingCompleted = completedResult.value ?? []
+    lastSeenCompletedID = Math.max(lastSeenCompletedID, newestCompletedID(incomingCompleted))
+    completedLogs.value = mergeCompletedRequestLogs(completedLogs.value, incomingCompleted)
+    page.value = Math.min(page.value, totalPages.value)
+    return incomingCompleted.length > 0
+  } else {
+    console.error('failed to refresh completed request logs', completedResult.reason)
+  }
+  page.value = Math.min(page.value, totalPages.value)
+  return false
+}
+
+const refreshLogs = (): Promise<boolean> => {
+  if (refreshPromise) {
+    refreshPending = true
+    return refreshPromise
   }
 
-  logAutoRefreshBusy = true
-  try {
+  refreshPromise = (async () => {
+    let foundNewCompleted = false
+    let statsNeedRefresh = false
     do {
-      logRefreshPending = false
-      const refreshWaiters = logRefreshWaiters.splice(0)
-      try {
-        const data = await fetchRequestLogs({
-          platform: filters.platform,
-          provider: filters.provider,
-          limit: 200,
-        })
-        const nextLogs = visibleRequestLogs(data ?? [])
-        reconcileRetryingLogs(nextLogs)
-        const nextSignature = logsSignature(nextLogs)
-        if (nextSignature !== lastLogsSignature) {
-          logs.value = nextLogs
-          lastLogsSignature = nextSignature
-          page.value = Math.min(page.value, totalPages.value)
-          syncProviderOptionsFromLogs(nextLogs)
-          void loadStats()
-        }
-      } catch (error) {
-        console.error('failed to auto refresh request logs', error)
-      } finally {
-        refreshWaiters.forEach((resolve) => resolve())
+      refreshPending = false
+      const snapshotFoundNew = await refreshLogSnapshot()
+      foundNewCompleted = snapshotFoundNew || foundNewCompleted
+      statsNeedRefresh = snapshotFoundNew || statsNeedRefresh
+      if (!refreshPending && statsNeedRefresh) {
+        await loadStats()
+        statsNeedRefresh = false
       }
-    } while (logRefreshPending && !loading.value)
-  } finally {
-    logAutoRefreshBusy = false
-    if (logRefreshPending && !loading.value) {
-      void refreshLogsIfChanged()
-    }
-  }
-  await forceRefreshCompleted
-}
-
-const loadStats = async () => {
-  try {
-    const data = await fetchLogStats(filters.platform)
-    stats.value = data ?? null
-  } catch (error) {
-    console.error('failed to load log stats', error)
-  }
-}
-
-const loadDashboard = async () => {
-  await loadHiddenLogProviders()
-  await Promise.all([loadLogs(), loadStats(), loadProviderOptions()])
-  syncProviderOptionsFromLogs(logs.value)
+    } while (refreshPending && !isUnmounted)
+    return foundNewCompleted
+  })().finally(() => {
+    refreshPromise = null
+  })
+  return refreshPromise
 }
 
 const pagedLogs = computed(() => {
   const start = (page.value - 1) * PAGE_SIZE
-  return logs.value.slice(start, start + PAGE_SIZE)
+  const completedPage = visibleCompletedLogs.value.slice(start, start + PAGE_SIZE)
+  return [...visibleActiveLogs.value, ...completedPage]
 })
 
-const totalPages = computed(() => Math.max(1, Math.ceil(logs.value.length / PAGE_SIZE)))
-
-const applyFilters = async () => {
-  page.value = 1
-  await loadDashboard()
-  resetTimer()
-}
-
-const refreshLogs = () => {
-  void loadDashboard()
-}
+const totalPages = computed(() => Math.max(1, Math.ceil(visibleCompletedLogs.value.length / PAGE_SIZE)))
 
 const manualRefresh = () => {
-  resetTimer()
-  void loadDashboard()
+  void (async () => {
+    await loadHiddenLogProviders()
+    const foundNewCompleted = await refreshLogs()
+    if (!foundNewCompleted) {
+      await loadStats()
+    }
+  })()
 }
 
 const nextPage = () => {
@@ -843,35 +796,27 @@ const canRetryLog = (item: RequestLog) => {
 
 const markRetryingLog = (id: number) => {
   retryingLogIds.value = new Set([...retryingLogIds.value, id])
-  lastLogsSignature = logsSignature(logs.value)
 }
 
 const clearRetryingLog = (id: number) => {
   const next = new Set(retryingLogIds.value)
   next.delete(id)
   retryingLogIds.value = next
-  lastLogsSignature = logsSignature(logs.value)
-}
-
-const clearRetryingLogIfSettled = (id: number) => {
-  const item = logs.value.find((log) => log.id === id)
-  if (!item || !isProcessingLog(item) || hasFirstResponse(item)) {
-    clearRetryingLog(id)
-  }
 }
 
 const markLogFirstTokenSeen = (id: number, firstTokenSec?: number, firstTextSec?: number) => {
   if (!isPositiveDuration(firstTokenSec) && !isPositiveDuration(firstTextSec)) return
 
-  logs.value = logs.value.map((log) => {
+  const updateLog = (log: RequestLog) => {
     if (log.id !== id) return log
     return {
       ...log,
       first_token_duration_sec: isPositiveDuration(firstTokenSec) ? firstTokenSec : log.first_token_duration_sec,
       first_text_sec: isPositiveDuration(firstTextSec) ? firstTextSec : log.first_text_sec,
     }
-  })
-  lastLogsSignature = logsSignature(logs.value)
+  }
+  activeLogs.value = activeLogs.value.map(updateLog)
+  completedLogs.value = completedLogs.value.map(updateLog)
 }
 
 const retryRejectedMessage = (status?: string) => {
@@ -902,11 +847,11 @@ const handleRetryLog = async (item: RequestLog) => {
         markLogFirstTokenSeen(item.id, result.first_token_duration_sec, result.first_text_sec)
       }
       showToast(retryRejectedMessage(result?.status), 'warning')
-      await refreshLogsIfChanged(true)
+      await refreshLogs()
       clearRetryingLog(item.id)
       return
     }
-    await refreshLogsIfChanged(true)
+    await refreshLogs()
   } catch (error) {
     console.error('failed to retry active request', error)
     clearRetryingLog(item.id)
@@ -914,7 +859,7 @@ const handleRetryLog = async (item: RequestLog) => {
       ? error.message
       : t('components.logs.retry.failed')
     showToast(message, 'error')
-    await refreshLogsIfChanged(true)
+    await refreshLogs()
   }
 }
 
@@ -986,25 +931,13 @@ const formatLogTokenNumber = (item: RequestLog, value?: number) => {
   return formatTokenNumber(value)
 }
 
-/**
- * 计算缓存命中率
- * @param cacheRead 缓存读取 token 数
- * @param inputSideTokens 输入侧 token 数
- * @returns 命中率百分比字符串
- * @author sm
- */
 const formatCacheHitRate = (cacheRead?: number, inputSideTokens?: number) => {
   const read = cacheRead ?? 0
   const total = inputSideTokens ?? 0
-
   if (total === 0) return '0%'
-
-  const rate = Math.min(100, (read / total) * 100)
-  return `${rate.toFixed(1)}%`
+  return `${Math.min(100, (read / total) * 100).toFixed(1)}%`
 }
 
-// OpenAI Responses/Chat 的 cached 和 reasoning token 是 input/output 的明细字段，
-// 不应作为额外流量再次加到总量里。
 const totalTokenTraffic = (data?: {
   input_tokens?: number
   output_tokens?: number
@@ -1023,7 +956,6 @@ const inputSideTokenTraffic = (data?: {
 
 const statsCards = computed(() => {
   const data = stats.value
-  const totalTokens = totalTokenTraffic(data)
   const inputSideTokens = inputSideTokenTraffic(data)
   return [
     {
@@ -1036,7 +968,7 @@ const statsCards = computed(() => {
       key: 'tokens',
       label: t('components.logs.summary.tokens'),
       hint: t('components.logs.summary.tokenHint'),
-      value: data ? formatTokenNumber(totalTokens) : '—',
+      value: data ? formatTokenNumber(totalTokenTraffic(data)) : '—',
     },
     {
       key: 'cacheReads',
@@ -1048,37 +980,39 @@ const statsCards = computed(() => {
   ]
 })
 
-const loadProviderOptions = async () => {
-  try {
-    const list = await fetchLogProviders(filters.platform)
-    providerOptions.value = (list ?? [])
-      .map(normalizeProviderName)
-      .filter((provider) => provider && !isHiddenLogProvider(filters.platform, provider))
-    providerOptions.value.sort((a, b) => a.localeCompare(b))
-  } catch (error) {
-    console.error('failed to load provider options', error)
-  }
-}
-
-watch(
-  () => filters.platform,
-  async () => {
-    await loadProviderOptions()
-    if (filters.provider && !providerOptions.value.includes(filters.provider)) {
-      filters.provider = ''
-    }
-  },
-)
-
 onMounted(async () => {
-  await loadDashboard()
-  startCountdown()
-  startLogAutoRefresh()
+  isUnmounted = false
+  isPageActive = true
+  document.addEventListener('visibilitychange', handleVisibilityChange)
+  await loadInitialLogs()
+  if (isUnmounted) return
+  initialLoadDone = true
+  syncPollingState()
+})
+
+onActivated(() => {
+  const wasActive = isPageActive
+  isPageActive = true
+  syncPollingState()
+  if (!wasActive && canPoll()) {
+    void (async () => {
+      await loadHiddenLogProviders()
+      await refreshLogs()
+    })()
+  }
+})
+
+onDeactivated(() => {
+  isPageActive = false
+  syncPollingState()
+  stopLogColumnResize()
 })
 
 onUnmounted(() => {
-  stopCountdown()
-  stopLogAutoRefresh()
+  isUnmounted = true
+  isPageActive = false
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+  syncPollingState()
   stopLogColumnResize()
 })
 </script>
@@ -1107,20 +1041,11 @@ html.dark .queued-token {
   margin-bottom: 0.75rem;
 }
 
-.summary-meta {
-  grid-column: 1 / -1;
-  font-size: 0.85rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: #64748b;
-}
-
 .summary-card {
   border: 1px solid rgba(15, 23, 42, 0.08);
-  border-radius: 16px;
+  border-radius: 8px;
   padding: 1rem 1.25rem;
-  background: radial-gradient(circle at top, rgba(148, 163, 184, 0.1), rgba(15, 23, 42, 0));
-  backdrop-filter: blur(6px);
+  background: rgba(148, 163, 184, 0.06);
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
@@ -1129,7 +1054,7 @@ html.dark .queued-token {
 .summary-card__label {
   font-size: 0.85rem;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
   color: #475569;
 }
 
@@ -1153,7 +1078,7 @@ html.dark .queued-token {
 
 html.dark .summary-card {
   border-color: rgba(255, 255, 255, 0.12);
-  background: radial-gradient(circle at top, rgba(148, 163, 184, 0.2), rgba(15, 23, 42, 0.35));
+  background: rgba(148, 163, 184, 0.1);
 }
 
 html.dark .summary-card__label {
@@ -1180,7 +1105,7 @@ html.dark .summary-card__sub-value {
 
   .summary-card {
     padding: 0.85rem 1rem;
-    border-radius: 14px;
+    border-radius: 8px;
   }
 
   .summary-card__label {
@@ -1198,31 +1123,34 @@ html.dark .summary-card__sub-value {
   }
 }
 
-/* 可点击卡片 */
 .summary-card--clickable {
   cursor: pointer;
   transition: transform 0.15s ease, box-shadow 0.15s ease;
 }
+
 .summary-card--clickable:hover {
   transform: translateY(-2px);
   box-shadow: 0 4px 12px rgba(249, 115, 22, 0.15);
 }
+
 .summary-card--clickable:active {
   transform: translateY(0);
 }
+
 html.dark .summary-card--clickable:hover {
   box-shadow: 0 4px 12px rgba(249, 115, 22, 0.25);
 }
 
-/* Token 弹窗 */
 .token-detail-modal {
   min-height: 80px;
 }
+
 .token-detail-list {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
 }
+
 .token-detail-item {
   display: flex;
   justify-content: space-between;
@@ -1232,22 +1160,28 @@ html.dark .summary-card--clickable:hover {
   border-radius: 8px;
   transition: background 0.15s ease;
 }
+
 .token-detail-item:hover {
   background: rgba(148, 163, 184, 0.12);
 }
+
 html.dark .token-detail-item {
   background: rgba(148, 163, 184, 0.12);
 }
+
 html.dark .token-detail-item:hover {
   background: rgba(148, 163, 184, 0.18);
 }
+
 .token-detail-item__name {
   font-weight: 500;
   color: #1e293b;
 }
+
 html.dark .token-detail-item__name {
   color: #f1f5f9;
 }
+
 .token-detail-item__value {
   font-weight: 600;
   color: #34d399;

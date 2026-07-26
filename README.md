@@ -414,14 +414,35 @@ ssh "$PROD_SSH" "
 "
 ```
 
-到这里自动发布必须停止。发布者需要把本次 `STAMP` 一并发给服务器操作员；下面命令由操作员在生产机上手动执行重启和验证：
+到这里自动发布必须停止。发布者需要把本次 `STAMP` 一并发给服务器操作员。
+
+后端版本首次引入 `request_log` 查询索引和 30 分钟统计汇总时，不能让服务启动过程隐式扫描历史表。新二进制在发现“非空旧表缺少索引”或“统计汇总尚未回填”时会停止启动，并提示运行显式维护命令：
 
 ```bash
-sudo systemctl restart codeswitch.service
+./codeswitch-web migrate-request-log-indexes
+```
+
+该命令会逐个、幂等地创建缺失索引，并重新生成北京时间当天的 48 个 30 分钟统计桶后标记汇总可用。创建索引可能读取完整 `request_log`，当天汇总回填会读取当天记录；两者都可能增加数据库、WAL 或临时文件占用，因此必须安排维护窗口。迁移前应先按“备份和恢复”章节完成冷备份，并检查数据库大小和可用磁盘：
+
+```bash
+du -sh "$HOME/.code-switch/app.db" "$HOME/.code-switch/app.db-wal" 2>/dev/null || true
+df -h "$HOME/.code-switch"
+```
+
+迁移命令采用 fail-closed 校验：它会先打印目标 `app.db` 的绝对路径和字节数，只以 `mode=rw` 打开既有数据库，并要求 `request_log` 已存在且至少有一条记录。目标数据库不存在、不是普通文件、缺少 `request_log` 或表为空时，命令会非零退出，不会创建配置目录、数据库、索引或统计汇总。执行前必须核对打印路径确实是生产数据库。新库或空库会在正常启动时只创建空汇总结构和 trigger，并自动标记可用，不会扫描 `request_log`。
+
+下面命令由服务器操作员手动执行。迁移命令必须由 systemd 配置中的服务用户直接运行，不能加 `sudo`，否则会解析到错误的 HOME/数据库路径：
+
+```bash
+sudo systemctl stop codeswitch.service
+"$HOME/apps/code-switch/codeswitch-web" migrate-request-log-indexes
+sudo systemctl start codeswitch.service
 sudo systemctl status codeswitch.service --no-pager -l
 curl -fsS http://127.0.0.1:8080/healthz
 curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18100/v1/models
 ```
+
+如果迁移失败，保持服务停止，先检查错误和磁盘空间；已经成功创建的索引会保留，当天统计汇总只会在事务完整提交后标记可用，排除问题后可直接重跑同一命令。不要在服务在线时运行迁移。
 
 预期：
 

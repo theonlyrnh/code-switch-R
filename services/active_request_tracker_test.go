@@ -5,8 +5,6 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
-
-	"github.com/daodao97/xgo/xdb"
 )
 
 func TestClientIPFromRequest(t *testing.T) {
@@ -379,8 +377,8 @@ func TestMarkFirstTextSyncsActiveRequest(t *testing.T) {
 	}
 }
 
-func TestListRequestLogsPrependsActiveRequests(t *testing.T) {
-	setupRelayTestEnv(t)
+func TestListActiveRequestLogsForUserReturnsTrackerRows(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 
 	previousTracker := defaultActiveRequestTracker
 	defaultActiveRequestTracker = newActiveRequestTracker()
@@ -388,25 +386,9 @@ func TestListRequestLogsPrependsActiveRequests(t *testing.T) {
 		defaultActiveRequestTracker = previousTracker
 	})
 
-	db, err := xdb.DB("default")
-	if err != nil {
-		t.Fatalf("get db: %v", err)
-	}
-	if _, err := db.Exec(`DELETE FROM request_log`); err != nil {
-		t.Fatalf("clear request_log: %v", err)
-	}
 	key, err := NewCodexRelayKeyService().CreateKeyForUser("user-a", "My named relay key")
 	if err != nil {
 		t.Fatalf("create relay key: %v", err)
-	}
-	if _, err := db.Exec(`
-		INSERT INTO request_log (
-			user_id, platform, model, provider, relay_key_id, http_code,
-			input_tokens, output_tokens, cache_create_tokens, cache_read_tokens,
-			reasoning_tokens, is_stream, duration_sec, first_token_duration_sec, first_text_sec, client_ip
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "user-a", "claude", "claude-sonnet", "completed-provider", key.ID, 200, 10, 20, 0, 0, 0, 1, 2.5, 0, 0.4, "127.0.0.1"); err != nil {
-		t.Fatalf("insert request_log: %v", err)
 	}
 
 	activeID := defaultActiveRequestTracker.Start(&ReqeustLog{
@@ -420,12 +402,12 @@ func TestListRequestLogsPrependsActiveRequests(t *testing.T) {
 	}, time.Now().Add(-time.Second))
 	defer defaultActiveRequestTracker.Finish(activeID)
 
-	logs, err := NewLogService().ListRequestLogsForUser("user-a", "claude", "", 10)
+	logs, err := NewLogService().ListActiveRequestLogsForUser("user-a")
 	if err != nil {
-		t.Fatalf("ListRequestLogsForUser: %v", err)
+		t.Fatalf("ListActiveRequestLogsForUser: %v", err)
 	}
-	if len(logs) < 2 {
-		t.Fatalf("logs count = %d, want at least 2", len(logs))
+	if len(logs) != 1 {
+		t.Fatalf("logs count = %d, want 1", len(logs))
 	}
 	if logs[0].Status != requestLogStatusProcessing || logs[0].Provider != "active-provider" {
 		t.Fatalf("first log = status %q provider %q, want processing active-provider", logs[0].Status, logs[0].Provider)
@@ -435,11 +417,5 @@ func TestListRequestLogsPrependsActiveRequests(t *testing.T) {
 	}
 	if logs[0].RelayKeyName != "My named relay key" {
 		t.Fatalf("active relay key name = %q, want My named relay key", logs[0].RelayKeyName)
-	}
-	if logs[1].Status != requestLogStatusCompleted || logs[1].Provider != "completed-provider" {
-		t.Fatalf("second log = status %q provider %q, want completed completed-provider", logs[1].Status, logs[1].Provider)
-	}
-	if logs[1].ClientIP != "127.0.0.1" || logs[1].FirstTokenDurationSec != 0.4 {
-		t.Fatalf("completed fields = client_ip %q first_token %f, want 127.0.0.1 and 0.4", logs[1].ClientIP, logs[1].FirstTokenDurationSec)
 	}
 }

@@ -128,6 +128,7 @@ const (
 	defaultAccountPoolBlacklistDurationMinutes = 10
 	maxAccountPoolBlacklistThreshold           = 100
 	maxAccountPoolBlacklistDurationMinutes     = 1440
+	maxSpecialBlacklistDurationMinutes         = 144000
 	maxAccountPoolKeyID                        = int64(1<<52 - 1)
 	defaultFirstTextRetryTimeoutSeconds        = 100
 	minFirstTextRetryTimeoutSeconds            = 5
@@ -570,8 +571,8 @@ func normalizeAndValidateSpecialBlacklistRules(pool *ProviderPool) error {
 		if rule.Threshold < 1 || rule.Threshold > 100 {
 			return fmt.Errorf("高级拉黑规则 %s 的次数阈值必须在 1 到 100 之间", rule.Name)
 		}
-		if rule.DurationMinutes < 1 || rule.DurationMinutes > 1440 {
-			return fmt.Errorf("高级拉黑规则 %s 的拉黑时长必须在 1 到 1440 分钟之间", rule.Name)
+		if rule.DurationMinutes < 1 || rule.DurationMinutes > maxSpecialBlacklistDurationMinutes {
+			return fmt.Errorf("高级拉黑规则 %s 的拉黑时长必须在 1 到 %d 分钟之间", rule.Name, maxSpecialBlacklistDurationMinutes)
 		}
 		normalized = append(normalized, rule)
 	}

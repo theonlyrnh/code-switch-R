@@ -356,12 +356,20 @@ type userScopedLogService struct {
 	base *services.LogService
 }
 
-func (s *userScopedLogService) ListRequestLogs(ctx context.Context, platform string, provider string, limit int) ([]services.ReqeustLog, error) {
+func (s *userScopedLogService) ListActiveRequestLogs(ctx context.Context) ([]services.ReqeustLog, error) {
 	user, err := authenticatedUserFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return s.base.ListRequestLogsForUser(user.ID, platform, provider, limit)
+	return s.base.ListActiveRequestLogsForUser(user.ID)
+}
+
+func (s *userScopedLogService) ListCompletedRequestLogs(ctx context.Context, afterID int64, limit int) ([]services.ReqeustLog, error) {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.base.ListCompletedRequestLogsForUser(user.ID, afterID, limit)
 }
 
 func (s *userScopedLogService) RetryActiveRequest(ctx context.Context, id int64) (services.ActiveRequestRetryResult, error) {
@@ -370,14 +378,6 @@ func (s *userScopedLogService) RetryActiveRequest(ctx context.Context, id int64)
 		return services.ActiveRequestRetryResult{}, err
 	}
 	return s.base.RetryActiveRequestForUser(user.ID, id), nil
-}
-
-func (s *userScopedLogService) ListProviders(ctx context.Context, platform string) ([]string, error) {
-	user, err := authenticatedUserFromContext(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return s.base.ListProvidersForUser(user.ID, platform)
 }
 
 func (s *userScopedLogService) StatsSince(ctx context.Context, platform string) (services.LogStats, error) {
@@ -829,14 +829,14 @@ func (s *userScopedConsoleService) listLogs(userID string, limit int) ([]service
 	since := s.clearTimeForUser(userID)
 	logs := make([]services.ConsoleLog, 0, limit)
 	if s.logService != nil {
-		finalLogs, err := s.logService.ListHTTPErrorConsoleLogsForUser(userID, 1000, since)
+		finalLogs, err := s.logService.ListHTTPErrorConsoleLogsForUser(userID, limit, since)
 		if err != nil {
 			return nil, err
 		}
 		logs = append(logs, finalLogs...)
 	}
 	if s.poolAttemptLogs != nil {
-		logs = append(logs, s.poolAttemptLogs.List(userID, 1000, since)...)
+		logs = append(logs, s.poolAttemptLogs.List(userID, limit, since)...)
 	}
 	sort.SliceStable(logs, func(i, j int) bool { return logs[i].Timestamp.Before(logs[j].Timestamp) })
 	if len(logs) > limit {

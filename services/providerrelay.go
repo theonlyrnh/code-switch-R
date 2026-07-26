@@ -3905,6 +3905,96 @@ func ensureRequestLogTableWithDB(db *sql.DB) error {
 	return nil
 }
 
+type requestLogIndexDefinition struct {
+	name      string
+	createSQL string
+}
+
+var requestLogIndexDefinitions = []requestLogIndexDefinition{
+	{
+		name:      "idx_request_log_created_at",
+		createSQL: "CREATE INDEX IF NOT EXISTS idx_request_log_created_at ON request_log(created_at)",
+	},
+	{
+		name:      "idx_request_log_user_platform_created_at",
+		createSQL: "CREATE INDEX IF NOT EXISTS idx_request_log_user_platform_created_at ON request_log(user_id, platform, created_at)",
+	},
+	{
+		name:      "idx_request_log_user_created_at",
+		createSQL: "CREATE INDEX IF NOT EXISTS idx_request_log_user_created_at ON request_log(user_id, created_at)",
+	},
+	{
+		name:      "idx_request_log_user_id",
+		createSQL: "CREATE INDEX IF NOT EXISTS idx_request_log_user_id ON request_log(user_id, id DESC)",
+	},
+	{
+		name:      "idx_request_log_user_error_id",
+		createSQL: "CREATE INDEX IF NOT EXISTS idx_request_log_user_error_id ON request_log(user_id, id DESC) WHERE http_code >= 400",
+	},
+}
+
+func missingRequestLogIndexes(db *sql.DB) ([]string, error) {
+	rows, err := db.Query(`SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'request_log'`)
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[string]struct{}, len(requestLogIndexDefinitions))
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		existing[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	missing := make([]string, 0, len(requestLogIndexDefinitions))
+	for _, index := range requestLogIndexDefinitions {
+		if _, ok := existing[index.name]; !ok {
+			missing = append(missing, index.name)
+		}
+	}
+	return missing, nil
+}
+
+func createMissingRequestLogIndexes(db *sql.DB, beforeCreate func(string), afterCreate func(string)) error {
+	missing, err := missingRequestLogIndexes(db)
+	if err != nil {
+		return fmt.Errorf("list request_log indexes: %w", err)
+	}
+	missingSet := make(map[string]struct{}, len(missing))
+	for _, name := range missing {
+		missingSet[name] = struct{}{}
+	}
+
+	for _, index := range requestLogIndexDefinitions {
+		if _, ok := missingSet[index.name]; !ok {
+			continue
+		}
+		if beforeCreate != nil {
+			beforeCreate(index.name)
+		}
+		if _, err := db.Exec(index.createSQL); err != nil {
+			return fmt.Errorf("create request_log index %s: %w", index.name, err)
+		}
+		if afterCreate != nil {
+			afterCreate(index.name)
+		}
+	}
+	return nil
+}
+
+func ensureRequestLogIndexes(db *sql.DB) error {
+	return createMissingRequestLogIndexes(db, nil, nil)
+}
+
 func ReqeustLogHook(c *gin.Context, kind string, usage *ReqeustLog) func(data []byte) (bool, []byte) { // SSE 钩子：累计字节和解析 token 用量
 	return func(data []byte) (bool, []byte) {
 		payload := strings.TrimSpace(string(data))

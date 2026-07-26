@@ -821,7 +821,16 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref, onMounted, onUnmounted, watch } from 'vue'
+import {
+  computed,
+  reactive,
+  ref,
+  onMounted,
+  onUnmounted,
+  onActivated,
+  onDeactivated,
+  watch,
+} from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Listbox, ListboxButton, ListboxOptions, ListboxOption } from '@headlessui/vue'
 import { Browser, Call, Events } from '@wailsio/runtime'
@@ -1065,7 +1074,18 @@ const providerStatsLoaded = reactive<Record<ProviderTab, boolean>>({
   'openai-chat': false,
   others: false,
 })
+const providerStatsRequests: Partial<Record<ProviderTab, Promise<void>>> = {}
+const providerStatsRequestVersions: Record<ProviderTab, number> = {
+  claude: 0,
+  'openai-responses': 0,
+  'openai-chat': 0,
+  others: 0,
+}
 let providerStatsTimer: number | undefined
+let mainPageActive = false
+let mainPageInitialized = false
+let mainPageDisposed = false
+let mainPageListenersRegistered = false
 const showHomeTitle = ref(true)
 const appVersion = ref('')
 
@@ -1460,30 +1480,51 @@ const onProxyToggle = async () => {
   }
 }
 
-const loadProviderStats = async (tab: ProviderTab) => {
+const loadProviderStats = (tab: ProviderTab): Promise<void> => {
+  if (mainPageDisposed) return Promise.resolve()
+
   // 'others' Tab 暂不加载统计数据（自定义 CLI 工具统计需要后续实现）
   if (tab === 'others') {
     providerStatsLoaded[tab] = true
-    return
+    return Promise.resolve()
   }
 
+  const pendingRequest = providerStatsRequests[tab]
+  if (pendingRequest) return pendingRequest
+
+  const requestVersion = ++providerStatsRequestVersions[tab]
   providerStatsLoading[tab] = true
-  try {
-    const stats = await fetchProviderDailyStats(tab as 'claude' | 'openai-responses' | 'openai-chat')
-    const mapped: Record<string, ProviderDailyStat> = {}
-    ;(stats ?? []).forEach((stat) => {
-      mapped[normalizeProviderKey(stat.provider)] = stat
-    })
-    providerStatsMap[tab] = mapped
-    providerStatsLoaded[tab] = true
-  } catch (error) {
-    console.error(`Failed to load provider stats for ${tab}`, error)
-    if (!providerStatsLoaded[tab]) {
+  const request = Promise.resolve()
+    .then(() => fetchProviderDailyStats(tab as 'claude' | 'openai-responses' | 'openai-chat'))
+    .then((stats) => {
+      if (mainPageDisposed || providerStatsRequestVersions[tab] !== requestVersion) return
+
+      const mapped: Record<string, ProviderDailyStat> = {}
+      ;(stats ?? []).forEach((stat) => {
+        mapped[normalizeProviderKey(stat.provider)] = stat
+      })
+      providerStatsMap[tab] = mapped
       providerStatsLoaded[tab] = true
-    }
-  } finally {
-    providerStatsLoading[tab] = false
-  }
+    })
+    .catch((error) => {
+      if (mainPageDisposed || providerStatsRequestVersions[tab] !== requestVersion) return
+
+      console.error(`Failed to load provider stats for ${tab}`, error)
+      if (!providerStatsLoaded[tab]) {
+        providerStatsLoaded[tab] = true
+      }
+    })
+    .finally(() => {
+      if (providerStatsRequests[tab] !== request) return
+
+      delete providerStatsRequests[tab]
+      if (!mainPageDisposed && providerStatsRequestVersions[tab] === requestVersion) {
+        providerStatsLoading[tab] = false
+      }
+    })
+
+  providerStatsRequests[tab] = request
+  return request
 }
 
 // 加载旧可用性测试结果（已废弃，保留兼容）
@@ -1593,12 +1634,13 @@ const loadRelayKeys = async () => {
 const refreshAllData = async () => {
   if (refreshing.value) return
   refreshing.value = true
+  const statsTab = activeTab.value
   try {
     await Promise.all([
       loadProvidersFromDisk(),
       ...providerTabIds.map(refreshProxyState),
       ...providerTabIds.map((tab) => refreshDirectAppliedStatus(tab)),
-      ...providerTabIds.map((tab) => loadProviderStats(tab)),
+      loadProviderStats(statsTab),
       loadAvailabilityResults(), // 同步刷新可用性监控状态（改用新服务）
       loadRelayKeys(),
     ])
@@ -1691,20 +1733,50 @@ const formatOfficialSite = (site: string) => {
   }
 }
 
+const providerStatsPollingEnabled = () =>
+  !mainPageDisposed
+  && mainPageActive
+  && mainPageInitialized
+  && document.visibilityState === 'visible'
+
+const refreshActiveProviderPollingData = () => {
+  if (!providerStatsPollingEnabled()) return
+
+  void loadProviderStats(activeTab.value)
+  void loadAvailabilityResults() // 同步刷新可用性监控状态（改用新服务）
+}
+
 const startProviderStatsTimer = () => {
-  stopProviderStatsTimer()
+  if (!providerStatsPollingEnabled() || providerStatsTimer !== undefined) return
+
   providerStatsTimer = window.setInterval(() => {
-    providerTabIds.forEach((tab) => {
-      void loadProviderStats(tab)
-    })
-    void loadAvailabilityResults() // 同步刷新可用性监控状态（改用新服务）
+    if (!providerStatsPollingEnabled()) {
+      stopProviderStatsTimer()
+      return
+    }
+    refreshActiveProviderPollingData()
   }, 60_000)
 }
 
 const stopProviderStatsTimer = () => {
-  if (providerStatsTimer) {
-    clearInterval(providerStatsTimer)
+  if (providerStatsTimer !== undefined) {
+    window.clearInterval(providerStatsTimer)
     providerStatsTimer = undefined
+  }
+}
+
+const syncProviderStatsTimer = () => {
+  if (providerStatsPollingEnabled()) {
+    startProviderStatsTimer()
+  } else {
+    stopProviderStatsTimer()
+  }
+}
+
+const handleDocumentVisibilityChange = () => {
+  syncProviderStatsTimer()
+  if (document.visibilityState === 'visible') {
+    refreshActiveProviderPollingData()
   }
 }
 
@@ -1774,9 +1846,18 @@ const switchToTabAndHighlight = (platform: string, providerName: string) => {
 // 处理供应商切换事件
 // @author sm
 const handleProviderSwitched = (event: { data: { platform: string; toProvider: string } }) => {
+  if (mainPageDisposed) return
+
   const { platform, toProvider } = event.data
   console.log('[Event] provider:switched', platform, toProvider)
   switchToTabAndHighlight(platform, toProvider)
+  if (
+    providerTabIds.includes(platform as ProviderTab)
+    && mainPageActive
+    && document.visibilityState === 'visible'
+  ) {
+    void loadProviderStats(platform as ProviderTab)
+  }
 }
 
 // 判断供应商是否是最后使用的
@@ -1797,55 +1878,128 @@ const scrollToCard = (el: HTMLElement | null) => {
 // 事件取消订阅函数
 let unsubscribeSwitched: (() => void) | undefined
 
-onMounted(async () => {
+const handleProvidersUpdated = () => {
+  if (mainPageDisposed) return
+  void loadProvidersFromDisk()
+}
+
+const registerMainPageListeners = () => {
+  if (mainPageDisposed || mainPageListenersRegistered) return
+
+  mainPageListenersRegistered = true
+  window.addEventListener('app-settings-updated', handleAppSettingsUpdated)
+  window.addEventListener('providers-updated', handleProvidersUpdated)
+  window.addEventListener(RELAY_KEYS_UPDATED_EVENT, loadRelayKeys)
+  document.addEventListener('visibilitychange', handleDocumentVisibilityChange)
+
+  try {
+    const unsubscribe = Events.On(
+      'provider:switched',
+      handleProviderSwitched as Parameters<typeof Events.On>[1],
+    )
+    if (mainPageDisposed || !mainPageListenersRegistered) {
+      unsubscribe()
+    } else {
+      unsubscribeSwitched = unsubscribe
+    }
+  } catch (error) {
+    console.error('Failed to subscribe to provider switch events', error)
+  }
+}
+
+const unregisterMainPageListeners = () => {
+  mainPageListenersRegistered = false
+  window.removeEventListener('app-settings-updated', handleAppSettingsUpdated)
+  window.removeEventListener('providers-updated', handleProvidersUpdated)
+  window.removeEventListener(RELAY_KEYS_UPDATED_EVENT, loadRelayKeys)
+  document.removeEventListener('visibilitychange', handleDocumentVisibilityChange)
+
+  const unsubscribe = unsubscribeSwitched
+  unsubscribeSwitched = undefined
+  try {
+    unsubscribe?.()
+  } catch (error) {
+    console.error('Failed to unsubscribe from provider switch events', error)
+  }
+}
+
+const initializeMainPage = async () => {
   await loadProvidersFromDisk()
+  if (mainPageDisposed) return
+
   await Promise.all(providerTabIds.map(refreshProxyState))
+  if (mainPageDisposed) return
+
   await Promise.all(providerTabIds.map((tab) => refreshDirectAppliedStatus(tab)))
-  await Promise.all(providerTabIds.map((tab) => loadProviderStats(tab)))
+  if (mainPageDisposed) return
+
+  await loadProviderStats(activeTab.value)
+  if (mainPageDisposed) return
+
   await loadRelayKeys()
+  if (mainPageDisposed) return
+
   await loadAppSettings()
+  if (mainPageDisposed) return
+
   await loadAppVersion()
-  startProviderStatsTimer()
+  if (mainPageDisposed) return
 
   // 加载初始可用性监控结果（改用新服务）
   await loadAvailabilityResults()
-
-  window.addEventListener('app-settings-updated', handleAppSettingsUpdated)
-
-  // 监听可用性页面的 Provider 更新事件
-  const handleProvidersUpdated = () => {
-    void loadProvidersFromDisk()
-  }
-  window.addEventListener('providers-updated', handleProvidersUpdated)
-  ;(window as any).__handleProvidersUpdated = handleProvidersUpdated
-
-  window.addEventListener(RELAY_KEYS_UPDATED_EVENT, loadRelayKeys)
+  if (mainPageDisposed) return
 
   // 加载最后使用的供应商
   await loadLastUsedProviders()
+  if (mainPageDisposed) return
 
-  // 监听供应商切换事件
-  unsubscribeSwitched = Events.On('provider:switched', handleProviderSwitched as Parameters<typeof Events.On>[1])
+  mainPageInitialized = true
+  syncProviderStatsTimer()
+}
+
+onMounted(() => {
+  mainPageActive = true
+  registerMainPageListeners()
+  void initializeMainPage().catch((error) => {
+    if (mainPageDisposed) return
+    console.error('Failed to initialize main page', error)
+    mainPageInitialized = true
+    syncProviderStatsTimer()
+  })
+})
+
+onActivated(() => {
+  if (mainPageDisposed) return
+
+  const wasActive = mainPageActive
+  mainPageActive = true
+  syncProviderStatsTimer()
+  if (!wasActive) {
+    refreshActiveProviderPollingData()
+  }
+})
+
+onDeactivated(() => {
+  mainPageActive = false
+  stopProviderStatsTimer()
 })
 
 onUnmounted(() => {
+  mainPageDisposed = true
+  mainPageActive = false
+  mainPageInitialized = false
   stopProviderStatsTimer()
-  window.removeEventListener('app-settings-updated', handleAppSettingsUpdated)
+  unregisterMainPageListeners()
 
-  if ((window as any).__handleProvidersUpdated) {
-    window.removeEventListener('providers-updated', (window as any).__handleProvidersUpdated)
-  }
+  providerTabIds.forEach((tab) => {
+    providerStatsRequestVersions[tab] += 1
+    delete providerStatsRequests[tab]
+  })
 
   // 清理高亮计时器
   if (highlightTimer) {
-    clearTimeout(highlightTimer)
-  }
-
-  window.removeEventListener(RELAY_KEYS_UPDATED_EVENT, loadRelayKeys)
-
-  // 取消事件订阅
-  if (unsubscribeSwitched) {
-    unsubscribeSwitched()
+    window.clearTimeout(highlightTimer)
+    highlightTimer = undefined
   }
 })
 
