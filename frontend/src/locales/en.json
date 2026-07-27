@@ -3,22 +3,6 @@
     "title": "My App",
     "login": "Login"
   },
-  "settings": {
-    "network": {
-      "title": "Network Settings",
-      "listenMode": "Listen Mode",
-      "modes": {
-        "localhost": "Localhost Only (127.0.0.1)",
-        "lan": "LAN (0.0.0.0)",
-        "custom": "Custom Address"
-      },
-      "customAddress": "Custom Address",
-      "currentAddress": "Current Listen Address",
-      "lanWarningTitle": "Security Warning",
-      "lanWarningText": "LAN mode exposes your API keys to the local network. Only use this in trusted environments.",
-      "saveFailed": "Failed to save network settings"
-    }
-  },
   "menus": {
     "about": "About",
     "general": "General settings",
@@ -275,10 +259,10 @@
           },
           "settings": {
             "title": "Settings and Security",
-            "body": "Settings cover appearance, startup, notifications, network listening, admin security, and availability monitoring.",
+            "body": "Settings cover appearance, startup, notifications, admin security, and availability monitoring.",
             "items": [
-              "Network listening controls whether the admin UI and relay are exposed only locally, on the LAN, or on a custom address.",
-              "Security settings manage admin sign-in and sessions; use strong credentials and be careful with LAN exposure for public deployments.",
+              "The admin UI and relay listen on localhost by default; use Caddy or Nginx as an HTTPS reverse proxy for public deployments.",
+              "Security settings manage admin sign-in and sessions; use strong credentials for public deployments.",
               "Availability monitoring can check providers periodically, and auto-blacklist reduces the impact of unavailable upstreams."
             ]
           }

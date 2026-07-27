@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
 	"time"
 )
 
 const (
-	defaultAdminAddr = "0.0.0.0:8080"
+	defaultAdminAddr = "127.0.0.1:8080"
 	defaultStaticDir = "frontend/dist"
 	defaultRelayAddr = services.DefaultRelayBindAddr
 )
@@ -51,7 +50,6 @@ type appRuntime struct {
 	versionService     *VersionService
 	consoleService     *services.ConsoleService
 	poolAttemptLogs    *services.PoolAttemptLogService
-	networkService     *services.NetworkService
 	providerRelay      *services.ProviderRelayService
 	poolService        *services.ProviderPoolService
 	proxyService       *services.ProxyService
@@ -80,17 +78,10 @@ func newAppRuntime() (*appRuntime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("初始化共享代理配置失败: %w", err)
 	}
-	bootstrapNetworkService := services.NewNetworkService(defaultRelayAddr, nil, nil, codexRelayKeys)
-	relayAddr := defaultRelayAddr
-	if networkSettings, err := bootstrapNetworkService.GetNetworkSettings(); err != nil {
-		log.Printf("读取网络监听设置失败（使用默认 relay 地址）: %v", err)
-	} else if addr := strings.TrimSpace(networkSettings.CurrentAddress); addr != "" {
-		relayAddr = addr
-	}
 	eventHub := services.NewEventHub()
 	notificationService := services.NewNotificationService(appSettings)
 	notificationService.SetEventEmitter(eventHub)
-	providerRelay := services.NewProviderRelayService(providerService, poolService, codexRelayKeys, notificationService, appSettings, relayAddr)
+	providerRelay := services.NewProviderRelayService(providerService, poolService, codexRelayKeys, notificationService, appSettings, defaultRelayAddr)
 	poolAttemptLogs := services.NewPoolAttemptLogService()
 	providerRelay.SetPoolAttemptLogService(poolAttemptLogs)
 	providerRelay.SetProxyManager(proxyService.Manager())
@@ -117,7 +108,6 @@ func newAppRuntime() (*appRuntime, error) {
 	}
 	versionService := NewVersionService()
 	consoleService := services.NewConsoleService()
-	networkService := services.NewNetworkService(providerRelay.Addr(), claudeSettings, codexSettings, codexRelayKeys)
 
 	if err := providerRelay.Start(); err != nil {
 		return nil, fmt.Errorf("启动代理服务失败: %w", err)
@@ -178,7 +168,6 @@ func newAppRuntime() (*appRuntime, error) {
 		versionService:     versionService,
 		consoleService:     consoleService,
 		poolAttemptLogs:    poolAttemptLogs,
-		networkService:     networkService,
 		providerRelay:      providerRelay,
 		poolService:        poolService,
 		proxyService:       proxyService,
@@ -228,7 +217,6 @@ func (rt *appRuntime) registerServices(registry *rpcRegistry) {
 	registry.Register("codeswitch/services.HealthCheckService", &userScopedHealthCheckService{base: rt.healthCheckService})
 	registry.Register("codeswitch/services.ModelMonitorService", &userScopedModelMonitorService{base: rt.modelMonitor})
 	registry.Register("codeswitch/services.ConsoleService", &userScopedConsoleService{logService: rt.logService, poolAttemptLogs: rt.poolAttemptLogs})
-	registry.Register("codeswitch/services.NetworkService", rt.networkService)
 	registry.Register("codeswitch/services.ProviderRelayService", &userScopedProviderRelayService{base: rt.providerRelay, poolService: rt.poolService})
 	registry.Register("codeswitch/services.ProviderPoolService", &userScopedProviderPoolService{base: rt.poolService, proxyService: rt.proxyService})
 	registry.Register("codeswitch/services.ProxyService", &userScopedProxyService{base: rt.proxyService, poolService: rt.poolService, userStore: rt.adminAuth.UserStore()})

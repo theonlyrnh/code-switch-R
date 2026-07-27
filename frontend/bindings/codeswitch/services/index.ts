@@ -12,7 +12,6 @@ import * as EnvCheckService from "./envcheckservice.js";
 import * as HealthCheckService from "./healthcheckservice.js";
 import * as LogService from "./logservice.js";
 import * as MCPService from "./mcpservice.js";
-import * as NetworkService from "./networkservice.js";
 import * as PromptService from "./promptservice.js";
 import * as ProviderService from "./providerservice.js";
 import * as SettingsService from "./settingsservice.js";
@@ -31,7 +30,6 @@ export {
     HealthCheckService,
     LogService,
     MCPService,
-    NetworkService,
     PromptService,
     ProviderService,
     SettingsService,
@@ -58,12 +56,10 @@ export {
     HealthCheckHistory,
     HealthCheckResult,
     Hotkey,
-    ListenMode,
     LogStats,
     LogStatsSeries,
     MCPServer,
     ManualTestResult,
-    NetworkSettings,
     Prompt,
     Provider,
     ProviderDailyStat,

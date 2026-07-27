@@ -83,10 +83,7 @@ export namespace Call {
 export namespace Browser {
   export function OpenURL(url: string): CancellablePromise<void> {
     try {
-      const opened = window.open(url, '_blank', 'noopener,noreferrer')
-      if (!opened) {
-        window.location.href = url
-      }
+      window.open(url, '_blank', 'noopener,noreferrer')
       return Promise.resolve()
     } catch (error) {
       return Promise.reject(error)

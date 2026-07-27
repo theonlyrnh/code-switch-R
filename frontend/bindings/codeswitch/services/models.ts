@@ -819,20 +819,6 @@ export class Hotkey {
     }
 }
 
-/**
- * ListenMode 监听模式
- */
-export enum ListenMode {
-    /**
-     * The Go zero value for the underlying type of the enum.
-     */
-    $zero = "",
-
-    ListenModeLocalhost = "localhost",
-    ListenModeLAN = "lan",
-    ListenModeCustom = "custom",
-};
-
 export class LogStats {
     "total_requests": number;
     "input_tokens": number;
@@ -1025,32 +1011,6 @@ export class ManualTestResult {
     static createFrom($$source: any = {}): ManualTestResult {
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         return new ManualTestResult($$parsedSource as Partial<ManualTestResult>);
-    }
-}
-
-/**
- * NetworkSettings 网络设置
- */
-export class NetworkSettings {
-    "listenMode": ListenMode;
-    "customAddress"?: string;
-    "currentAddress"?: string;
-
-    /** Creates a new NetworkSettings instance. */
-    constructor($$source: Partial<NetworkSettings> = {}) {
-        if (!("listenMode" in $$source)) {
-            this["listenMode"] = ListenMode.$zero;
-        }
-
-        Object.assign(this, $$source);
-    }
-
-    /**
-     * Creates a new NetworkSettings instance from a string or object.
-     */
-    static createFrom($$source: any = {}): NetworkSettings {
-        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
-        return new NetworkSettings($$parsedSource as Partial<NetworkSettings>);
     }
 }
 

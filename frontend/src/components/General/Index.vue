@@ -5,7 +5,6 @@ import { Call } from '@wailsio/runtime'
 import ListItem from '../Setting/ListRow.vue'
 import LanguageSwitcher from '../Setting/LanguageSwitcher.vue'
 import ThemeSetting from '../Setting/ThemeSetting.vue'
-import NetworkSettings from '../Setting/NetworkSettings.vue'
 import SecuritySettings from '../Setting/SecuritySettings.vue'
 import { fetchAppSettings, saveAppSettings, type AppSettings } from '../../services/appSettings'
 import { logoutAdmin } from '../../services/adminAuth'
@@ -228,8 +227,6 @@ onMounted(async () => {
           </ListItem>
         </div>
       </section>
-
-      <NetworkSettings />
 
       <SecuritySettings />
 
