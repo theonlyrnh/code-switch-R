@@ -341,47 +341,6 @@ export class ClaudeProxyStatus {
 }
 
 /**
- * ConfigFile 配置文件信息
- */
-export class ConfigFile {
-    "id": string;
-    "label": string;
-    "path": string;
-
-    /**
-     * json | toml | env
-     */
-    "format": string;
-    "isPrimary"?: boolean;
-
-    /** Creates a new ConfigFile instance. */
-    constructor($$source: Partial<ConfigFile> = {}) {
-        if (!("id" in $$source)) {
-            this["id"] = "";
-        }
-        if (!("label" in $$source)) {
-            this["label"] = "";
-        }
-        if (!("path" in $$source)) {
-            this["path"] = "";
-        }
-        if (!("format" in $$source)) {
-            this["format"] = "";
-        }
-
-        Object.assign(this, $$source);
-    }
-
-    /**
-     * Creates a new ConfigFile instance from a string or object.
-     */
-    static createFrom($$source: any = {}): ConfigFile {
-        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
-        return new ConfigFile($$parsedSource as Partial<ConfigFile>);
-    }
-}
-
-/**
  * ConnectivityResult 连通性测试结果
  */
 export class ConnectivityResult {
@@ -464,75 +423,6 @@ export class ConsoleLog {
     static createFrom($$source: any = {}): ConsoleLog {
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         return new ConsoleLog($$parsedSource as Partial<ConsoleLog>);
-    }
-}
-
-/**
- * CustomCliProxyStatus 代理状态
- */
-export class CustomCliProxyStatus {
-    "enabled": boolean;
-    "baseUrl": string;
-
-    /** Creates a new CustomCliProxyStatus instance. */
-    constructor($$source: Partial<CustomCliProxyStatus> = {}) {
-        if (!("enabled" in $$source)) {
-            this["enabled"] = false;
-        }
-        if (!("baseUrl" in $$source)) {
-            this["baseUrl"] = "";
-        }
-
-        Object.assign(this, $$source);
-    }
-
-    /**
-     * Creates a new CustomCliProxyStatus instance from a string or object.
-     */
-    static createFrom($$source: any = {}): CustomCliProxyStatus {
-        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
-        return new CustomCliProxyStatus($$parsedSource as Partial<CustomCliProxyStatus>);
-    }
-}
-
-/**
- * CustomCliTool 自定义 CLI 工具配置
- */
-export class CustomCliTool {
-    "id": string;
-    "name": string;
-    "configFiles": ConfigFile[];
-    "proxyInjection"?: ProxyInjection[];
-
-    /** Creates a new CustomCliTool instance. */
-    constructor($$source: Partial<CustomCliTool> = {}) {
-        if (!("id" in $$source)) {
-            this["id"] = "";
-        }
-        if (!("name" in $$source)) {
-            this["name"] = "";
-        }
-        if (!("configFiles" in $$source)) {
-            this["configFiles"] = [];
-        }
-
-        Object.assign(this, $$source);
-    }
-
-    /**
-     * Creates a new CustomCliTool instance from a string or object.
-     */
-    static createFrom($$source: any = {}): CustomCliTool {
-        const $$createField2_0 = $$createType8;
-        const $$createField3_0 = $$createType10;
-        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
-        if ("configFiles" in $$parsedSource) {
-            $$parsedSource["configFiles"] = $$createField2_0($$parsedSource["configFiles"]);
-        }
-        if ("proxyInjection" in $$parsedSource) {
-            $$parsedSource["proxyInjection"] = $$createField3_0($$parsedSource["proxyInjection"]);
-        }
-        return new CustomCliTool($$parsedSource as Partial<CustomCliTool>);
     }
 }
 
@@ -1488,35 +1378,6 @@ export class ProviderTimeline {
     }
 }
 
-/**
- * ProxyInjection 代理注入配置
- */
-export class ProxyInjection {
-    "targetFileId": string;
-    "baseUrlField": string;
-    "authTokenField"?: string;
-
-    /** Creates a new ProxyInjection instance. */
-    constructor($$source: Partial<ProxyInjection> = {}) {
-        if (!("targetFileId" in $$source)) {
-            this["targetFileId"] = "";
-        }
-        if (!("baseUrlField" in $$source)) {
-            this["baseUrlField"] = "";
-        }
-
-        Object.assign(this, $$source);
-    }
-
-    /**
-     * Creates a new ProxyInjection instance from a string or object.
-     */
-    static createFrom($$source: any = {}): ProxyInjection {
-        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
-        return new ProxyInjection($$parsedSource as Partial<ProxyInjection>);
-    }
-}
-
 export class ReqeustLog {
     "id": number;
 
@@ -1806,10 +1667,6 @@ const $$createType2 = CLIConfigFile.createFrom;
 const $$createType3 = $Create.Array($$createType2);
 const $$createType4 = $Create.Map($Create.Any, $Create.Any);
 const $$createType5 = $Create.Map($Create.Any, $Create.Any);
-const $$createType7 = ConfigFile.createFrom;
-const $$createType8 = $Create.Array($$createType7);
-const $$createType9 = ProxyInjection.createFrom;
-const $$createType10 = $Create.Array($$createType9);
 const $$createType11 = HealthCheckResult.createFrom;
 const $$createType12 = $Create.Array($$createType11);
 const $$createType13 = $Create.Nullable($$createType11);

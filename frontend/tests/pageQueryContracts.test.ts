@@ -65,3 +65,27 @@ test('Logs keeps a raw 105-row completed window before display filtering', async
   assert.match(source, /const visibleCompletedLogs = computed\(\(\) => visibleRequestLogs\(completedLogs\.value\)\)/)
   assert.match(source, /visibleCompletedLogs\.value\.slice\(start, start \+ PAGE_SIZE\)/)
 })
+
+test('Claude provider creation defaults the test model to Claude Opus 4.8', async () => {
+  const source = await readSource('../src/components/Main/Index.vue')
+
+  assert.match(
+    source,
+    /const getDefaultTestModel = \(platform: ProviderTab\) =>\s*platform === 'claude' \? 'claude-opus-4-8' : 'gpt-5\.5'/,
+  )
+
+  const createStart = source.indexOf('const openCreateModal = () =>')
+  const createEnd = source.indexOf('\nconst openEditModal =', createStart)
+  const createHandler = source.slice(createStart, createEnd)
+  assert.match(createHandler, /providerTestModel\.value = getDefaultTestModel\(activeTab\.value\)/)
+})
+
+test('Main only exposes the three supported provider platforms', async () => {
+  const source = await readSource('../src/components/Main/Index.vue')
+
+  assert.match(source, /\{ id: 'claude', label: 'Claude Code' \}/)
+  assert.match(source, /\{ id: 'openai-responses', label: 'OpenAI Responses' \}/)
+  assert.match(source, /\{ id: 'openai-chat', label: 'OpenAI Chat' \}/)
+  assert.doesNotMatch(source, /\{ id: 'others'/)
+  assert.doesNotMatch(source, /CustomCliConfigEditor|customCliService|components\.main\.customCli/)
+})

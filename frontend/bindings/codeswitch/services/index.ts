@@ -7,7 +7,6 @@ import * as CliConfigService from "./cliconfigservice.js";
 import * as CodexSettingsService from "./codexsettingsservice.js";
 import * as ConnectivityTestService from "./connectivitytestservice.js";
 import * as ConsoleService from "./consoleservice.js";
-import * as CustomCliService from "./customcliservice.js";
 import * as DeepLinkService from "./deeplinkservice.js";
 import * as EnvCheckService from "./envcheckservice.js";
 import * as HealthCheckService from "./healthcheckservice.js";
@@ -27,7 +26,6 @@ export {
     CodexSettingsService,
     ConnectivityTestService,
     ConsoleService,
-    CustomCliService,
     DeepLinkService,
     EnvCheckService,
     HealthCheckService,
@@ -52,11 +50,8 @@ export {
     CLIPlatform,
     CLITemplate,
     ClaudeProxyStatus,
-    ConfigFile,
     ConnectivityResult,
     ConsoleLog,
-    CustomCliProxyStatus,
-    CustomCliTool,
     DeepLinkImportRequest,
     EndpointLatency,
     EnvConflict,
@@ -73,7 +68,6 @@ export {
     Provider,
     ProviderDailyStat,
     ProviderTimeline,
-    ProxyInjection,
     ReqeustLog,
     RetryConfig,
     Skill

@@ -993,7 +993,7 @@ const emit = defineEmits<{
 
 const subTab = ref<'providers' | 'pools'>('providers')
 const pools = ref<ProviderPool[]>([])
-const collapsedAccountPoolKeys = ref<Set<string>>(new Set())
+const expandedAccountPoolKeys = ref<Set<string>>(new Set())
 const clearingAllBlacklistsPoolIDs = ref<Set<string>>(new Set())
 let poolLoadGeneration = 0
 let unsubscribeBlacklistChanged: (() => void) | undefined
@@ -2152,16 +2152,16 @@ const getAvailableAccountKeys = (pool: ProviderPool): AccountPoolKey[] =>
 const getBlacklistedAccountKeys = (pool: ProviderPool): AccountPoolKey[] =>
   (pool.accountPoolConfig?.keys ?? []).filter((key) => getBlacklistPenalty(pool, key.id))
 
-const isAccountKeysCollapsed = (poolID: string): boolean => collapsedAccountPoolKeys.value.has(poolID)
+const isAccountKeysCollapsed = (poolID: string): boolean => !expandedAccountPoolKeys.value.has(poolID)
 
 const toggleAccountKeysCollapsed = (poolID: string) => {
-  const next = new Set(collapsedAccountPoolKeys.value)
+  const next = new Set(expandedAccountPoolKeys.value)
   if (next.has(poolID)) {
     next.delete(poolID)
   } else {
     next.add(poolID)
   }
-  collapsedAccountPoolKeys.value = next
+  expandedAccountPoolKeys.value = next
 }
 
 // 根据 provider ID 获取 provider 名称

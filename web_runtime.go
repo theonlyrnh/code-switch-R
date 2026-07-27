@@ -51,7 +51,6 @@ type appRuntime struct {
 	versionService     *VersionService
 	consoleService     *services.ConsoleService
 	poolAttemptLogs    *services.PoolAttemptLogService
-	customCliService   *services.CustomCliService
 	networkService     *services.NetworkService
 	providerRelay      *services.ProviderRelayService
 	poolService        *services.ProviderPoolService
@@ -118,7 +117,6 @@ func newAppRuntime() (*appRuntime, error) {
 	}
 	versionService := NewVersionService()
 	consoleService := services.NewConsoleService()
-	customCliService := services.NewCustomCliService(providerRelay.Addr())
 	networkService := services.NewNetworkService(providerRelay.Addr(), claudeSettings, codexSettings, codexRelayKeys)
 
 	if err := providerRelay.Start(); err != nil {
@@ -180,7 +178,6 @@ func newAppRuntime() (*appRuntime, error) {
 		versionService:     versionService,
 		consoleService:     consoleService,
 		poolAttemptLogs:    poolAttemptLogs,
-		customCliService:   customCliService,
 		networkService:     networkService,
 		providerRelay:      providerRelay,
 		poolService:        poolService,
@@ -231,7 +228,6 @@ func (rt *appRuntime) registerServices(registry *rpcRegistry) {
 	registry.Register("codeswitch/services.HealthCheckService", &userScopedHealthCheckService{base: rt.healthCheckService})
 	registry.Register("codeswitch/services.ModelMonitorService", &userScopedModelMonitorService{base: rt.modelMonitor})
 	registry.Register("codeswitch/services.ConsoleService", &userScopedConsoleService{logService: rt.logService, poolAttemptLogs: rt.poolAttemptLogs})
-	registry.Register("codeswitch/services.CustomCliService", rt.customCliService)
 	registry.Register("codeswitch/services.NetworkService", rt.networkService)
 	registry.Register("codeswitch/services.ProviderRelayService", &userScopedProviderRelayService{base: rt.providerRelay, poolService: rt.poolService})
 	registry.Register("codeswitch/services.ProviderPoolService", &userScopedProviderPoolService{base: rt.poolService, proxyService: rt.proxyService})

@@ -140,9 +140,6 @@ func providerPlatformForPool(kind string) string {
 	case "openai-chat", "openai_chat":
 		return "openai-chat"
 	default:
-		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(kind)), "custom:") {
-			return strings.TrimSpace(kind)
-		}
 		return strings.TrimSpace(kind)
 	}
 }
@@ -160,19 +157,6 @@ func providerFilePathInDir(dir string, kind string) (string, error) {
 	case "openai-chat", "openai_chat":
 		filename = "openai-chat.json"
 	default:
-		// 支持自定义 CLI 工具的供应商存储：custom:{tool-id}
-		if strings.HasPrefix(kind, "custom:") {
-			toolId := strings.TrimPrefix(kind, "custom:")
-			if toolId == "" {
-				return "", fmt.Errorf("invalid custom provider kind: %s", kind)
-			}
-			// 存储在 providers 子目录下
-			providersDir := filepath.Join(dir, "providers")
-			if err := os.MkdirAll(providersDir, 0o700); err != nil {
-				return "", err
-			}
-			return filepath.Join(providersDir, toolId+".json"), nil
-		}
 		return "", fmt.Errorf("unknown provider type: %s", kind)
 	}
 	return filepath.Join(dir, filename), nil
@@ -196,13 +180,7 @@ func (ps *ProviderService) SaveProvidersForUser(userID string, kind string, prov
 		return err
 	}
 	ps.mu.Unlock()
-
-	poolService, err := NewProviderPoolServiceForUser(userID)
-	if err != nil {
-		return err
-	}
-	_, err = poolService.EnsureDefaultPool(providerPlatformForPool(kind), providers, DefaultPoolSeed{Mode: ProviderPoolModeManaged})
-	return err
+	return nil
 }
 
 // loadProvidersRaw 原样读取配置文件（不迁移、不保存）

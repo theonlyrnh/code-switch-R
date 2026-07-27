@@ -168,7 +168,6 @@
         "label": "Claude proxy",
         "hostClaude": "Host Claude Code",
         "hostCodex": "Host OpenAI Responses",
-        "hostOthers": "Host Custom CLI",
         "tooltip": "Route traffic through the local relay to manage API keys centrally.",
         "statusOn": "Managed",
         "statusOff": "Not managed"
@@ -194,7 +193,7 @@
           },
           "overview": {
             "title": "Overview",
-            "body": "Code Switch centralizes providers, relay keys, and diagnostics for Claude Code, Codex/OpenAI Responses, OpenAI Chat, and custom CLI tools.",
+            "body": "Code Switch centralizes providers, relay keys, and diagnostics for Claude Code, Codex/OpenAI Responses, and OpenAI Chat.",
             "items": [
               "The home page groups providers and provider pools by platform; use the top tabs to switch platforms.",
               "When hosting is enabled, the local relay takes over the matching CLI API traffic and chooses providers from your configuration.",
@@ -274,15 +273,6 @@
               }
             ]
           },
-          "customCli": {
-            "title": "Custom CLI",
-            "body": "Custom CLI support is for tools such as Droid, RooCode, or other clients that read local config files.",
-            "items": [
-              "Add a CLI tool from the others tab and register its config file path and format.",
-              "After proxy injection fields are configured, hosting writes the local relay address and auth data into those config fields.",
-              "Each custom CLI can keep its own provider list and hosting state."
-            ]
-          },
           "settings": {
             "title": "Settings and Security",
             "body": "Settings cover appearance, startup, notifications, network listening, admin security, and availability monitoring.",
@@ -293,37 +283,6 @@
             ]
           }
         }
-      },
-      "customCli": {
-        "selectToolFirst": "Please select a CLI tool first",
-        "noTools": "No custom CLI tools yet",
-        "addTool": "Add CLI Tool",
-        "toolName": "Tool Name",
-        "toolNamePlaceholder": "e.g., Droid, RooCode",
-        "configFiles": "Config Files",
-        "proxySettings": "Proxy Injection Settings",
-        "selectTool": "Select CLI Tool",
-        "createTitle": "New CLI Tool",
-        "editTitle": "Edit CLI Tool",
-        "deleteTitle": "Delete CLI Tool",
-        "deleteMessage": "Are you sure you want to delete {name}? This action cannot be undone.",
-        "primaryConfig": "Primary Config",
-        "labelPlaceholder": "Config file label",
-        "pathPlaceholder": "Config file path, e.g., ~/.droid/config.json",
-        "primary": "Primary",
-        "selectConfigFile": "Select target config file",
-        "unnamed": "Unnamed",
-        "baseUrlFieldPlaceholder": "Base URL field path, e.g., env.ANTHROPIC_BASE_URL",
-        "authTokenFieldPlaceholder": "Auth token field path (optional)",
-        "proxyHint": "Proxy injection writes the local proxy address to the specified config file fields",
-        "nameRequired": "Please enter a tool name",
-        "configRequired": "Please add at least one valid config file path",
-        "createSuccess": "CLI tool created successfully",
-        "updateSuccess": "CLI tool updated successfully",
-        "deleteSuccess": "CLI tool deleted",
-        "saveFailed": "Failed to save CLI tool",
-        "deleteFailed": "Failed to delete CLI tool",
-        "invalidProxyTarget": "Invalid proxy injection target config file"
       },
       "logs": {
         "view": "View logs",
@@ -342,7 +301,6 @@
         "successRate": "Success rate",
         "loading": "Refreshing...",
         "noData": "No data yet today",
-        "lastUsed": "In Use",
         "codexSwitchDisabled": ""
       },
       "directApply": {

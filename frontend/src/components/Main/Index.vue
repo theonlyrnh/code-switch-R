@@ -109,85 +109,7 @@
         </div>
       </div>
 
-      <!-- 'others' Tab: CLI 工具选择器 -->
-      <div v-if="activeTab === 'others'" class="cli-tool-selector">
-        <div class="tool-selector-row">
-          <select
-            v-model="selectedToolId"
-            class="tool-select"
-            @change="onToolSelect"
-          >
-            <option v-if="customCliTools.length === 0" value="" disabled>
-              {{ t('components.main.customCli.noTools') }}
-            </option>
-            <option
-              v-for="tool in customCliTools"
-              :key="tool.id"
-              :value="tool.id"
-            >
-              {{ tool.name }}
-            </option>
-          </select>
-          <button
-            class="ghost-icon add-tool-btn"
-            :data-tooltip="t('components.main.customCli.addTool')"
-            @click="openCliToolModal"
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                d="M12 5v14M5 12h14"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                fill="none"
-              />
-            </svg>
-          </button>
-          <button
-            v-if="selectedToolId"
-            class="ghost-icon"
-            :data-tooltip="t('components.main.form.editTitle')"
-            @click="editCurrentCliTool"
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                d="M11.983 2.25a1.125 1.125 0 011.077.81l.563 2.101a7.482 7.482 0 012.326 1.343l2.08-.621a1.125 1.125 0 011.356.651l1.313 3.207a1.125 1.125 0 01-.442 1.339l-1.86 1.205a7.418 7.418 0 010 2.686l1.86 1.205a1.125 1.125 0 01.442 1.339l-1.313 3.207a1.125 1.125 0 01-1.356.651l-2.08-.621a7.482 7.482 0 01-2.326 1.343l-.563 2.101a1.125 1.125 0 01-1.077.81h-2.634a1.125 1.125 0 01-1.077-.81l-.563-2.101a7.482 7.482 0 01-2.326-1.343l-2.08.621a1.125 1.125 0 01-1.356-.651l-1.313-3.207a1.125 1.125 0 01.442-1.339l1.86-1.205a7.418 7.418 0 010-2.686l-1.86-1.205a1.125 1.125 0 01-.442-1.339l1.313-3.207a1.125 1.125 0 011.356-.651l2.08.621a7.482 7.482 0 012.326-1.343l.563-2.101a1.125 1.125 0 011.077-.81h2.634z"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-              <path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-            </svg>
-          </button>
-          <button
-            v-if="selectedToolId"
-            class="ghost-icon"
-            :data-tooltip="t('components.main.form.actions.delete')"
-            @click="deleteCurrentCliTool"
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                d="M9 3h6m-7 4h8m-6 0v11m4-11v11M5 7h14l-.867 12.138A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.862L5 7z"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
-          </button>
-        </div>
-        <p v-if="customCliTools.length === 0" class="no-tools-hint">
-          {{ t('components.main.customCli.noTools') }} - {{ t('components.main.customCli.addTool') }}
-        </p>
-      </div>
-
-	      <!-- 供应商/池子子标签页（claude/openai-responses/openai-chat） -->
 	      <PoolPanel
-	        v-if="activeTab !== 'others'"
 	        :platform="activeTab"
 	        :providers="activeCards"
 	        :highlighted-provider="highlightedProvider"
@@ -204,126 +126,6 @@
 	        @add-provider="openCreateModal"
 	        @refresh="refreshAllData"
 	      />
-
-      <!-- others Tab: 原有卡片列表 -->
-      <div v-if="activeTab === 'others'" class="automation-list" @dragover.prevent>
-        <article
-          v-for="card in activeCards"
-          :key="card.id"
-          :ref="el => { if (card.name === highlightedProvider) scrollToCard(el as HTMLElement) }"
-          :class="[
-            'automation-card',
-            { dragging: draggingId === card.id },
-            { 'is-last-used': isLastUsedProvider(card.name) },
-            { 'is-highlighted': highlightedProvider === card.name }
-          ]"
-          draggable="true"
-          @dragstart="onDragStart(card.id)"
-          @dragend="onDragEnd"
-          @drop="onDrop(card.id)"
-        >
-          <!-- 正在使用标签 -->
-          <span v-if="isLastUsedProvider(card.name)" class="last-used-badge">
-            ✓ {{ t('components.main.providers.lastUsed') }}
-          </span>
-          <div class="card-leading">
-            <div
-              :class="['card-icon', { empty: !providerFaviconUrl(card.officialSite) }]"
-              :style="{ backgroundColor: providerFaviconUrl(card.officialSite) ? card.tint : 'transparent', color: card.accent }"
-            >
-              <img
-                v-if="providerFaviconUrl(card.officialSite)"
-                class="provider-favicon"
-                :src="providerFaviconUrl(card.officialSite)"
-                :alt="`${card.name} icon`"
-                loading="lazy"
-                decoding="async"
-                @error="markFaviconFailed(card.officialSite)"
-                aria-hidden="true"
-              />
-            </div>
-            <div class="card-text">
-              <div class="card-title-row">
-                <p class="card-title">{{ card.name }}</p>
-                <button
-                  v-if="card.officialSite"
-                  class="card-site"
-                  type="button"
-                  @click.stop="openOfficialSite(card.officialSite)"
-                >
-                  {{ formatOfficialSite(card.officialSite) }}
-                </button>
-              </div>
-              <p
-                v-for="stats in [providerStatDisplay(card.name)]"
-                :key="`metrics-${card.id}`"
-                class="card-metrics"
-              >
-                <template v-if="stats.state !== 'ready'">
-                  {{ stats.message }}
-                </template>
-                <template v-else>
-                  <span v-if="stats.successRateLabel" class="card-success-rate" :class="stats.successRateClass">
-                    {{ stats.successRateLabel }}
-                  </span>
-                  <span class="card-metric-separator" aria-hidden="true">·</span>
-                  <span>{{ stats.requests }}</span>
-                  <span class="card-metric-separator" aria-hidden="true">·</span>
-                  <span>{{ stats.tokens }}</span>
-                </template>
-              </p>
-            </div>
-          </div>
-          <div class="card-actions">
-            <button class="ghost-icon" :data-tooltip="t('components.main.form.editTitle')" @click="configure(card)">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path
-                  d="M11.983 2.25a1.125 1.125 0 011.077.81l.563 2.101a7.482 7.482 0 012.326 1.343l2.08-.621a1.125 1.125 0 011.356.651l1.313 3.207a1.125 1.125 0 01-.442 1.339l-1.86 1.205a7.418 7.418 0 010 2.686l1.86 1.205a1.125 1.125 0 01.442 1.339l-1.313 3.207a1.125 1.125 0 01-1.356.651l-2.08-.621a7.482 7.482 0 01-2.326 1.343l-.563 2.101a1.125 1.125 0 01-1.077.81h-2.634a1.125 1.125 0 01-1.077-.81l-.563-2.101a7.482 7.482 0 01-2.326-1.343l-2.08.621a1.125 1.125 0 01-1.356-.651l-1.313-3.207a1.125 1.125 0 01.442-1.339l1.86-1.205a7.418 7.418 0 010-2.686l-1.86-1.205a1.125 1.125 0 01-.442-1.339l1.313-3.207a1.125 1.125 0 011.356-.651l2.08.621a7.482 7.482 0 012.326-1.343l.563-2.101a1.125 1.125 0 011.077-.81h2.634z"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.5"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                />
-                <path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-              </svg>
-            </button>
-            <button class="ghost-icon" :data-tooltip="t('components.main.controls.duplicate')" @click="handleDuplicate(card)">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path
-                  d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.5"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                />
-              </svg>
-            </button>
-            <button class="ghost-icon" :data-tooltip="t('components.main.form.actions.delete')" @click="requestRemove(card)">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path
-                  d="M9 3h6m-7 4h8m-6 0v11m4-11v11M5 7h14l-.867 12.138A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.862L5 7z"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.5"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                />
-              </svg>
-            </button>
-          </div>
-        </article>
-      </div>
-
-      <!-- 自定义 CLI 工具配置文件编辑器 -->
-      <CustomCliConfigEditor
-        v-if="activeTab === 'others' && selectedToolId && selectedCustomCliTool"
-        :tool-id="selectedToolId"
-        :tool-name="selectedCustomCliTool.name"
-        :config-files="selectedCustomCliTool.configFiles"
-        @saved="onConfigFileSaved"
-      />
       </section>
 
       <BaseModal
@@ -663,159 +465,6 @@
       </footer>
       </BaseModal>
 
-      <!-- CLI 工具配置模态框 -->
-      <BaseModal
-        :open="cliToolModalState.open"
-        :title="cliToolModalState.editingId ? t('components.main.customCli.editTitle') : t('components.main.customCli.createTitle')"
-        @close="closeCliToolModal"
-      >
-        <form class="vendor-form cli-tool-form" @submit.prevent="submitCliToolModal">
-          <label class="form-field">
-            <span>{{ t('components.main.customCli.toolName') }}</span>
-            <BaseInput
-              v-model="cliToolModalState.form.name"
-              type="text"
-              :placeholder="t('components.main.customCli.toolNamePlaceholder')"
-              required
-            />
-          </label>
-
-          <!-- 配置文件列表 -->
-          <div class="form-field">
-            <div class="field-header">
-              <span>{{ t('components.main.customCli.configFiles') }}</span>
-              <button type="button" class="add-btn" @click="addConfigFile">
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none" />
-                </svg>
-              </button>
-            </div>
-            <div class="config-files-list">
-              <div
-                v-for="(cf, idx) in cliToolModalState.form.configFiles"
-                :key="cf.id"
-                class="config-file-item"
-              >
-                <div class="config-file-row">
-                  <BaseInput
-                    v-model="cf.label"
-                    class="config-label-input"
-                    :placeholder="t('components.main.customCli.labelPlaceholder')"
-                  />
-                  <select v-model="cf.format" class="config-format-select">
-                    <option value="json">JSON</option>
-                    <option value="toml">TOML</option>
-                    <option value="env">ENV</option>
-                  </select>
-                  <label class="primary-checkbox">
-                    <input type="checkbox" v-model="cf.isPrimary" />
-                    <span>{{ t('components.main.customCli.primary') }}</span>
-                  </label>
-                  <button
-                    type="button"
-                    class="remove-btn"
-                    :disabled="cliToolModalState.form.configFiles.length <= 1"
-                    @click="removeConfigFile(idx)"
-                  >
-                    <svg viewBox="0 0 24 24" aria-hidden="true">
-                      <path d="M6 18L18 6M6 6l12 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none" />
-                    </svg>
-                  </button>
-                </div>
-                <BaseInput
-                  v-model="cf.path"
-                  class="config-path-input"
-                  :placeholder="t('components.main.customCli.pathPlaceholder')"
-                />
-              </div>
-            </div>
-          </div>
-
-          <!-- 代理注入配置 -->
-          <div class="form-field">
-            <div class="field-header">
-              <span>{{ t('components.main.customCli.proxySettings') }}</span>
-              <button type="button" class="add-btn" @click="addProxyInjection">
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none" />
-                </svg>
-              </button>
-            </div>
-            <div class="proxy-injection-list">
-              <div
-                v-for="(pi, idx) in cliToolModalState.form.proxyInjection"
-                :key="idx"
-                class="proxy-injection-item"
-              >
-                <div class="proxy-injection-row">
-                  <select v-model="pi.targetFileId" class="target-file-select">
-                    <option value="">{{ t('components.main.customCli.selectConfigFile') }}</option>
-                    <option
-                      v-for="cf in cliToolModalState.form.configFiles"
-                      :key="cf.id"
-                      :value="cf.id"
-                    >
-                      {{ cf.label || cf.path || t('components.main.customCli.unnamed') }}
-                    </option>
-                  </select>
-                  <button
-                    type="button"
-                    class="remove-btn"
-                    :disabled="cliToolModalState.form.proxyInjection.length <= 1"
-                    @click="removeProxyInjection(idx)"
-                  >
-                    <svg viewBox="0 0 24 24" aria-hidden="true">
-                      <path d="M6 18L18 6M6 6l12 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none" />
-                    </svg>
-                  </button>
-                </div>
-                <div class="proxy-fields-row">
-                  <BaseInput
-                    v-model="pi.baseUrlField"
-                    class="proxy-field-input"
-                    :placeholder="t('components.main.customCli.baseUrlFieldPlaceholder')"
-                  />
-                  <BaseInput
-                    v-model="pi.authTokenField"
-                    class="proxy-field-input"
-                    :placeholder="t('components.main.customCli.authTokenFieldPlaceholder')"
-                  />
-                </div>
-              </div>
-            </div>
-            <HelpHint :text="t('components.main.customCli.proxyHint')" />
-          </div>
-
-          <footer class="form-actions">
-            <BaseButton variant="outline" type="button" @click="closeCliToolModal">
-              {{ t('components.main.form.actions.cancel') }}
-            </BaseButton>
-            <BaseButton type="submit">
-              {{ t('components.main.form.actions.save') }}
-            </BaseButton>
-          </footer>
-        </form>
-      </BaseModal>
-
-      <!-- CLI 工具删除确认框 -->
-      <BaseModal
-        :open="cliToolConfirmState.open"
-        :title="t('components.main.customCli.deleteTitle')"
-        variant="confirm"
-        @close="closeCliToolConfirm"
-      >
-        <div class="confirm-body">
-          <p>{{ t('components.main.customCli.deleteMessage', { name: cliToolConfirmState.tool?.name ?? '' }) }}</p>
-        </div>
-        <footer class="form-actions confirm-actions">
-          <BaseButton variant="outline" type="button" @click="closeCliToolConfirm">
-            {{ t('components.main.form.actions.cancel') }}
-          </BaseButton>
-          <BaseButton variant="danger" type="button" @click="confirmDeleteCliTool">
-            {{ t('components.main.form.actions.delete') }}
-          </BaseButton>
-        </footer>
-      </BaseModal>
     </div>
   </div>
 </template>
@@ -848,7 +497,6 @@ import ReadOnlyJsonEditor from '../common/ReadOnlyJsonEditor.vue'
 import ModelWhitelistEditor from '../common/ModelWhitelistEditor.vue'
 import HelpHint from '../common/HelpHint.vue'
 import ModelMappingEditor from '../common/ModelMappingEditor.vue'
-import CustomCliConfigEditor from '../common/CustomCliConfigEditor.vue'
 import PoolPanel from './PoolPanel.vue'
 import { ListRelayKeys, type RelayKeyItem } from '../../services/providerPool'
 import { RELAY_KEYS_UPDATED_EVENT } from '../../events/relayKeys'
@@ -861,18 +509,6 @@ import { getCurrentTheme, setTheme, type ThemeMode } from '../../utils/ThemeMana
 import { useRouter } from 'vue-router'
 import { showToast } from '../../utils/toast'
 import { extractErrorMessage } from '../../utils/error'
-import {
-  listCustomCliTools,
-  createCustomCliTool,
-  updateCustomCliTool,
-  deleteCustomCliTool,
-  getCustomCliProxyStatus,
-  enableCustomCliProxy,
-  disableCustomCliProxy,
-  type CustomCliTool,
-  type ConfigFile,
-  type ProxyInjection,
-} from '../../services/customCliService'
 import {
   getConnectivityResults,
   StatusAvailable,
@@ -909,7 +545,6 @@ const docSectionKeys = [
   'logs',
   'console',
   'codex',
-  'customCli',
   'settings',
 ] as const
 const docSectionItemCounts: Record<(typeof docSectionKeys)[number], number> = {
@@ -922,7 +557,6 @@ const docSectionItemCounts: Record<(typeof docSectionKeys)[number], number> = {
   logs: 3,
   console: 3,
   codex: 3,
-  customCli: 3,
   settings: 3,
 }
 const docSectionCodeBlockCounts: Partial<Record<(typeof docSectionKeys)[number], number>> = {
@@ -982,13 +616,11 @@ const proxyStates = reactive<Record<ProviderTab, boolean>>({
   claude: false,
   'openai-responses': false,
   'openai-chat': false,
-  others: false,
 })
 const proxyBusy = reactive<Record<ProviderTab, boolean>>({
   claude: false,
   'openai-responses': false,
   'openai-chat': false,
-  others: false,
 })
 
 // 直连应用状态
@@ -996,11 +628,10 @@ const directAppliedIds = reactive<Record<ProviderTab, string | number | null>>({
   claude: null,
   'openai-responses': null,
   'openai-chat': null,
-  others: null,
 })
 
 const supportsDirectApply = (tab: ProviderTab) =>
-  tab !== 'others' && tab !== 'openai-chat'
+  tab !== 'openai-chat'
 
 const refreshDirectAppliedStatus = async (tab: ProviderTab = activeTab.value) => {
   if (!supportsDirectApply(tab)) return
@@ -1060,26 +691,22 @@ const providerStatsMap = reactive<Record<ProviderTab, Record<string, ProviderDai
   claude: {},
   'openai-responses': {},
   'openai-chat': {},
-  others: {},
 })
 const providerStatsLoading = reactive<Record<ProviderTab, boolean>>({
   claude: false,
   'openai-responses': false,
   'openai-chat': false,
-  others: false,
 })
 const providerStatsLoaded = reactive<Record<ProviderTab, boolean>>({
   claude: false,
   'openai-responses': false,
   'openai-chat': false,
-  others: false,
 })
 const providerStatsRequests: Partial<Record<ProviderTab, Promise<void>>> = {}
 const providerStatsRequestVersions: Record<ProviderTab, number> = {
   claude: 0,
   'openai-responses': 0,
   'openai-chat': 0,
-  others: 0,
 }
 let providerStatsTimer: number | undefined
 let mainPageActive = false
@@ -1089,29 +716,11 @@ let mainPageListenersRegistered = false
 const showHomeTitle = ref(true)
 const appVersion = ref('')
 
-// 自定义 CLI 工具状态
-const customCliTools = ref<CustomCliTool[]>([])
-const selectedToolId = ref<string | null>(null)
-const customCliProxyStates = reactive<Record<string, boolean>>({})  // toolId -> enabled
-
-// 当前选中的 CLI 工具（计算属性）
-const selectedCustomCliTool = computed(() => {
-  if (!selectedToolId.value) return null
-  return customCliTools.value.find(t => t.id === selectedToolId.value) || null
-})
-
-// 配置文件保存成功后的回调
-const onConfigFileSaved = () => {
-  // 配置文件保存成功，可以在这里添加额外逻辑（如刷新状态）
-  console.log('[CustomCliConfigEditor] Config file saved')
-}
-
 // 可用性旧结果（已废弃，保留用于兼容）
 const connectivityResultsMap = reactive<Record<ProviderTab, Record<number, ConnectivityResult>>>({
   claude: {},
   'openai-responses': {},
   'openai-chat': {},
-  others: {},
 })
 
 // 可用性监控状态（新）
@@ -1119,23 +728,8 @@ const availabilityResultsMap = reactive<Record<ProviderTab, Record<number, Provi
   claude: {},
   'openai-responses': {},
   'openai-chat': {},
-  others: {},
 })
 
-// 最后使用的供应商（用于高亮显示）
-// @author sm
-interface LastUsedProvider {
-  platform: string
-  pool_id?: string
-  provider_name: string
-  updated_at: number
-}
-const lastUsedProviders = reactive<Record<string, LastUsedProvider | null>>({
-  claude: null,
-  'openai-responses': null,
-  'openai-chat': null,
-  others: null,
-})
 // 高亮闪烁的供应商名称
 const highlightedProvider = ref<string | null>(null)
 let highlightTimer: number | undefined
@@ -1210,7 +804,6 @@ const tabs = [
   { id: 'claude', label: 'Claude Code' },
   { id: 'openai-responses', label: 'OpenAI Responses' },
   { id: 'openai-chat', label: 'OpenAI Chat' },
-  { id: 'others', label: '其他' },
 ] as const
 type ProviderTab = (typeof tabs)[number]['id']
 const providerTabIds = tabs.map((tab) => tab.id) as ProviderTab[]
@@ -1253,9 +846,7 @@ const cards = reactive<Record<ProviderTab, AutomationCard[]>>({
   claude: [],
   'openai-responses': [],
   'openai-chat': [],
-  others: [],
 })
-const draggingId = ref<number | null>(null)
 const draggingTab = ref<ProviderTab | null>(null)
 const tabOrder = ref<ProviderTab[]>(loadTabOrder())
 const orderedTabs = computed(() => tabOrder.value.map((id) => tabById[id]))
@@ -1283,13 +874,12 @@ const saveProviderCache = (cache: ProviderCache) => {
 }
 
 const cacheProviders = (tabId: ProviderTab, providers: AutomationCard[]) => {
-  if (tabId === 'others') return
   const cache = loadProviderCache()
   cache[tabId] = serializeProviders(providers)
   saveProviderCache(cache)
 }
 
-const loadInitialProviders = (tabId: Exclude<ProviderTab, 'others'>): AutomationCard[] => {
+const loadInitialProviders = (tabId: ProviderTab): AutomationCard[] => {
   const cached = loadProviderCache()[tabId]
   if (Array.isArray(cached)) {
     return createAutomationCards(cached)
@@ -1322,21 +912,9 @@ cards.claude.splice(0, cards.claude.length, ...loadInitialProviders('claude'))
 cards['openai-responses'].splice(0, cards['openai-responses'].length, ...loadInitialProviders('openai-responses'))
 cards['openai-chat'].splice(0, cards['openai-chat'].length, ...loadInitialProviders('openai-chat'))
 
-// 生成 custom CLI 工具的 provider kind（后端需要 "custom:{toolId}" 格式）
-const getCustomProviderKind = (toolId: string): string => `custom:${toolId}`
-
 const persistProviders = async (tabId: ProviderTab): Promise<{ ok: boolean; error?: string }> => {
   try {
-    if (tabId === 'others') {
-      // 'others' Tab 需要使用 "custom:{toolId}" 格式
-      if (!selectedToolId.value) {
-        showToast(t('components.main.customCli.selectToolFirst'), 'error')
-        return { ok: false, error: t('components.main.customCli.selectToolFirst') }
-      }
-      await SaveProviders(getCustomProviderKind(selectedToolId.value), serializeProviders(cards.others))
-    } else {
-      await SaveProviders(tabId, serializeProviders(cards[tabId]))
-    }
+    await SaveProviders(tabId, serializeProviders(cards[tabId]))
     cacheProviders(tabId, cards[tabId])
     return { ok: true }
   } catch (error) {
@@ -1354,18 +932,13 @@ const replaceProviders = (tabId: ProviderTab, data: AutomationCard[]) => {
 const loadProvidersFromDisk = async () => {
   for (const tab of providerTabIds) {
     try {
-      if (tab === 'others') {
-        // 'others' Tab: 先加载自定义 CLI 工具列表，再加载每个工具的 providers
-        await loadCustomCliTools()
+      const saved = await LoadProviders(tab)
+      if (Array.isArray(saved)) {
+        replaceProviders(tab, saved as AutomationCard[])
+        sortProvidersByLevel(cards[tab])  // 初始排序：启用优先，Level 升序
+        cacheProviders(tab, cards[tab])
       } else {
-        const saved = await LoadProviders(tab)
-        if (Array.isArray(saved)) {
-          replaceProviders(tab, saved as AutomationCard[])
-          sortProvidersByLevel(cards[tab])  // 初始排序：启用优先，Level 升序
-          cacheProviders(tab, cards[tab])
-        } else {
-          await persistProviders(tab)
-        }
+        await persistProviders(tab)
       }
     } catch (error) {
       console.error('Failed to load providers', error)
@@ -1375,72 +948,10 @@ const loadProvidersFromDisk = async () => {
   }
 }
 
-// 加载自定义 CLI 工具列表
-const loadCustomCliTools = async () => {
-  try {
-    const tools = await listCustomCliTools()
-    customCliTools.value = tools
-
-    // 自动选择第一个工具（如果有）
-    if (tools.length > 0 && !selectedToolId.value) {
-      selectedToolId.value = tools[0].id
-    }
-
-    // 为每个工具加载代理状态
-    for (const tool of tools) {
-      try {
-        const status = await getCustomCliProxyStatus(tool.id)
-        customCliProxyStates[tool.id] = Boolean(status?.enabled)
-      } catch (err) {
-        customCliProxyStates[tool.id] = false
-      }
-    }
-
-    // 如果当前选中了工具，更新 'others' Tab 的代理状态并加载 providers
-    if (selectedToolId.value) {
-      proxyStates.others = customCliProxyStates[selectedToolId.value] ?? false
-      await loadCustomCliProviders(selectedToolId.value)
-    }
-  } catch (error) {
-    console.error('Failed to load custom CLI tools', error)
-    customCliTools.value = []
-  }
-}
-
-// 加载特定 CLI 工具的 providers
-const loadCustomCliProviders = async (toolId: string) => {
-  if (!toolId) return
-  try {
-    const kind = getCustomProviderKind(toolId)
-    const saved = await LoadProviders(kind)
-    if (Array.isArray(saved)) {
-      cards.others.splice(0, cards.others.length, ...createAutomationCards(saved as AutomationCard[]))
-      sortProvidersByLevel(cards.others)
-    } else {
-      // 如果没有保存的数据，清空列表
-      cards.others.splice(0, cards.others.length)
-    }
-  } catch (error) {
-    console.error(`Failed to load providers for tool ${toolId}`, error)
-    cards.others.splice(0, cards.others.length)
-  }
-}
-
 const refreshProxyState = async (tab: ProviderTab) => {
   try {
-    if (tab === 'others') {
-      // 'others' Tab 的代理状态依赖于选中的 CLI 工具
-      if (selectedToolId.value) {
-        const status = await getCustomCliProxyStatus(selectedToolId.value)
-        customCliProxyStates[selectedToolId.value] = Boolean(status?.enabled)
-        proxyStates[tab] = Boolean(status?.enabled)
-      } else {
-        proxyStates[tab] = false
-      }
-    } else {
-      const status = await fetchProxyStatus(tab as 'claude' | 'openai-responses' | 'openai-chat')
-      proxyStates[tab] = Boolean(status?.enabled)
-    }
+    const status = await fetchProxyStatus(tab)
+    proxyStates[tab] = Boolean(status?.enabled)
   } catch (error) {
     console.error(`Failed to fetch proxy status for ${tab}`, error)
     proxyStates[tab] = false
@@ -1453,24 +964,10 @@ const onProxyToggle = async () => {
   proxyBusy[tab] = true
   const nextState = !proxyStates[tab]
   try {
-    if (tab === 'others') {
-      // 'others' Tab 需要选中工具才能切换代理
-      if (!selectedToolId.value) {
-        showToast(t('components.main.customCli.selectToolFirst'), 'error')
-        return
-      }
-      if (nextState) {
-        await enableCustomCliProxy(selectedToolId.value)
-      } else {
-        await disableCustomCliProxy(selectedToolId.value)
-      }
-      customCliProxyStates[selectedToolId.value] = nextState
+    if (nextState) {
+      await enableProxy(tab)
     } else {
-      if (nextState) {
-        await enableProxy(tab as 'claude' | 'openai-responses' | 'openai-chat')
-      } else {
-        await disableProxy(tab as 'claude' | 'openai-responses' | 'openai-chat')
-      }
+      await disableProxy(tab)
     }
     proxyStates[tab] = nextState
   } catch (error) {
@@ -1483,19 +980,13 @@ const onProxyToggle = async () => {
 const loadProviderStats = (tab: ProviderTab): Promise<void> => {
   if (mainPageDisposed) return Promise.resolve()
 
-  // 'others' Tab 暂不加载统计数据（自定义 CLI 工具统计需要后续实现）
-  if (tab === 'others') {
-    providerStatsLoaded[tab] = true
-    return Promise.resolve()
-  }
-
   const pendingRequest = providerStatsRequests[tab]
   if (pendingRequest) return pendingRequest
 
   const requestVersion = ++providerStatsRequestVersions[tab]
   providerStatsLoading[tab] = true
   const request = Promise.resolve()
-    .then(() => fetchProviderDailyStats(tab as 'claude' | 'openai-responses' | 'openai-chat'))
+    .then(() => fetchProviderDailyStats(tab))
     .then((stats) => {
       if (mainPageDisposed || providerStatsRequestVersions[tab] !== requestVersion) return
 
@@ -1529,11 +1020,6 @@ const loadProviderStats = (tab: ProviderTab): Promise<void> => {
 
 // 加载旧可用性测试结果（已废弃，保留兼容）
 const loadConnectivityResults = async (tab: ProviderTab) => {
-  // 'others' Tab 暂不加载旧可用性结果
-  if (tab === 'others') {
-    return
-  }
-
   try {
     const results = await getConnectivityResults(tab)
     const map: Record<number, ConnectivityResult> = {}
@@ -1780,52 +1266,12 @@ const handleDocumentVisibilityChange = () => {
   }
 }
 
-// 加载最后使用的供应商
-// @author sm
-const loadLastUsedProviders = async () => {
-  try {
-    const result = await Call.ByName('codeswitch/services.ProviderRelayService.GetAllLastUsedProviders')
-    if (result) {
-      Object.keys(lastUsedProviders).forEach(platform => {
-        lastUsedProviders[platform] = null
-      })
-
-      if (Array.isArray(result)) {
-        result.forEach((item: LastUsedProvider) => {
-          const platform = item?.platform
-          if (!platform || !(platform in lastUsedProviders)) return
-
-          const current = lastUsedProviders[platform]
-          if (!current || (item.updated_at || 0) >= (current.updated_at || 0)) {
-            lastUsedProviders[platform] = item
-          }
-        })
-      } else {
-        Object.keys(result).forEach(platform => {
-          if (platform in lastUsedProviders && result[platform]) {
-            lastUsedProviders[platform] = result[platform]
-          }
-        })
-      }
-    }
-  } catch (err) {
-    console.error('加载最后使用的供应商失败:', err)
-  }
-}
-
 // 切换到指定平台的 Tab 并高亮供应商
 // @author sm
 const switchToTabAndHighlight = (platform: string, providerName: string) => {
   // 切换到对应的 Tab
   if (providerTabIds.includes(platform as ProviderTab) && selectedTab.value !== platform) {
     selectedTab.value = platform as ProviderTab
-  }
-
-  // 更新最后使用的供应商
-  lastUsedProviders[platform] = {
-    platform,
-    provider_name: providerName,
-    updated_at: Date.now(),
   }
 
   // 高亮闪烁供应商卡片
@@ -1857,21 +1303,6 @@ const handleProviderSwitched = (event: { data: { platform: string; toProvider: s
     && document.visibilityState === 'visible'
   ) {
     void loadProviderStats(platform as ProviderTab)
-  }
-}
-
-// 判断供应商是否是最后使用的
-// @author sm
-const isLastUsedProvider = (providerName: string): boolean => {
-  const lastUsed = lastUsedProviders[activeTab.value]
-  return lastUsed?.provider_name === providerName
-}
-
-// 滚动到指定卡片
-// @author sm
-const scrollToCard = (el: HTMLElement | null) => {
-  if (el) {
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
 }
 
@@ -1947,10 +1378,6 @@ const initializeMainPage = async () => {
 
   // 加载初始可用性监控结果（改用新服务）
   await loadAvailabilityResults()
-  if (mainPageDisposed) return
-
-  // 加载最后使用的供应商
-  await loadLastUsedProviders()
   if (mainPageDisposed) return
 
   mainPageInitialized = true
@@ -2031,7 +1458,8 @@ const connectivityTestResult = ref<{ success: boolean; message: string } | null>
 const testingProtocolEndpoint = ref(false)
 const testingModelsEndpoint = ref(false)
 const defaultTestMessage = '这是一条测试消息，请回复"yes"'
-const defaultTestModel = 'gpt-5.5'
+const getDefaultTestModel = (platform: ProviderTab) =>
+  platform === 'claude' ? 'claude-opus-4-8' : 'gpt-5.5'
 const providerTestMessage = ref(defaultTestMessage)
 type ProtocolEndpointTestResult = {
   success: boolean
@@ -2131,7 +1559,7 @@ const loadProviderModelsForForm = async () => {
     )
     providerModelOptions.value = result.models || []
     if (!providerTestModel.value) {
-      providerTestModel.value = defaultTestModel
+      providerTestModel.value = getDefaultTestModel(modalState.tabId)
     }
   } catch (error) {
     console.warn('Failed to load provider models for form:', error)
@@ -2303,12 +1731,6 @@ const currentProxyLabel = computed(() => {
   const tab = activeTab.value
   if (tab === 'claude') {
     return t('components.main.relayToggle.hostClaude')
-  } else if (tab === 'openai-responses') {
-    return t('components.main.relayToggle.hostCodex')
-  } else if (tab === 'others') {
-    // 显示选中的工具名称
-    const tool = customCliTools.value.find(t => t.id === selectedToolId.value)
-    return tool?.name || t('components.main.relayToggle.hostOthers')
   }
   return t('components.main.relayToggle.hostCodex')
 })
@@ -2526,7 +1948,7 @@ const openCreateModal = () => {
   modalState.editingId = null
   editingCard.value = null
   Object.assign(modalState.form, defaultFormValues(activeTab.value))
-  providerTestModel.value = defaultTestModel
+  providerTestModel.value = getDefaultTestModel(activeTab.value)
   providerTestMessage.value = defaultTestMessage
   providerModelOptions.value = []
   providerModelDropdownOpen.value = false
@@ -2580,7 +2002,7 @@ const openEditModal = (card: AutomationCard) => {
   providerTestModel.value =
     card.availabilityConfig?.testModel ||
     card.connectivityTestModel ||
-    defaultTestModel
+    getDefaultTestModel(activeTab.value)
   providerTestMessage.value = defaultTestMessage
   providerModelOptions.value = []
   providerModelDropdownOpen.value = false
@@ -2832,7 +2254,7 @@ const handleDuplicate = (card: AutomationCard) => {
   providerTestModel.value =
     card.availabilityConfig?.testModel ||
     card.connectivityTestModel ||
-    defaultTestModel
+    getDefaultTestModel(activeTab.value)
   providerTestMessage.value = defaultTestMessage
   providerModelOptions.value = []
   providerModelDropdownOpen.value = false
@@ -2862,29 +2284,6 @@ const confirmRemove = async () => {
   if (!confirmState.card) return
   await remove(confirmState.card.id, confirmState.tabId)
   closeConfirm()
-}
-
-const onDragStart = (id: number) => {
-  draggingId.value = id
-}
-
-const onDrop = async (targetId: number) => {
-  if (draggingId.value === null || draggingId.value === targetId) return
-  const currentTab = activeTab.value
-  const list = cards[currentTab]
-  if (!list) return
-  const fromIndex = list.findIndex((card) => card.id === draggingId.value)
-  const toIndex = list.findIndex((card) => card.id === targetId)
-  if (fromIndex === -1 || toIndex === -1) return
-  const [moved] = list.splice(fromIndex, 1)
-  const newIndex = fromIndex < toIndex ? toIndex - 1 : toIndex
-  list.splice(newIndex, 0, moved)
-  draggingId.value = null
-  await persistProviders(currentTab)
-}
-
-const onDragEnd = () => {
-  draggingId.value = null
 }
 
 const reorderTabs = (targetTab: ProviderTab) => {
@@ -2930,313 +2329,9 @@ const onTabDragEnd = () => {
   draggingTab.value = null
 }
 
-// ========== 自定义 CLI 工具管理 ==========
-
-// CLI 工具模态框状态
-const cliToolModalState = reactive({
-  open: false,
-  editingId: null as string | null,
-  form: {
-    name: '',
-    configFiles: [] as Array<{
-      id: string
-      label: string
-      path: string
-      format: 'json' | 'toml' | 'env'
-      isPrimary: boolean
-    }>,
-    proxyInjection: [] as Array<{
-      targetFileId: string
-      baseUrlField: string
-      authTokenField: string
-    }>,
-  },
-})
-
-// CLI 工具删除确认状态
-const cliToolConfirmState = reactive({
-  open: false,
-  tool: null as CustomCliTool | null,
-})
-
-// 切换选中的 CLI 工具
-const onToolSelect = async () => {
-  if (selectedToolId.value) {
-    // 更新当前 tab 的代理状态
-    proxyStates.others = customCliProxyStates[selectedToolId.value] ?? false
-    // 加载该工具的 providers 列表
-    await loadCustomCliProviders(selectedToolId.value)
-  } else {
-    // 未选中任何工具，清空 providers 列表
-    cards.others.splice(0, cards.others.length)
-  }
-}
-
-// 仅在只有一个配置文件时自动选中，避免多配置场景下造成"意外选择"
-const getAutoSelectedProxyTargetFileId = () => {
-  const files = cliToolModalState.form.configFiles
-  if (files.length === 1) return files[0].id
-  return ''
-}
-
-// 打开新建 CLI 工具模态框
-const openCliToolModal = () => {
-  cliToolModalState.editingId = null
-  cliToolModalState.form.name = ''
-  cliToolModalState.form.configFiles = [{
-    id: `cfg-${Date.now()}`,
-    label: t('components.main.customCli.primaryConfig'),
-    path: '',
-    format: 'json',
-    isPrimary: true,
-  }]
-  // 默认占位行保持全空，允许用户选择不配置代理注入
-  // 保存时会自动补齐 targetFileId（如果用户填写了字段且只有一个配置文件）
-  cliToolModalState.form.proxyInjection = [{
-    targetFileId: '',
-    baseUrlField: '',
-    authTokenField: '',
-  }]
-  cliToolModalState.open = true
-}
-
-// 编辑当前选中的 CLI 工具
-const editCurrentCliTool = async () => {
-  if (!selectedToolId.value) return
-  const tool = customCliTools.value.find(t => t.id === selectedToolId.value)
-  if (!tool) return
-
-  cliToolModalState.editingId = tool.id
-  cliToolModalState.form.name = tool.name
-  cliToolModalState.form.configFiles = tool.configFiles.length > 0
-    ? tool.configFiles.map(cf => ({
-        id: cf.id,
-        label: cf.label,
-        path: cf.path,
-        format: cf.format,
-        isPrimary: cf.isPrimary ?? false,
-      }))
-    : [{
-        id: `cfg-${Date.now()}`,
-        label: t('components.main.customCli.primaryConfig'),
-        path: '',
-        format: 'json' as const,
-        isPrimary: true,
-      }]
-  // 加载已有的代理注入配置，默认占位行保持全空
-  // 保存时会自动补齐 targetFileId（如果用户填写了字段且只有一个配置文件）
-  cliToolModalState.form.proxyInjection = tool.proxyInjection && tool.proxyInjection.length > 0
-    ? tool.proxyInjection.map(pi => ({
-        targetFileId: pi.targetFileId ?? '',
-        baseUrlField: pi.baseUrlField ?? '',
-        authTokenField: pi.authTokenField ?? '',
-      }))
-    : [{
-        targetFileId: '',
-        baseUrlField: '',
-        authTokenField: '',
-      }]
-  cliToolModalState.open = true
-}
-
-// 请求删除当前选中的 CLI 工具
-const deleteCurrentCliTool = () => {
-  if (!selectedToolId.value) return
-  const tool = customCliTools.value.find(t => t.id === selectedToolId.value)
-  if (!tool) return
-  cliToolConfirmState.tool = tool
-  cliToolConfirmState.open = true
-}
-
-// 关闭 CLI 工具模态框
-const closeCliToolModal = () => {
-  cliToolModalState.open = false
-}
-
-// 关闭 CLI 工具删除确认框
-const closeCliToolConfirm = () => {
-  cliToolConfirmState.open = false
-  cliToolConfirmState.tool = null
-}
-
-// 添加配置文件
-const addConfigFile = () => {
-  cliToolModalState.form.configFiles.push({
-    id: `cfg-${Date.now()}`,
-    label: '',
-    path: '',
-    format: 'json',
-    isPrimary: false,
-  })
-}
-
-// 删除配置文件
-const removeConfigFile = (index: number) => {
-  if (cliToolModalState.form.configFiles.length <= 1) return
-  cliToolModalState.form.configFiles.splice(index, 1)
-}
-
-// 添加代理注入配置
-const addProxyInjection = () => {
-  cliToolModalState.form.proxyInjection.push({
-    targetFileId: getAutoSelectedProxyTargetFileId(),
-    baseUrlField: '',
-    authTokenField: '',
-  })
-}
-
-// 删除代理注入配置
-const removeProxyInjection = (index: number) => {
-  if (cliToolModalState.form.proxyInjection.length <= 1) return
-  cliToolModalState.form.proxyInjection.splice(index, 1)
-}
-
-// 提交 CLI 工具模态框
-const submitCliToolModal = async () => {
-  const name = cliToolModalState.form.name.trim()
-  if (!name) {
-    showToast(t('components.main.customCli.nameRequired'), 'error')
-    return
-  }
-
-  // 过滤掉空的配置文件
-  const validConfigFiles = cliToolModalState.form.configFiles.filter(cf => cf.path.trim())
-  if (validConfigFiles.length === 0) {
-    showToast(t('components.main.customCli.configRequired'), 'error')
-    return
-  }
-
-  // 验证至少有一个主配置文件
-  const hasPrimary = validConfigFiles.some(cf => cf.isPrimary)
-  if (!hasPrimary) {
-    // 如果没有选中主配置文件，自动将第一个设为主配置
-    validConfigFiles[0].isPrimary = true
-  }
-
-  // 代理注入配置：允许全空（表示不使用），但不允许"半填"
-  // 单一配置文件时，自动选中作为代理注入目标（避免用户忘记选择）
-  const autoTargetFileId = validConfigFiles.length === 1 ? validConfigFiles[0].id : ''
-
-  const proxyInjectionsToSave = cliToolModalState.form.proxyInjection
-    .map(pi => {
-      const baseUrlField = pi.baseUrlField.trim()
-      const authTokenField = pi.authTokenField.trim()
-      // 如果用户填写了字段但忘记选择目标文件，且只有一个配置文件，自动补充
-      const targetFileId = pi.targetFileId.trim() || ((baseUrlField || authTokenField) ? autoTargetFileId : '')
-      return { targetFileId, baseUrlField, authTokenField }
-    })
-    .filter(pi => pi.targetFileId || pi.baseUrlField || pi.authTokenField)
-
-  const hasIncompleteProxyInjection = proxyInjectionsToSave.some(
-    pi => !pi.targetFileId || !pi.baseUrlField
-  )
-  if (hasIncompleteProxyInjection) {
-    showToast(t('components.main.customCli.proxyInjectionIncomplete'), 'error')
-    return
-  }
-
-  // 先校验"目标 ID 是否存在"，再校验"目标文件路径是否有效"，避免报错信息误导
-  const allFileIds = new Set(cliToolModalState.form.configFiles.map(cf => cf.id))
-  const validFileIds = new Set(validConfigFiles.map(cf => cf.id))
-
-  const hasInvalidProxyTarget = proxyInjectionsToSave.some(pi => !allFileIds.has(pi.targetFileId))
-  if (hasInvalidProxyTarget) {
-    showToast(t('components.main.customCli.invalidProxyTarget'), 'error')
-    return
-  }
-
-  const hasProxyTargetPathMissing = proxyInjectionsToSave.some(pi => !validFileIds.has(pi.targetFileId))
-  if (hasProxyTargetPathMissing) {
-    showToast(t('components.main.customCli.proxyTargetPathRequired'), 'error')
-    return
-  }
-
-  try {
-    if (cliToolModalState.editingId) {
-      // 更新现有工具
-      await updateCustomCliTool(cliToolModalState.editingId, {
-        id: cliToolModalState.editingId,
-        name,
-        configFiles: validConfigFiles,
-        proxyInjection: proxyInjectionsToSave,
-      })
-      showToast(t('components.main.customCli.updateSuccess'), 'success')
-    } else {
-      // 创建新工具
-      const newTool = await createCustomCliTool({
-        name,
-        configFiles: validConfigFiles,
-        proxyInjection: proxyInjectionsToSave,
-      })
-      selectedToolId.value = newTool.id
-      showToast(t('components.main.customCli.createSuccess'), 'success')
-    }
-
-    // 刷新工具列表
-    await loadCustomCliTools()
-    closeCliToolModal()
-  } catch (error) {
-    console.error('Failed to save CLI tool', error)
-    // 处理各种错误类型：Error 对象、字符串、其他
-    const msg = error instanceof Error ? error.message : String(error ?? '')
-    if (msg.includes('ERR_CUSTOM_CLI_PROXY_INJECTION_INCOMPLETE')) {
-      showToast(t('components.main.customCli.proxyInjectionIncomplete'), 'error')
-      return
-    }
-    if (msg.includes('ERR_CUSTOM_CLI_INVALID_PROXY_TARGET')) {
-      showToast(t('components.main.customCli.invalidProxyTarget'), 'error')
-      return
-    }
-    showToast(t('components.main.customCli.saveFailed'), 'error')
-  }
-}
-
-// 确认删除 CLI 工具
-const confirmDeleteCliTool = async () => {
-  if (!cliToolConfirmState.tool) return
-  try {
-    await deleteCustomCliTool(cliToolConfirmState.tool.id)
-    showToast(t('components.main.customCli.deleteSuccess'), 'success')
-
-    // 如果删除的是当前选中的工具，清空选择
-    if (selectedToolId.value === cliToolConfirmState.tool.id) {
-      selectedToolId.value = null
-      proxyStates.others = false
-    }
-
-    // 刷新工具列表
-    await loadCustomCliTools()
-    closeCliToolConfirm()
-  } catch (error) {
-    console.error('Failed to delete CLI tool', error)
-    showToast(t('components.main.customCli.deleteFailed'), 'error')
-  }
-}
 </script>
 
 <style scoped>
-/* 正在使用的供应商卡片样式 */
-/* @author sm */
-.automation-card.is-last-used {
-  position: relative;
-  border: 2px solid rgb(16, 185, 129);
-  box-shadow: 0 0 8px rgba(16, 185, 129, 0.3);
-}
-
-/* 正在使用标签 */
-.last-used-badge {
-  position: absolute;
-  top: -10px;
-  right: 12px;
-  background: rgb(16, 185, 129);
-  color: white;
-  font-size: 10px;
-  font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 4px;
-  z-index: 1;
-}
-
 /* 高亮闪烁的供应商卡片（切换时） */
 .automation-card.is-highlighted {
   animation: highlight-pulse 0.6s ease-in-out 3;
@@ -3251,17 +2346,6 @@ const confirmDeleteCliTool = async () => {
   50% {
     box-shadow: 0 0 20px rgba(245, 158, 11, 0.7);
   }
-}
-
-/* 暗色模式适配 */
-:global(.dark) .automation-card.is-last-used {
-  border-color: rgb(52, 211, 153);
-  box-shadow: 0 0 8px rgba(52, 211, 153, 0.3);
-}
-
-:global(.dark) .last-used-badge {
-  background: rgb(52, 211, 153);
-  color: rgb(6, 78, 59);
 }
 
 :global(.dark) .automation-card.is-highlighted {
@@ -3966,256 +3050,6 @@ const confirmDeleteCliTool = async () => {
 :global(.dark) .test-result.error {
   background: rgba(239, 68, 68, 0.15);
   color: #f87171;
-}
-
-/* ========== CLI 工具选择器样式 ========== */
-.cli-tool-selector {
-  padding: 12px 16px;
-  background: var(--mac-surface);
-  border-radius: 8px;
-  margin-bottom: 16px;
-  border: 1px solid var(--mac-border);
-}
-
-.tool-selector-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.tool-select {
-  flex: 1;
-  padding: 8px 12px;
-  background: var(--color-bg-secondary);
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  font-size: 14px;
-  color: var(--color-text-primary);
-  cursor: pointer;
-  transition: all 0.2s ease;
-}
-
-.tool-select:hover {
-  border-color: var(--color-border-hover);
-}
-
-.tool-select:focus {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
-}
-
-.add-tool-btn {
-  flex-shrink: 0;
-}
-
-.no-tools-hint {
-  margin-top: 8px;
-  font-size: 13px;
-  color: var(--mac-text-secondary);
-  text-align: center;
-}
-
-/* ========== CLI 工具表单样式 ========== */
-.cli-tool-form .field-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
-}
-
-.cli-tool-form .field-header span {
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--mac-text);
-}
-
-.cli-tool-form .add-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  background: var(--mac-accent);
-  color: white;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.cli-tool-form .add-btn:hover {
-  filter: brightness(1.1);
-}
-
-.cli-tool-form .add-btn svg {
-  width: 16px;
-  height: 16px;
-}
-
-.cli-tool-form .remove-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  background: transparent;
-  color: var(--mac-text-secondary);
-  border: 1px solid var(--mac-border);
-  border-radius: 6px;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.cli-tool-form .remove-btn:hover:not(:disabled) {
-  background: rgba(239, 68, 68, 0.1);
-  border-color: #ef4444;
-  color: #ef4444;
-}
-
-.cli-tool-form .remove-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.cli-tool-form .remove-btn svg {
-  width: 14px;
-  height: 14px;
-}
-
-/* ========== 配置文件列表样式 ========== */
-.config-files-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.config-file-item {
-  padding: 12px;
-  background: var(--mac-surface-strong);
-  border: 1px solid var(--mac-border);
-  border-radius: 8px;
-}
-
-.config-file-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.config-label-input {
-  flex: 1;
-  min-width: 0;
-}
-
-.config-format-select {
-  width: 80px;
-  padding: 6px 8px;
-  background: var(--color-bg-secondary);
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  font-size: 13px;
-  color: var(--color-text-primary);
-  cursor: pointer;
-}
-
-.config-format-select:focus {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
-}
-
-.primary-checkbox {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--mac-text-secondary);
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.primary-checkbox input {
-  width: 14px;
-  height: 14px;
-  accent-color: var(--mac-accent);
-  cursor: pointer;
-}
-
-.config-path-input {
-  width: 100%;
-}
-
-/* ========== 代理注入配置样式 ========== */
-.proxy-injection-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.proxy-injection-item {
-  padding: 12px;
-  background: var(--mac-surface-strong);
-  border: 1px solid var(--mac-border);
-  border-radius: 8px;
-}
-
-.proxy-injection-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.target-file-select {
-  flex: 1;
-  padding: 8px 12px;
-  background: var(--color-bg-secondary);
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  font-size: 13px;
-  color: var(--color-text-primary);
-  cursor: pointer;
-}
-
-.target-file-select:focus {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
-}
-
-.proxy-fields-row {
-  display: flex;
-  gap: 8px;
-}
-
-.proxy-field-input {
-  flex: 1;
-  min-width: 0;
-}
-
-/* 暗色模式适配 */
-:global(.dark) .cli-tool-selector {
-  background: var(--mac-surface);
-  border-color: var(--mac-border);
-}
-
-:global(.dark) .config-file-item,
-:global(.dark) .proxy-injection-item {
-  background: rgba(255, 255, 255, 0.03);
-  border-color: rgba(255, 255, 255, 0.08);
-}
-
-:global(.dark) .tool-select,
-:global(.dark) .config-format-select,
-:global(.dark) .target-file-select {
-  background: rgba(255, 255, 255, 0.05);
-  border-color: rgba(255, 255, 255, 0.1);
-  color: var(--mac-text);
-}
-
-:global(.dark) .tool-select:hover,
-:global(.dark) .config-format-select:hover,
-:global(.dark) .target-file-select:hover {
-  border-color: rgba(255, 255, 255, 0.2);
 }
 
 /* 直连应用按钮 */

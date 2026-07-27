@@ -55,23 +55,28 @@ Code Switch 是适合 Linux 服务器运行的 Web 管理界面 + 本地代理�
 
 ## 生产约定
 
-生产机通过本机 SSH 配置里的别名连接，例如：
+执行远程部署前，必须由用户明确提供服务器名称和连接方法。连接方法可以是本机 SSH 配置里的别名，也可以是 `user@host`；如果需要非默认端口、私钥、跳板机或其他 SSH 参数，也必须由用户一并提供，不能根据历史环境自行猜测。
+
+例如：
 
 ```bash
-ssh <生产机别名>
+ssh <用户提供的 SSH 目标>
 ```
 
-本文档用变量表示生产机和域名，不假设固定机器名：
+本文档只使用占位变量，不假设任何固定服务器名、SSH 别名、主机地址或域名。下面的值均应替换为用户为本次操作提供的实际信息：
 
 ```bash
-PROD_SSH="<生产机 SSH 别名>"
-ADMIN_DOMAIN="code.wcisman.cc"
-API_DOMAIN="codeapi.wcisman.cc"
+REMOTE_SERVER_NAME="<用户提供的服务器名称>"
+SSH_TARGET="<用户提供的 SSH 别名或 user@host>"
+ADMIN_DOMAIN="<用户提供的 Web 管理域名>"
+API_DOMAIN="<用户提供的 API 域名>"
 LOCAL_REPO="$(pwd)"
 REMOTE_DIR="~/apps/code-switch"
 DATA_DIR="~/.code-switch"
 SERVICE_NAME="codeswitch.service"
 ```
+
+后续示例假设 `SSH_TARGET` 已包含在 `~/.ssh/config` 中，或可以直接被 `ssh` 和 `scp` 使用。若用户提供的是其他连接命令，应按用户给出的参数等价调整 `ssh` 和 `scp`，不要把连接细节写死到仓库。
 
 远程本机端口：
 
@@ -169,16 +174,16 @@ go test ./...
 go build -o codeswitch-web .
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-PROD_SSH="<生产机 SSH 别名>"
+SSH_TARGET="<用户提供的 SSH 别名或 user@host>"
 REMOTE_DIR="~/apps/code-switch"
 FRONTEND_TGZ="$ARTIFACT_DIR/codeswitch-frontend-dist.$STAMP.tgz"
 
 tar -C frontend -czf "$FRONTEND_TGZ" dist
-ssh "$PROD_SSH" "mkdir -p $REMOTE_DIR/frontend"
-scp codeswitch-web "$PROD_SSH:$REMOTE_DIR/codeswitch-web.new"
-scp "$FRONTEND_TGZ" "$PROD_SSH:$REMOTE_DIR/codeswitch-frontend-dist.$STAMP.tgz"
+ssh "$SSH_TARGET" "mkdir -p $REMOTE_DIR/frontend"
+scp codeswitch-web "$SSH_TARGET:$REMOTE_DIR/codeswitch-web.new"
+scp "$FRONTEND_TGZ" "$SSH_TARGET:$REMOTE_DIR/codeswitch-frontend-dist.$STAMP.tgz"
 
-ssh "$PROD_SSH" "
+ssh "$SSH_TARGET" "
   set -e
   cd $REMOTE_DIR
 
@@ -210,7 +215,7 @@ REMOTE_DIR="$HOME/apps/code-switch"
 sudo mkdir -p "$REMOTE_DIR/frontend"
 sudo chown -R "$USER:$USER" "$HOME/apps"
 
-ADMIN_DOMAIN="code.wcisman.cc"
+ADMIN_DOMAIN="<用户提供的 Web 管理域名>"
 SETUP_TOKEN="$(openssl rand -hex 32)"
 echo "CODE_SWITCH_SETUP_TOKEN=$SETUP_TOKEN"
 
@@ -252,8 +257,8 @@ sudo apt install -y caddy
 
 sudo cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak.$(date +%Y%m%d-%H%M%S) 2>/dev/null || true
 
-ADMIN_DOMAIN="code.wcisman.cc"
-API_DOMAIN="codeapi.wcisman.cc"
+ADMIN_DOMAIN="<用户提供的 Web 管理域名>"
+API_DOMAIN="<用户提供的 API 域名>"
 
 sudo tee /etc/caddy/Caddyfile >/dev/null <<EOF
 $ADMIN_DOMAIN {
@@ -342,15 +347,15 @@ npm install
 npm run build
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-PROD_SSH="<生产机 SSH 别名>"
+SSH_TARGET="<用户提供的 SSH 别名或 user@host>"
 REMOTE_DIR="~/apps/code-switch"
 FRONTEND_TGZ="$ARTIFACT_DIR/codeswitch-frontend-dist.$STAMP.tgz"
 
 tar -C "$REPO_DIR/frontend" -czf "$FRONTEND_TGZ" dist
-ssh "$PROD_SSH" "mkdir -p $REMOTE_DIR/frontend"
-scp "$FRONTEND_TGZ" "$PROD_SSH:$REMOTE_DIR/codeswitch-frontend-dist.$STAMP.tgz"
+ssh "$SSH_TARGET" "mkdir -p $REMOTE_DIR/frontend"
+scp "$FRONTEND_TGZ" "$SSH_TARGET:$REMOTE_DIR/codeswitch-frontend-dist.$STAMP.tgz"
 
-ssh "$PROD_SSH" "
+ssh "$SSH_TARGET" "
   set -e
   cd $REMOTE_DIR
 
@@ -383,16 +388,16 @@ go test ./...
 go build -o codeswitch-web .
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-PROD_SSH="<生产机 SSH 别名>"
+SSH_TARGET="<用户提供的 SSH 别名或 user@host>"
 REMOTE_DIR="~/apps/code-switch"
 FRONTEND_TGZ="$ARTIFACT_DIR/codeswitch-frontend-dist.$STAMP.tgz"
 
 tar -C frontend -czf "$FRONTEND_TGZ" dist
-ssh "$PROD_SSH" "mkdir -p $REMOTE_DIR/frontend"
-scp codeswitch-web "$PROD_SSH:$REMOTE_DIR/codeswitch-web.new"
-scp "$FRONTEND_TGZ" "$PROD_SSH:$REMOTE_DIR/codeswitch-frontend-dist.$STAMP.tgz"
+ssh "$SSH_TARGET" "mkdir -p $REMOTE_DIR/frontend"
+scp codeswitch-web "$SSH_TARGET:$REMOTE_DIR/codeswitch-web.new"
+scp "$FRONTEND_TGZ" "$SSH_TARGET:$REMOTE_DIR/codeswitch-frontend-dist.$STAMP.tgz"
 
-ssh "$PROD_SSH" "
+ssh "$SSH_TARGET" "
   set -e
   cd $REMOTE_DIR
 
@@ -422,7 +427,7 @@ ssh "$PROD_SSH" "
 ./codeswitch-web migrate-request-log-indexes
 ```
 
-该命令会逐个、幂等地创建缺失索引，并重新生成北京时间当天的 48 个 30 分钟统计桶后标记汇总可用。创建索引可能读取完整 `request_log`，当天汇总回填会读取当天记录；两者都可能增加数据库、WAL 或临时文件占用，因此必须安排维护窗口。迁移前应先按“备份和恢复”章节完成冷备份，并检查数据库大小和可用磁盘：
+该命令会逐个、幂等地创建缺失索引，并重新生成北京时间当天的 48 个 30 分钟统计桶后标记汇总可用。创建索引可能读取完整 `request_log`，当天汇总回填会读取当天记录；两者都可能增加数据库、WAL 或临时文件占用，因此必须安排维护窗口。迁移前应确认具备可回滚条件，并检查数据库大小和可用磁盘：
 
 ```bash
 du -sh "$HOME/.code-switch/app.db" "$HOME/.code-switch/app.db-wal" 2>/dev/null || true
@@ -470,16 +475,16 @@ ARTIFACT_DIR="$(pwd)/.deploy"
 mkdir -p "$ARTIFACT_DIR"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-PROD_SSH="<生产机 SSH 别名>"
+SSH_TARGET="<用户提供的 SSH 别名或 user@host>"
 REMOTE_DIR="~/apps/code-switch"
 MANAGE_USERS_BIN="$ARTIFACT_DIR/manage-users-bin.$STAMP"
 
 go build -o "$MANAGE_USERS_BIN" ./cmd/manage-users
-ssh "$PROD_SSH" "mkdir -p $REMOTE_DIR/scripts"
-scp scripts/manage-users "$PROD_SSH:$REMOTE_DIR/scripts/manage-users.new"
-scp "$MANAGE_USERS_BIN" "$PROD_SSH:$REMOTE_DIR/scripts/manage-users-bin.new"
+ssh "$SSH_TARGET" "mkdir -p $REMOTE_DIR/scripts"
+scp scripts/manage-users "$SSH_TARGET:$REMOTE_DIR/scripts/manage-users.new"
+scp "$MANAGE_USERS_BIN" "$SSH_TARGET:$REMOTE_DIR/scripts/manage-users-bin.new"
 
-ssh "$PROD_SSH" "
+ssh "$SSH_TARGET" "
   set -e
   cd $REMOTE_DIR
 
@@ -532,8 +537,8 @@ curl -i -sS -X POST http://127.0.0.1:18100/responses \
 公网验证：
 
 ```bash
-ADMIN_DOMAIN="code.wcisman.cc"
-API_DOMAIN="codeapi.wcisman.cc"
+ADMIN_DOMAIN="<用户提供的 Web 管理域名>"
+API_DOMAIN="<用户提供的 API 域名>"
 
 curl -fsS "https://$ADMIN_DOMAIN/healthz"
 curl -i -sS -X POST "https://$API_DOMAIN/chat/completions" \
@@ -541,296 +546,6 @@ curl -i -sS -X POST "https://$API_DOMAIN/chat/completions" \
   -d '{}'
 ```
 
-
-## 备份和恢复
-
-生产备份方案：
-
-```text
-~/.code-switch
-  -> 停 codeswitch.service 后打 tgz 冷备份
-  -> restic 加密、去重、保留策略
-  -> 腾讯云 COS 私有 Bucket 的 code-switch/prod 仓库
-```
-
-前提：
-
-- 腾讯云 COS Bucket 已创建，访问权限为私有读写。
-- COS 访问白名单已放行服务器出口 IP。
-- CAM 密钥只授予这个 Bucket 的数据读写权限。
-- 服务器上 `codeswitch.service` 已由 systemd 管理。
-
-日常备份和跨服务器迁移使用同一个逻辑仓库：
-
-```text
-code-switch/prod
-```
-
-### 配置 COS 仓库
-
-以下命令需要服务器操作员执行。替换 `SecretId`、`SecretKey`、地域和 Bucket 名：
-
-```bash
-sudo apt update
-sudo apt install -y restic
-
-sudo install -d -m 700 /etc/code-switch-backup
-
-sudo tee /etc/code-switch-backup/cos.env >/dev/null <<'EOF'
-AWS_ACCESS_KEY_ID='替换成腾讯云 SecretId'
-AWS_SECRET_ACCESS_KEY='替换成腾讯云 SecretKey'
-AWS_REGION='ap-tokyo'
-AWS_DEFAULT_REGION='ap-tokyo'
-RESTIC_REPOSITORY='s3:https://cos.ap-tokyo.myqcloud.com/code-switch-backups-1309705566/code-switch/prod'
-RESTIC_PASSWORD_FILE='/etc/code-switch-backup/restic-password'
-EOF
-
-openssl rand -base64 48 | sudo tee /etc/code-switch-backup/restic-password >/dev/null
-
-sudo chmod 600 /etc/code-switch-backup/cos.env
-sudo chmod 600 /etc/code-switch-backup/restic-password
-sudo cat /etc/code-switch-backup/restic-password
-```
-
-保存 `restic-password`。这个密码丢失后，云端备份无法解密恢复。
-
-腾讯云 COS 2024-01-01 后创建的 Bucket 不支持 path-style 访问。所有 `restic` 命令都必须带：
-
-```bash
--o s3.bucket-lookup=dns -o "s3.region=$AWS_REGION"
-```
-
-初始化：
-
-```bash
-sudo bash -c '
-set -a
-. /etc/code-switch-backup/cos.env
-set +a
-restic -o s3.bucket-lookup=dns -o "s3.region=$AWS_REGION" init
-'
-```
-
-如果出现 `client.BucketExists: Access Denied`，检查：
-
-- Bucket 地域和 endpoint 是否一致。
-- COS 白名单是否包含服务器实际出口 IP。
-- CAM 权限是否包含 Bucket list/head 和 object put/get/delete。
-- 命令是否漏了 `-o s3.bucket-lookup=dns`。
-
-### 备份脚本
-
-```bash
-sudo tee /usr/local/sbin/code-switch-backup-cos >/dev/null <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-CODE_SWITCH_USER="${CODE_SWITCH_USER:-chh}"
-CODE_SWITCH_HOME="$(getent passwd "$CODE_SWITCH_USER" | cut -d: -f6)"
-BACKUP_DIR="$CODE_SWITCH_HOME/backups/code-switch"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-ARCHIVE="$BACKUP_DIR/code-switch-data.$STAMP.tgz"
-ENV_FILE="/etc/code-switch-backup/cos.env"
-
-if [ -z "$CODE_SWITCH_HOME" ]; then
-  echo "cannot resolve home for user: $CODE_SWITCH_USER" >&2
-  exit 1
-fi
-
-mkdir -p "$BACKUP_DIR"
-
-systemctl stop codeswitch.service
-trap 'systemctl start codeswitch.service' EXIT
-
-tar -C "$CODE_SWITCH_HOME" -czf "$ARCHIVE" .code-switch
-sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
-
-systemctl start codeswitch.service
-trap - EXIT
-
-set -a
-. "$ENV_FILE"
-set +a
-
-RESTIC_S3_OPTS=(-o "s3.bucket-lookup=dns" -o "s3.region=$AWS_REGION")
-
-restic "${RESTIC_S3_OPTS[@]}" backup "$ARCHIVE" "$ARCHIVE.sha256"
-restic "${RESTIC_S3_OPTS[@]}" forget \
-  --keep-daily 7 \
-  --keep-weekly 4 \
-  --keep-monthly 6 \
-  --prune
-
-find "$BACKUP_DIR" \
-  -type f \
-  \( -name 'code-switch-data.*.tgz' -o -name 'code-switch-data.*.tgz.sha256' \) \
-  -mtime +30 \
-  -delete
-EOF
-
-sudo chmod 700 /usr/local/sbin/code-switch-backup-cos
-```
-
-手动执行：
-
-```bash
-sudo /usr/local/sbin/code-switch-backup-cos
-```
-
-查看快照：
-
-```bash
-sudo bash -c '
-set -a
-. /etc/code-switch-backup/cos.env
-set +a
-restic -o s3.bucket-lookup=dns -o "s3.region=$AWS_REGION" snapshots
-'
-```
-
-### 定时备份
-
-```bash
-sudo mkdir -p /var/cache/code-switch-restic
-sudo chown root:root /var/cache/code-switch-restic
-sudo chmod 700 /var/cache/code-switch-restic
-
-sudo tee /etc/systemd/system/code-switch-backup-cos.service >/dev/null <<'EOF'
-[Unit]
-Description=Back up Code Switch data to Tencent COS
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=oneshot
-Environment=XDG_CACHE_HOME=/var/cache/code-switch-restic
-ExecStart=/usr/local/sbin/code-switch-backup-cos
-EOF
-
-sudo tee /etc/systemd/system/code-switch-backup-cos.timer >/dev/null <<'EOF'
-[Unit]
-Description=Daily Code Switch backup to Tencent COS
-
-[Timer]
-OnCalendar=*-*-* 04:10:00
-Persistent=true
-RandomizedDelaySec=10m
-
-[Install]
-WantedBy=timers.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now code-switch-backup-cos.timer
-systemctl list-timers --all | grep code-switch
-```
-
-查看日志并确认备份成功：
-
-```bash
-sudo journalctl -u code-switch-backup-cos.service -n 120 --no-pager
-```
-
-正常日志应包含：
-
-- `snapshot <id> saved`
-- `code-switch-backup-cos.service: Deactivated successfully`
-- `Finished code-switch-backup-cos.service`
-
-如果出现 `unable to open cache: unable to locate cache directory`，说明 service 没有正确设置 `XDG_CACHE_HOME`，按上面的 service 文件重新写入并执行：
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart code-switch-backup-cos.timer
-```
-
-### 恢复演练
-
-定期把最新备份恢复到 `/tmp` 并校验哈希：
-
-```bash
-sudo rm -rf /tmp/code-switch-restore-test
-sudo mkdir -p /tmp/code-switch-restore-test
-
-sudo bash -c '
-set -euo pipefail
-set -a
-. /etc/code-switch-backup/cos.env
-set +a
-
-RESTIC_S3_OPTS=(-o "s3.bucket-lookup=dns" -o "s3.region=$AWS_REGION")
-restic "${RESTIC_S3_OPTS[@]}" restore latest --target /tmp/code-switch-restore-test
-
-RESTORED_DIR="$(find /tmp/code-switch-restore-test -type d -path '*/backups/code-switch' | sort | tail -n 1)"
-ls -lh "$RESTORED_DIR"
-cd "$RESTORED_DIR"
-sha256sum -c ./*.tgz.sha256
-'
-```
-
-`sha256sum` 输出 `OK` 才说明备份文件完整。
-
-### 正式恢复
-
-正式恢复会替换 `~/.code-switch`。恢复前先给当前数据做本机备份：
-
-```bash
-sudo bash -c '
-set -euo pipefail
-
-RESTORE_ROOT="/tmp/code-switch-restore"
-CODE_SWITCH_USER="${CODE_SWITCH_USER:-chh}"
-CODE_SWITCH_HOME="$(getent passwd "$CODE_SWITCH_USER" | cut -d: -f6)"
-CURRENT_BACKUP_DIR="$CODE_SWITCH_HOME/backups/code-switch"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-
-if [ -z "$CODE_SWITCH_HOME" ]; then
-  echo "cannot resolve home for user: $CODE_SWITCH_USER" >&2
-  exit 1
-fi
-
-rm -rf "$RESTORE_ROOT"
-mkdir -p "$RESTORE_ROOT" "$CURRENT_BACKUP_DIR"
-
-set -a
-. /etc/code-switch-backup/cos.env
-set +a
-
-RESTIC_S3_OPTS=(-o "s3.bucket-lookup=dns" -o "s3.region=$AWS_REGION")
-restic "${RESTIC_S3_OPTS[@]}" restore latest --target "$RESTORE_ROOT"
-
-RESTORED_BACKUP="$(find "$RESTORE_ROOT" -type f -path "*/backups/code-switch/code-switch-data.*.tgz" | sort | tail -n 1)"
-RESTORED_SHA="$RESTORED_BACKUP.sha256"
-cd "$(dirname "$RESTORED_BACKUP")"
-sha256sum -c "$(basename "$RESTORED_SHA")"
-
-systemctl stop codeswitch.service
-trap "systemctl start codeswitch.service" EXIT
-
-if [ -d "$CODE_SWITCH_HOME/.code-switch" ]; then
-  tar -C "$CODE_SWITCH_HOME" -czf "$CURRENT_BACKUP_DIR/before-restore.$STAMP.tgz" .code-switch
-fi
-
-rm -rf "$CODE_SWITCH_HOME/.code-switch"
-tar -C "$CODE_SWITCH_HOME" -xzf "$RESTORED_BACKUP"
-chown -R "$CODE_SWITCH_USER:$CODE_SWITCH_USER" "$CODE_SWITCH_HOME/.code-switch"
-chmod -R u+rwX,go-rwx "$CODE_SWITCH_HOME/.code-switch"
-
-systemctl start codeswitch.service
-trap - EXIT
-systemctl status codeswitch.service --no-pager -l
-'
-```
-
-恢复后执行“验证”里的本机和公网检查。
-
-一次成功恢复应满足：
-
-- restic 输出 `repository ... opened ... password is correct`。
-- `sha256sum` 输出 `OK`。
-- `codeswitch.service` 恢复为 `active (running)`。
-- `curl http://127.0.0.1:8080/healthz` 返回 `{"ok":true}`。
-- 未带 relay key 请求 `127.0.0.1:18100` 返回 `401`。
 
 ## 使用
 
@@ -852,7 +567,7 @@ systemctl status codeswitch.service --no-pager -l
 
 CLI 代理：
 
-- 在主界面为 Claude Code、Codex、Gemini CLI 或自定义 CLI 打开代理。
+- 在主界面为 Claude Code、Codex/OpenAI Responses 或 OpenAI Chat 配置代理。
 - 程序会把对应 CLI 配置指向 `127.0.0.1:18100`。
 - 关闭代理会恢复原始直连配置。
 

@@ -935,7 +935,7 @@ func TestDuplicateProvider(t *testing.T) {
 	}
 }
 
-func TestSaveProvidersForUserEnsuresUserDefaultPool(t *testing.T) {
+func TestSaveProvidersForUserDoesNotCreateUserDefaultPool(t *testing.T) {
 	testHome := t.TempDir()
 	t.Setenv("HOME", testHome)
 
@@ -954,6 +954,18 @@ func TestSaveProvidersForUserEnsuresUserDefaultPool(t *testing.T) {
 	if err := providerService.SaveProvidersForUser("usr_test", "openai-responses", providers); err != nil {
 		t.Fatalf("SaveProvidersForUser failed: %v", err)
 	}
+	providerService = NewProviderService()
+	if err := providerService.SaveProvidersForUser("usr_test", "openai-responses", providers); err != nil {
+		t.Fatalf("SaveProvidersForUser after service reinitialization failed: %v", err)
+	}
+
+	saved, err := providerService.LoadProvidersForUser("usr_test", "openai-responses")
+	if err != nil {
+		t.Fatalf("LoadProvidersForUser failed: %v", err)
+	}
+	if len(saved) != 1 || saved[0].ID != 101 {
+		t.Fatalf("saved providers = %+v, want provider 101", saved)
+	}
 
 	poolService, err := NewProviderPoolServiceForUser("usr_test")
 	if err != nil {
@@ -963,17 +975,11 @@ func TestSaveProvidersForUserEnsuresUserDefaultPool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPools failed: %v", err)
 	}
-	if len(pools) != 1 {
-		t.Fatalf("expected 1 user pool, got %d", len(pools))
+	if len(pools) != 0 {
+		t.Fatalf("saving providers created pools: %+v", pools)
 	}
-	if pools[0].ID != "pool_openai-responses_default" {
-		t.Fatalf("unexpected default pool id %q", pools[0].ID)
-	}
-	if pools[0].Mode != ProviderPoolModeManaged {
-		t.Fatalf("expected managed default pool, got %q", pools[0].Mode)
-	}
-	if len(pools[0].Members) != 1 || pools[0].Members[0].ProviderID != 101 || !pools[0].Members[0].Enabled {
-		t.Fatalf("unexpected default pool members: %+v", pools[0].Members)
+	if _, err := os.Stat(poolService.path); !os.IsNotExist(err) {
+		t.Fatalf("user provider pool file should not be created, stat err: %v", err)
 	}
 
 	globalPoolFile := filepath.Join(testHome, appSettingsDir, providerPoolsFile)

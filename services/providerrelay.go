@@ -1526,7 +1526,7 @@ func (prs *ProviderRelayService) EnsureDefaultPoolsAndBindings() error {
 		platformDefaults[platform] = defaultPoolIDForPlatform(platform)
 	}
 
-	// 确保默认池子（每次启动都要保证池子存在）
+	// 显式遗留迁移：为各平台补齐默认池。正常启动不调用此方法。
 	if err := prs.poolService.EnsureDefaultPoolsForAllPlatforms(seeds); err != nil {
 		fmt.Printf("[WARN] 确保默认池子失败: %v\n", err)
 	}
@@ -1678,13 +1678,6 @@ func (prs *ProviderRelayService) registerRoutes(router gin.IRouter) {
 	// /v1/models 端点（OpenAI-compatible API）
 	// 支持 Claude 和 Codex 平台
 	router.GET("/v1/models", codexAuth, prs.modelsHandler(""))
-
-	// 自定义 CLI 工具端点（路由格式: /custom/:toolId/v1/messages）
-	// toolId 用于区分不同的 CLI 工具，对应 provider kind 为 "custom:{toolId}"
-	router.POST("/custom/:toolId/v1/messages", prs.customCliProxyHandler())
-
-	// 自定义 CLI 工具的 /v1/models 端点
-	router.GET("/custom/:toolId/v1/models", prs.customModelsHandler())
 }
 
 func (prs *ProviderRelayService) resolveRelayEndpoint(kind string, provider Provider, routeEndpoint string) string {
@@ -4085,7 +4078,7 @@ func ssePayloadHasText(data string) bool {
 type ReqeustLog struct {
 	ID                          int64   `json:"id"`
 	UserID                      string  `json:"user_id"`
-	Platform                    string  `json:"platform"` // claude、codex 或自定义 CLI
+	Platform                    string  `json:"platform"` // claude、openai-responses 或 openai-chat
 	Model                       string  `json:"model"`
 	Provider                    string  `json:"provider"` // provider name
 	RelayKeyID                  string  `json:"relay_key_id"`
@@ -4418,220 +4411,6 @@ func ReplaceModelInRequestBody(bodyBytes []byte, newModel string) ([]byte, error
 	return modified, nil
 }
 
-// customCliProxyHandler 处理自定义 CLI 工具的 API 请求
-// 路由格式: /custom/:toolId/v1/messages
-// toolId 用于区分不同的 CLI 工具，对应 provider kind 为 "custom:{toolId}"
-func (prs *ProviderRelayService) customCliProxyHandler() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		// 从 URL 参数提取 toolId
-		toolId := c.Param("toolId")
-		if toolId == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "toolId is required"})
-			return
-		}
-
-		// 构建 provider kind（格式: "custom:{toolId}"）
-		kind := "custom:" + toolId
-		endpoint := "/v1/messages"
-		// custom CLI 目前未实现 key -> pool 路由，仍使用固定 poolID 隔离。
-		poolID := "pool_" + kind + "_default"
-
-		fmt.Printf("[CustomCLI] 收到请求: toolId=%s, kind=%s\n", toolId, kind)
-
-		// 读取请求体
-		var bodyBytes []byte
-		if c.Request.Body != nil {
-			data, err := io.ReadAll(c.Request.Body)
-			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-				return
-			}
-			bodyBytes = data
-			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		}
-
-		isStream := gjson.GetBytes(bodyBytes, "stream").Bool()
-		requestedModel := gjson.GetBytes(bodyBytes, "model").String()
-
-		if requestedModel == "" {
-			fmt.Printf("[CustomCLI][WARN] 请求未指定模型名，无法执行模型智能降级\n")
-		}
-
-		// 加载该 CLI 工具的 providers
-		providers, err := prs.providerService.LoadProviders(kind)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to load providers for %s: %v", kind, err)})
-			return
-		}
-
-		// 过滤可用的 providers
-		active := make([]Provider, 0, len(providers))
-		skippedCount := 0
-		for _, provider := range providers {
-			if !provider.Enabled || provider.APIURL == "" || provider.APIKey == "" {
-				continue
-			}
-
-			if errs := provider.ValidateConfiguration(); len(errs) > 0 {
-				fmt.Printf("[CustomCLI][WARN] Provider %s 配置验证失败，已自动跳过: %v\n", provider.Name, errs)
-				skippedCount++
-				continue
-			}
-
-			if requestedModel != "" && !provider.IsModelSupported(requestedModel) {
-				fmt.Printf("[CustomCLI][INFO] Provider %s 不支持模型 %s，已跳过\n", provider.Name, requestedModel)
-				skippedCount++
-				continue
-			}
-
-			active = append(active, provider)
-		}
-
-		if len(active) == 0 {
-			if requestedModel != "" {
-				c.JSON(http.StatusNotFound, gin.H{
-					"error": fmt.Sprintf("没有可用的 provider 支持模型 '%s'（已跳过 %d 个不兼容的 provider）", requestedModel, skippedCount),
-				})
-			} else {
-				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("no providers available for %s", kind)})
-			}
-			return
-		}
-
-		fmt.Printf("[CustomCLI][INFO] 找到 %d 个可用的 provider（已过滤 %d 个）：", len(active), skippedCount)
-		for _, p := range active {
-			fmt.Printf("%s ", p.Name)
-		}
-		fmt.Println()
-
-		// 按 Level 分组
-		levelGroups := make(map[int][]Provider)
-		for _, provider := range active {
-			level := provider.Level
-			if level <= 0 {
-				level = 1
-			}
-			levelGroups[level] = append(levelGroups[level], provider)
-		}
-
-		levels := make([]int, 0, len(levelGroups))
-		for level := range levelGroups {
-			levels = append(levels, level)
-		}
-		sort.Ints(levels)
-
-		fmt.Printf("[CustomCLI][INFO] 共 %d 个 Level 分组：%v\n", len(levels), levels)
-
-		query := flattenQuery(c.Request.URL.Query())
-		clientHeaders := cloneHeaders(c.Request.Header)
-
-		// 【降级模式】：按 Level 顺序尝试
-		fmt.Printf("[CustomCLI][INFO] 🔄 降级模式（顺序降级）\n")
-
-		var lastError error
-		var lastProvider string
-		var lastDuration time.Duration
-		totalAttempts := 0
-
-		for _, level := range levels {
-			providersInLevel := levelGroups[level]
-
-			fmt.Printf("[CustomCLI][INFO] === 尝试 Level %d（%d 个 provider）===\n", level, len(providersInLevel))
-
-			for i, provider := range providersInLevel {
-				totalAttempts++
-
-				effectiveModel := provider.GetEffectiveModel(requestedModel)
-				currentBodyBytes := bodyBytes
-				if effectiveModel != requestedModel && requestedModel != "" {
-					fmt.Printf("[CustomCLI][INFO] Provider %s 映射模型: %s -> %s\n", provider.Name, requestedModel, effectiveModel)
-					modifiedBody, err := ReplaceModelInRequestBody(bodyBytes, effectiveModel)
-					if err != nil {
-						fmt.Printf("[CustomCLI][ERROR] 替换模型名失败: %v\n", err)
-						continue
-					}
-					currentBodyBytes = modifiedBody
-				}
-
-				fmt.Printf("[CustomCLI][INFO]   [%d/%d] Provider: %s | Model: %s\n", i+1, len(providersInLevel), provider.Name, effectiveModel)
-				// 获取有效的端点（用户配置优先）
-				effectiveEndpoint := provider.GetEffectiveEndpoint(endpoint)
-
-				startTime := time.Now()
-				ok, err := prs.forwardRequest(c, kind, provider, effectiveEndpoint, query, clientHeaders, currentBodyBytes, isStream, effectiveModel)
-				duration := time.Since(startTime)
-
-				if ok {
-					fmt.Printf("[CustomCLI][INFO]   ✓ Level %d 成功: %s | 耗时: %.2fs\n", level, provider.Name, duration.Seconds())
-					prs.setLastUsedProviderForUser(relayUserIDFromContext(c), kind, poolID, provider.Name)
-					return
-				}
-
-				lastProvider = provider.Name
-				lastDuration = duration
-
-				errorMsg := "未知错误"
-				if err != nil {
-					errorMsg = redactProviderSecret(err.Error(), provider)
-					if errorMsg == err.Error() {
-						lastError = err
-					} else {
-						lastError = errors.New(errorMsg)
-					}
-				}
-				fmt.Printf("[CustomCLI][WARN]   ✗ Level %d 失败: %s | 错误: %s | 耗时: %.2fs\n",
-					level, provider.Name, errorMsg, duration.Seconds())
-
-				if errors.Is(err, errClientAbort) {
-					fmt.Printf("[CustomCLI][INFO] 客户端中断，停止重试: %s\n", provider.Name)
-					return
-				}
-
-				// 发送切换通知
-				if prs.notificationService != nil {
-					nextProvider := ""
-					if i+1 < len(providersInLevel) {
-						nextProvider = providersInLevel[i+1].Name
-					} else {
-						for _, nextLevel := range levels {
-							if nextLevel > level && len(levelGroups[nextLevel]) > 0 {
-								nextProvider = levelGroups[nextLevel][0].Name
-								break
-							}
-						}
-					}
-					if nextProvider != "" {
-						prs.notificationService.NotifyProviderSwitch(SwitchNotification{
-							UserID:       relayUserIDFromContext(c),
-							FromProvider: provider.Name,
-							ToProvider:   nextProvider,
-							Reason:       errorMsg,
-							Platform:     kind,
-						})
-					}
-				}
-			}
-
-			fmt.Printf("[CustomCLI][WARN] Level %d 的所有 %d 个 provider 均失败，尝试下一 Level\n", level, len(providersInLevel))
-		}
-
-		// 所有 provider 都失败
-		errorMsg := "未知错误"
-		if lastError != nil {
-			errorMsg = lastError.Error()
-		}
-		fmt.Printf("[CustomCLI][ERROR] 所有 %d 个 provider 均失败，最后尝试: %s | 错误: %s\n",
-			totalAttempts, lastProvider, errorMsg)
-
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error":          fmt.Sprintf("所有 %d 个 provider 均失败，最后错误: %s", totalAttempts, errorMsg),
-			"last_provider":  lastProvider,
-			"last_duration":  fmt.Sprintf("%.2fs", lastDuration.Seconds()),
-			"total_attempts": totalAttempts,
-		})
-	}
-}
-
 type modelsProviderResponse struct {
 	statusCode  int
 	header      http.Header
@@ -4806,63 +4585,6 @@ func (prs *ProviderRelayService) fetchModelsFromProvider(
 	}, nil
 }
 
-func (prs *ProviderRelayService) forwardLegacyModelsRequest(
-	c *gin.Context,
-	kind string,
-	logPrefix string,
-) error {
-	userID := relayUserIDFromContext(c)
-	var providers []Provider
-	var err error
-	if strings.TrimSpace(userID) != "" {
-		providers, err = prs.providerService.LoadProvidersForUser(userID, kind)
-	} else {
-		providers, err = prs.providerService.LoadProviders(kind)
-	}
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load providers"})
-		return fmt.Errorf("failed to load providers: %w", err)
-	}
-
-	activeProviders := make([]Provider, 0, len(providers))
-	for _, provider := range providers {
-		if !provider.Enabled || provider.APIURL == "" || provider.APIKey == "" {
-			continue
-		}
-		activeProviders = append(activeProviders, provider)
-	}
-	if len(activeProviders) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "no providers available"})
-		return fmt.Errorf("no providers available")
-	}
-
-	sort.SliceStable(activeProviders, func(i, j int) bool {
-		left := activeProviders[i].Level
-		if left <= 0 {
-			left = 1
-		}
-		right := activeProviders[j].Level
-		if right <= 0 {
-			right = 1
-		}
-		return left < right
-	})
-
-	provider := activeProviders[0]
-	fmt.Printf("[%s] 使用 Provider: %s | URL: %s\n", logPrefix, provider.Name, provider.APIURL)
-	response, err := prs.fetchModelsFromProvider(c, provider, logPrefix)
-	if err != nil {
-		if errors.Is(err, errClientAbort) {
-			return err
-		}
-		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("请求失败: %v", err)})
-		return err
-	}
-	fmt.Printf("[%s] ✓ 成功: %s | HTTP %d\n", logPrefix, provider.Name, response.statusCode)
-	writeModelsProviderResponse(c, response)
-	return nil
-}
-
 // forwardModelsRequest 共享的 /v1/models 请求转发逻辑。
 // 模型列表请求也必须走 relay key 绑定的 pool，并过滤当前 pool 的拉黑状态。
 func (prs *ProviderRelayService) forwardModelsRequest(
@@ -4871,10 +4593,6 @@ func (prs *ProviderRelayService) forwardModelsRequest(
 	logPrefix string,
 ) error {
 	fmt.Printf("[%s] 收到 /v1/models 请求, kind=%s\n", logPrefix, kind)
-
-	if strings.HasPrefix(providerPlatformForPool(kind), "custom:") && relayKeyPoolBindingsFromContext(c) == nil {
-		return prs.forwardLegacyModelsRequest(c, kind, logPrefix)
-	}
 
 	candidates := modelsPlatformCandidates(c, kind)
 	if len(candidates) == 0 {
@@ -5052,24 +4770,6 @@ candidateLoop:
 func (prs *ProviderRelayService) modelsHandler(kind string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		_ = prs.forwardModelsRequest(c, kind, "Models")
-	}
-}
-
-// customModelsHandler 处理自定义 CLI 工具的 /v1/models 请求
-// 路由格式: /custom/:toolId/v1/models
-func (prs *ProviderRelayService) customModelsHandler() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		// 从 URL 参数提取 toolId
-		toolId := c.Param("toolId")
-		if toolId == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "toolId is required"})
-			return
-		}
-
-		// 构建 provider kind（格式: "custom:{toolId}"）
-		kind := "custom:" + toolId
-
-		_ = prs.forwardModelsRequest(c, kind, "CustomModels")
 	}
 }
 
