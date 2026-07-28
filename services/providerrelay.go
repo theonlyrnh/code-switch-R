@@ -56,6 +56,7 @@ type ProviderRelayService struct {
 	appSettings         *AppSettingsService
 	proxyManager        *ProxyManager
 	proxyService        *ProxyService
+	trafficService      *TrafficService
 	proxyClientMu       sync.Mutex
 	proxyClients        map[string]*http.Client
 	proxyClientLastUsed map[string]time.Time
@@ -77,6 +78,12 @@ type ProviderRelayService struct {
 func (prs *ProviderRelayService) SetPoolAttemptLogService(service *PoolAttemptLogService) {
 	if prs != nil {
 		prs.poolAttemptLogs = service
+	}
+}
+
+func (prs *ProviderRelayService) SetTrafficService(service *TrafficService) {
+	if prs != nil {
+		prs.trafficService = service
 	}
 }
 
@@ -1575,6 +1582,7 @@ func (prs *ProviderRelayService) Start() error {
 	}
 
 	router := gin.Default()
+	router.Use(prs.trafficMiddleware())
 	prs.registerRoutes(router)
 
 	prs.server = &http.Server{
@@ -1678,6 +1686,7 @@ func (prs *ProviderRelayService) registerRoutes(router gin.IRouter) {
 	// /v1/models 端点（OpenAI-compatible API）
 	// 支持 Claude 和 Codex 平台
 	router.GET("/v1/models", codexAuth, prs.modelsHandler(""))
+	router.GET("/models", codexAuth, prs.modelsHandler(""))
 }
 
 func (prs *ProviderRelayService) resolveRelayEndpoint(kind string, provider Provider, routeEndpoint string) string {
@@ -2168,6 +2177,7 @@ func (prs *ProviderRelayService) startActiveRequestLog(c *gin.Context, kind stri
 		ExcludeFromTotalTraffic: isAccountPool(pool) && pool.ExcludeFromTotalTraffic,
 		startedAt:               start,
 	}
+	requestLog.initializeTraffic(c)
 	activeRequestID := defaultActiveRequestTracker.Start(requestLog, start)
 	requestLog.ActiveRequestID = activeRequestID
 	defaultActiveRequestTracker.Update(activeRequestID, requestLog)
@@ -2178,6 +2188,7 @@ func (prs *ProviderRelayService) finishActiveRequestLog(requestLog *ReqeustLog) 
 	if requestLog == nil {
 		return
 	}
+	requestLog.finalizeClientTraffic()
 	defaultActiveRequestTracker.Finish(requestLog.ActiveRequestID)
 	if requestLog.attemptPersisted {
 		return
@@ -2207,8 +2218,12 @@ func (prs *ProviderRelayService) persistCompletedRequestLog(requestLog *ReqeustL
 			user_id, platform, model, provider, relay_key_id, http_code,
 			input_tokens, output_tokens, cache_create_tokens, cache_read_tokens,
 			reasoning_tokens, is_stream, duration_sec, first_token_duration_sec, client_ip,
-			upstream_header_sec, first_event_sec, first_text_sec, error_message, exclude_from_total, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			upstream_header_sec, first_event_sec, first_text_sec, error_message, exclude_from_total,
+			traffic_trace_id, client_network_scope, client_request_bytes, client_response_bytes,
+			upstream_request_bytes, upstream_response_bytes, retry_request_bytes, retry_response_bytes,
+			upstream_attempts, public_ingress_bytes, public_egress_bytes, local_ingress_bytes,
+			local_egress_bytes, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		requestLog.UserID,
 		requestLog.Platform,
@@ -2230,6 +2245,19 @@ func (prs *ProviderRelayService) persistCompletedRequestLog(requestLog *ReqeustL
 		requestLog.FirstTextSec,
 		requestLog.ErrorMessage,
 		boolToInt(requestLog.ExcludeFromTotalTraffic),
+		requestLog.TrafficTraceID,
+		requestLog.ClientNetworkScope,
+		requestLog.ClientRequestBytes,
+		requestLog.ClientResponseBytes,
+		requestLog.UpstreamRequestBytes,
+		requestLog.UpstreamResponseBytes,
+		requestLog.RetryRequestBytes,
+		requestLog.RetryResponseBytes,
+		requestLog.UpstreamAttempts,
+		requestLog.PublicIngressBytes,
+		requestLog.PublicEgressBytes,
+		requestLog.LocalIngressBytes,
+		requestLog.LocalEgressBytes,
 		time.Now().UTC().Format(timeLayout),
 	)
 
@@ -2566,7 +2594,13 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 			err = errActiveRequestRetryRequested
 		}
 	}()
-	resp, firstTextAttempt, err := prs.doProviderRequestWithAttemptStart(requestCtx, targetURL, headers, query, bodyBytes, startFirstTextAttempt)
+	trafficMetadata := &upstreamTrafficMetadata{
+		service:    prs.trafficService,
+		requestLog: requestLog,
+		provider:   provider.Name,
+		targetURL:  targetURL,
+	}
+	resp, firstTextAttempt, err := prs.doProviderRequestWithAttemptStart(requestCtx, targetURL, headers, query, bodyBytes, startFirstTextAttempt, trafficMetadata)
 	if firstTextAttempt != nil {
 		firstTextAttempt.stop()
 		defer firstTextAttempt.close()
@@ -2888,7 +2922,7 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 }
 
 func (prs *ProviderRelayService) doProviderRequest(ctx context.Context, targetURL string, headers http.Header, query url.Values, bodyBytes []byte) (*xrequest.Response, error) {
-	response, _, err := prs.doProviderRequestWithAttemptStart(ctx, targetURL, headers, query, bodyBytes, nil)
+	response, _, err := prs.doProviderRequestWithAttemptStart(ctx, targetURL, headers, query, bodyBytes, nil, nil)
 	return response, err
 }
 
@@ -2899,9 +2933,14 @@ func (prs *ProviderRelayService) doProviderRequestWithAttemptStart(
 	query url.Values,
 	bodyBytes []byte,
 	startAttempt func(context.Context) *providerRequestAttempt,
+	trafficMetadata ...*upstreamTrafficMetadata,
 ) (*xrequest.Response, *providerRequestAttempt, error) {
 	const maxAttempts = 2
 	var lastErr error
+	var traffic *upstreamTrafficMetadata
+	if len(trafficMetadata) > 0 {
+		traffic = trafficMetadata[0]
+	}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		client, endpoint, clientErr := prs.requestClient(ctx)
 		if clientErr != nil {
@@ -2929,11 +2968,15 @@ func (prs *ProviderRelayService) doProviderRequestWithAttemptStart(
 			return nil, requestAttempt, err
 		}
 
+		trafficAttempt := traffic.begin()
+		trafficAttempt.wrapRequest(req)
 		resp, err := client.Do(req)
+		trafficAttempt.wrapResponse(resp)
 		if err != nil {
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
 			}
+			trafficAttempt.finish()
 			lastErr = err
 			timedOut := requestAttempt != nil && requestAttempt.timedOut.Load()
 			requestAttempt.close()
@@ -3850,8 +3893,21 @@ func ensureRequestLogTableWithDB(db *sql.DB) error {
 		first_event_sec REAL DEFAULT 0,
 		first_text_sec REAL DEFAULT 0,
 		error_message TEXT,
-		exclude_from_total INTEGER DEFAULT 0,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			exclude_from_total INTEGER DEFAULT 0,
+			traffic_trace_id TEXT,
+			client_network_scope TEXT,
+			client_request_bytes INTEGER DEFAULT 0,
+			client_response_bytes INTEGER DEFAULT 0,
+			upstream_request_bytes INTEGER DEFAULT 0,
+			upstream_response_bytes INTEGER DEFAULT 0,
+			retry_request_bytes INTEGER DEFAULT 0,
+			retry_response_bytes INTEGER DEFAULT 0,
+			upstream_attempts INTEGER DEFAULT 0,
+			public_ingress_bytes INTEGER DEFAULT 0,
+			public_egress_bytes INTEGER DEFAULT 0,
+			local_ingress_bytes INTEGER DEFAULT 0,
+			local_egress_bytes INTEGER DEFAULT 0,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`
 
 	if _, err := db.Exec(createTableSQL); err != nil {
@@ -3893,6 +3949,29 @@ func ensureRequestLogTableWithDB(db *sql.DB) error {
 	}
 	if err := ensureRequestLogColumn(db, "exclude_from_total", "INTEGER DEFAULT 0"); err != nil {
 		return err
+	}
+	trafficColumns := []struct {
+		name       string
+		definition string
+	}{
+		{"traffic_trace_id", "TEXT"},
+		{"client_network_scope", "TEXT"},
+		{"client_request_bytes", "INTEGER DEFAULT 0"},
+		{"client_response_bytes", "INTEGER DEFAULT 0"},
+		{"upstream_request_bytes", "INTEGER DEFAULT 0"},
+		{"upstream_response_bytes", "INTEGER DEFAULT 0"},
+		{"retry_request_bytes", "INTEGER DEFAULT 0"},
+		{"retry_response_bytes", "INTEGER DEFAULT 0"},
+		{"upstream_attempts", "INTEGER DEFAULT 0"},
+		{"public_ingress_bytes", "INTEGER DEFAULT 0"},
+		{"public_egress_bytes", "INTEGER DEFAULT 0"},
+		{"local_ingress_bytes", "INTEGER DEFAULT 0"},
+		{"local_egress_bytes", "INTEGER DEFAULT 0"},
+	}
+	for _, column := range trafficColumns {
+		if err := ensureRequestLogColumn(db, column.name, column.definition); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -4101,6 +4180,19 @@ type ReqeustLog struct {
 	CreatedAt                   string  `json:"created_at"`
 	Status                      string  `json:"status,omitempty"`
 	RetryRequested              bool    `json:"retry_requested,omitempty"`
+	TrafficTraceID              string  `json:"traffic_trace_id,omitempty"`
+	ClientNetworkScope          string  `json:"client_network_scope,omitempty"`
+	ClientRequestBytes          int64   `json:"client_request_bytes"`
+	ClientResponseBytes         int64   `json:"client_response_bytes"`
+	UpstreamRequestBytes        int64   `json:"upstream_request_bytes"`
+	UpstreamResponseBytes       int64   `json:"upstream_response_bytes"`
+	RetryRequestBytes           int64   `json:"retry_request_bytes"`
+	RetryResponseBytes          int64   `json:"retry_response_bytes"`
+	UpstreamAttempts            int     `json:"upstream_attempts"`
+	PublicIngressBytes          int64   `json:"public_ingress_bytes"`
+	PublicEgressBytes           int64   `json:"public_egress_bytes"`
+	LocalIngressBytes           int64   `json:"local_ingress_bytes"`
+	LocalEgressBytes            int64   `json:"local_egress_bytes"`
 	QueuePosition               int     `json:"queue_position,omitempty"`
 	QueueStartedAt              string  `json:"queue_started_at,omitempty"`
 	ActiveRequestID             int64   `json:"-"`
@@ -4108,6 +4200,7 @@ type ReqeustLog struct {
 	startedAt                   time.Time
 	inputTokensIncludeCacheRead bool
 	attemptPersisted            bool
+	traffic                     *requestTrafficState
 }
 
 func (r *ReqeustLog) elapsedSinceStart() float64 {
@@ -4418,6 +4511,219 @@ type modelsProviderResponse struct {
 	body        []byte
 }
 
+type modelsListEntry struct {
+	id   string
+	body json.RawMessage
+}
+
+type modelsListEnvelope struct {
+	Object string            `json:"object"`
+	Data   []json.RawMessage `json:"data"`
+}
+
+type modelsFetchResult struct {
+	provider Provider
+	response *modelsProviderResponse
+	entries  []modelsListEntry
+	err      error
+}
+
+func parseModelsList(body []byte) ([]modelsListEntry, error) {
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, fmt.Errorf("invalid models response JSON: %w", err)
+	}
+	if len(envelope.Data) == 0 || bytes.Equal(bytes.TrimSpace(envelope.Data), []byte("null")) {
+		return nil, errors.New("models response is missing data array")
+	}
+
+	var rawEntries []json.RawMessage
+	if err := json.Unmarshal(envelope.Data, &rawEntries); err != nil {
+		return nil, fmt.Errorf("models response data is not an array: %w", err)
+	}
+	entries := make([]modelsListEntry, 0, len(rawEntries))
+	for _, rawEntry := range rawEntries {
+		var model struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(rawEntry, &model); err != nil {
+			return nil, fmt.Errorf("invalid model entry: %w", err)
+		}
+		model.ID = strings.TrimSpace(model.ID)
+		if model.ID == "" {
+			return nil, errors.New("model entry is missing id")
+		}
+		entries = append(entries, modelsListEntry{
+			id:   model.ID,
+			body: append(json.RawMessage(nil), rawEntry...),
+		})
+	}
+	return entries, nil
+}
+
+func reverseMappedModelAliases(provider Provider, upstreamModel string) []string {
+	if len(provider.ModelMapping) == 0 {
+		return nil
+	}
+
+	externalModels := make([]string, 0, len(provider.ModelMapping))
+	for externalModel := range provider.ModelMapping {
+		externalModels = append(externalModels, externalModel)
+	}
+	sort.Strings(externalModels)
+
+	aliases := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, externalPattern := range externalModels {
+		internalPattern := strings.TrimSpace(provider.ModelMapping[externalPattern])
+		externalPattern = strings.TrimSpace(externalPattern)
+		if externalPattern == "" || internalPattern == "" {
+			continue
+		}
+
+		alias := ""
+		switch {
+		case !strings.Contains(externalPattern, "*") && internalPattern == upstreamModel:
+			alias = externalPattern
+		case strings.Count(externalPattern, "*") == 1 &&
+			strings.Count(internalPattern, "*") == 1 &&
+			matchWildcard(internalPattern, upstreamModel):
+			alias = applyWildcardMapping(internalPattern, externalPattern, upstreamModel)
+		}
+		alias = strings.TrimSpace(alias)
+		if alias == "" || strings.Contains(alias, "*") {
+			continue
+		}
+		if _, ok := seen[alias]; ok {
+			continue
+		}
+		seen[alias] = struct{}{}
+		aliases = append(aliases, alias)
+	}
+	return aliases
+}
+
+func mapModelsListForProvider(entries []modelsListEntry, provider Provider) ([]modelsListEntry, error) {
+	mapped := make([]modelsListEntry, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	add := func(entry modelsListEntry, modelID string) error {
+		modelID = strings.TrimSpace(modelID)
+		if modelID == "" {
+			return nil
+		}
+		if _, ok := seen[modelID]; ok {
+			return nil
+		}
+		body := entry.body
+		if modelID != entry.id {
+			updated, err := sjson.SetBytes(body, "id", modelID)
+			if err != nil {
+				return fmt.Errorf("failed to expose mapped model %q: %w", modelID, err)
+			}
+			body = updated
+		}
+		seen[modelID] = struct{}{}
+		mapped = append(mapped, modelsListEntry{id: modelID, body: body})
+		return nil
+	}
+
+	for _, entry := range entries {
+		aliases := reverseMappedModelAliases(provider, entry.id)
+		if len(aliases) == 0 {
+			if err := add(entry, entry.id); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		for _, alias := range aliases {
+			if err := add(entry, alias); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return mapped, nil
+}
+
+func marshalModelsList(entries []modelsListEntry) ([]byte, error) {
+	data := make([]json.RawMessage, 0, len(entries))
+	for _, entry := range entries {
+		data = append(data, entry.body)
+	}
+	return json.Marshal(modelsListEnvelope{Object: "list", Data: data})
+}
+
+func mergeModelsFetchResults(results []modelsFetchResult) []modelsListEntry {
+	merged := make([]modelsListEntry, 0)
+	seen := make(map[string]struct{})
+	for _, result := range results {
+		for _, entry := range result.entries {
+			if _, ok := seen[entry.id]; ok {
+				continue
+			}
+			seen[entry.id] = struct{}{}
+			merged = append(merged, entry)
+		}
+	}
+	return merged
+}
+
+func applyModelsMappingToResponse(response *modelsProviderResponse, provider Provider) error {
+	if response == nil || len(provider.ModelMapping) == 0 {
+		return nil
+	}
+	entries, err := parseModelsList(response.body)
+	if err != nil {
+		return err
+	}
+	entries, err = mapModelsListForProvider(entries, provider)
+	if err != nil {
+		return err
+	}
+	body, err := marshalModelsList(entries)
+	if err != nil {
+		return fmt.Errorf("failed to encode mapped models response: %w", err)
+	}
+	response.body = body
+	response.contentType = "application/json"
+	response.header.Del("Content-Length")
+	response.header.Set("Content-Type", response.contentType)
+	return nil
+}
+
+func sanitizeModelsFailure(
+	response *modelsProviderResponse,
+	fetchErr error,
+	provider Provider,
+) (*modelsProviderResponse, error) {
+	if response != nil {
+		redactedBody := redactProviderSecret(string(response.body), provider)
+		if redactedBody != string(response.body) {
+			response.body = []byte(redactedBody)
+			response.header.Del("Content-Length")
+		}
+		for headerName, values := range response.header {
+			for valueIndex, value := range values {
+				values[valueIndex] = redactProviderSecret(value, provider)
+			}
+			response.header[headerName] = values
+		}
+		if fetchErr == nil {
+			bodySummary := summarizeBodyForError(redactedBody, 1000)
+			fetchErr = fmt.Errorf("upstream status %d: %s", response.statusCode, bodySummary)
+		}
+	}
+	if fetchErr == nil {
+		fetchErr = errors.New("empty models response")
+	}
+	redactedFetchError := redactProviderSecret(fetchErr.Error(), provider)
+	if redactedFetchError != fetchErr.Error() {
+		fetchErr = errors.New(redactedFetchError)
+	}
+	return response, fetchErr
+}
+
 func modelsPlatformCandidates(c *gin.Context, preferredKind string) []string {
 	seen := make(map[string]bool)
 	candidates := make([]string, 0, 3)
@@ -4491,7 +4797,9 @@ func writeModelsProviderResponse(c *gin.Context, response *modelsProviderRespons
 }
 
 func (prs *ProviderRelayService) fetchModelsFromProvider(
-	c *gin.Context,
+	ctx context.Context,
+	inboundHeaders http.Header,
+	rawQuery string,
 	provider Provider,
 	logPrefix string,
 ) (*modelsProviderResponse, error) {
@@ -4500,9 +4808,9 @@ func (prs *ProviderRelayService) fetchModelsFromProvider(
 		endpoint = "/v1/models"
 	}
 	targetURL := joinURL(provider.APIURL, endpoint)
-	targetURL = appendRawQuery(targetURL, c.Request.URL.RawQuery)
+	targetURL = appendRawQuery(targetURL, rawQuery)
 
-	headers := cloneHeaders(c.Request.Header)
+	headers := cloneHeaders(inboundHeaders)
 	removeInboundAuthHeaders(headers)
 	removeHopByHopHeaders(headers)
 	deleteHeaderCaseInsensitive(headers, "Accept-Encoding")
@@ -4532,12 +4840,12 @@ func (prs *ProviderRelayService) fetchModelsFromProvider(
 		err  error
 	)
 	for attempt := 0; attempt < 2; attempt++ {
-		req, requestErr := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, targetURL, nil)
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 		if requestErr != nil {
 			return nil, fmt.Errorf("failed to create request: %w", requestErr)
 		}
 		req.Header = cloneHeaders(headers)
-		client, _, clientErr := prs.requestClient(c.Request.Context())
+		client, _, clientErr := prs.requestClient(ctx)
 		if clientErr != nil {
 			if proxyErr, ok := isProxyRequestError(clientErr); ok {
 				prs.proxyManager.InvalidateProxy(proxyErr.PoolKey, proxyErr.Node)
@@ -4557,7 +4865,7 @@ func (prs *ProviderRelayService) fetchModelsFromProvider(
 				continue
 			}
 		}
-		if c.Request.Context().Err() != nil || errors.Is(err, context.Canceled) {
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 			return nil, fmt.Errorf("%w: %v", errClientAbort, err)
 		}
 		fmt.Printf("[%s] ✗ 请求失败: %s | 错误: %v\n", logPrefix, provider.Name, err)
@@ -4570,7 +4878,7 @@ func (prs *ProviderRelayService) fetchModelsFromProvider(
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		if c.Request.Context().Err() != nil || errors.Is(err, context.Canceled) {
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 			return nil, fmt.Errorf("%w: %v", errClientAbort, err)
 		}
 		fmt.Printf("[%s] ✗ 读取响应失败: %s | 错误: %v\n", logPrefix, provider.Name, err)
@@ -4583,6 +4891,44 @@ func (prs *ProviderRelayService) fetchModelsFromProvider(
 		contentType: resp.Header.Get("Content-Type"),
 		body:        body,
 	}, nil
+}
+
+func (prs *ProviderRelayService) fetchManagedModelsFromProviders(
+	c *gin.Context,
+	providers []Provider,
+	logPrefix string,
+) []modelsFetchResult {
+	results := make([]modelsFetchResult, len(providers))
+	if len(providers) == 0 {
+		return results
+	}
+
+	ctx := c.Request.Context()
+	headers := cloneHeaders(c.Request.Header)
+	rawQuery := c.Request.URL.RawQuery
+	var wg sync.WaitGroup
+	wg.Add(len(providers))
+	for index, provider := range providers {
+		index := index
+		provider := provider
+		go func() {
+			defer wg.Done()
+			result := modelsFetchResult{provider: provider}
+			result.response, result.err = prs.fetchModelsFromProvider(ctx, headers, rawQuery, provider, logPrefix)
+			if result.err == nil && result.response != nil &&
+				result.response.statusCode >= http.StatusOK && result.response.statusCode < http.StatusMultipleChoices {
+				entries, err := parseModelsList(result.response.body)
+				if err == nil {
+					entries, err = mapModelsListForProvider(entries, provider)
+				}
+				result.entries = entries
+				result.err = err
+			}
+			results[index] = result
+		}()
+	}
+	wg.Wait()
+	return results
 }
 
 // forwardModelsRequest 共享的 /v1/models 请求转发逻辑。
@@ -4653,12 +4999,91 @@ candidateLoop:
 			}
 
 			providers := providersFromAttemptPlan(plan)
+			if !accountPool && plan.pool.Mode == ProviderPoolModeManaged {
+				results := prs.fetchManagedModelsFromProviders(c, providers, logPrefix)
+				successCount := 0
+				allFailuresBlacklisted := true
+				var firstFailureResponse *modelsProviderResponse
+				var firstFailureErr error
+				var firstFailureWasProxy bool
+
+				for index := range results {
+					result := &results[index]
+					if result.err == nil && result.response != nil &&
+						result.response.statusCode >= http.StatusOK && result.response.statusCode < http.StatusMultipleChoices {
+						successCount++
+						fmt.Printf("[%s] ✓ 成功: %s | HTTP %d\n", logPrefix, result.provider.Name, result.response.statusCode)
+						prs.recordProviderSuccessForUser(plan.userID, candidate, plan.poolID, result.provider)
+						continue
+					}
+
+					if errors.Is(result.err, errClientAbort) || c.Request.Context().Err() != nil {
+						return result.err
+					}
+					result.response, result.err = sanitizeModelsFailure(result.response, result.err, result.provider)
+					fmt.Printf("[%s][WARN] Provider %s 模型列表失败: %v\n", logPrefix, result.provider.Name, result.err)
+					_, proxyFailure := isProxyRequestError(result.err)
+					blacklistedAfterFailure := false
+					if !proxyFailure {
+						blacklistedAfterFailure = prs.recordProviderFailureForUser(
+							plan.userID, candidate, plan.poolID, plan.pool, result.provider, result.err.Error(),
+						)
+					}
+					if !blacklistedAfterFailure {
+						allFailuresBlacklisted = false
+						if firstFailureErr == nil {
+							firstFailureErr = result.err
+							firstFailureWasProxy = proxyFailure
+							if result.response != nil &&
+								(result.response.statusCode < http.StatusOK || result.response.statusCode >= http.StatusMultipleChoices) {
+								firstFailureResponse = result.response
+							}
+						}
+					}
+				}
+
+				if c.Request.Context().Err() != nil {
+					return fmt.Errorf("%w: %v", errClientAbort, c.Request.Context().Err())
+				}
+				if successCount > 0 {
+					body, err := marshalModelsList(mergeModelsFetchResults(results))
+					if err != nil {
+						c.JSON(http.StatusBadGateway, gin.H{"error": "failed to encode models response"})
+						return err
+					}
+					c.Data(http.StatusOK, "application/json", body)
+					return nil
+				}
+				if allFailuresBlacklisted {
+					lastErr = errors.New("all managed models providers failed and were blacklisted")
+					continue candidateLoop
+				}
+				lastErr = firstFailureErr
+				if firstFailureWasProxy {
+					c.JSON(http.StatusBadGateway, gin.H{"error": "代理连接失败，请稍后重试"})
+					return firstFailureErr
+				}
+				if firstFailureResponse != nil {
+					writeModelsProviderResponse(c, firstFailureResponse)
+					return firstFailureErr
+				}
+				c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("请求失败: %v", firstFailureErr)})
+				return firstFailureErr
+			}
+
 			retryStrictAccountSelection := false
 			for i, provider := range providers {
 				fmt.Printf("[%s] 使用 Provider: %s | Platform: %s | Pool: %s | URL: %s\n",
 					logPrefix, provider.Name, candidate, plan.pool.Name, provider.APIURL)
 
-				response, fetchErr := prs.fetchModelsFromProvider(c, provider, logPrefix)
+				response, fetchErr := prs.fetchModelsFromProvider(
+					c.Request.Context(), c.Request.Header, c.Request.URL.RawQuery, provider, logPrefix,
+				)
+				if fetchErr == nil && response != nil && response.statusCode >= http.StatusOK && response.statusCode < http.StatusMultipleChoices {
+					if !accountPool {
+						fetchErr = applyModelsMappingToResponse(response, provider)
+					}
+				}
 				if fetchErr == nil && response != nil && response.statusCode >= http.StatusOK && response.statusCode < http.StatusMultipleChoices {
 					fmt.Printf("[%s] ✓ 成功: %s | HTTP %d\n", logPrefix, provider.Name, response.statusCode)
 					prs.recordProviderSuccessForUser(plan.userID, candidate, plan.poolID, provider)
@@ -4666,37 +5091,17 @@ candidateLoop:
 					return nil
 				}
 
-				if fetchErr == nil && response != nil {
-					redactedBody := redactProviderSecret(string(response.body), provider)
-					if redactedBody != string(response.body) {
-						response.body = []byte(redactedBody)
-						response.header.Del("Content-Length")
-					}
-					for headerName, values := range response.header {
-						for valueIndex, value := range values {
-							values[valueIndex] = redactProviderSecret(value, provider)
-						}
-						response.header[headerName] = values
-					}
-					if accountPool && isRequestScopedUpstream4xx(response.statusCode) {
-						// This status describes the caller's request, not this account
-						// key. Do not fail over or add an account-pool penalty.
-						response.header = clientErrorResponseHeaders(response.header)
-						writeModelsProviderResponse(c, response)
-						return nil
-					}
-					bodySummary := summarizeBodyForError(redactedBody, 1000)
-					fetchErr = fmt.Errorf("upstream status %d: %s", response.statusCode, bodySummary)
+				if accountPool && fetchErr == nil && response != nil && isRequestScopedUpstream4xx(response.statusCode) {
+					// This status describes the caller's request, not this account
+					// key. Do not fail over or add an account-pool penalty.
+					response, _ = sanitizeModelsFailure(response, nil, provider)
+					response.header = clientErrorResponseHeaders(response.header)
+					writeModelsProviderResponse(c, response)
+					return nil
 				}
-				if fetchErr == nil {
-					fetchErr = fmt.Errorf("empty models response")
-				}
+				response, fetchErr = sanitizeModelsFailure(response, fetchErr, provider)
 				if errors.Is(fetchErr, errClientAbort) {
 					return fetchErr
-				}
-				redactedFetchError := redactProviderSecret(fetchErr.Error(), provider)
-				if redactedFetchError != fetchErr.Error() {
-					fetchErr = errors.New(redactedFetchError)
 				}
 				lastErr = fetchErr
 				if accountPool {
@@ -4720,7 +5125,8 @@ candidateLoop:
 					break
 				}
 				if !blacklistedAfterFailure {
-					if response != nil {
+					if response != nil &&
+						(response.statusCode < http.StatusOK || response.statusCode >= http.StatusMultipleChoices) {
 						writeModelsProviderResponse(c, response)
 						return fetchErr
 					}

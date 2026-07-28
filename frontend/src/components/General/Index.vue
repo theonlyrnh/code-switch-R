@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, ref, onActivated, onDeactivated, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { Call } from '@wailsio/runtime'
 import ListItem from '../Setting/ListRow.vue'
@@ -7,6 +7,7 @@ import LanguageSwitcher from '../Setting/LanguageSwitcher.vue'
 import ThemeSetting from '../Setting/ThemeSetting.vue'
 import SecuritySettings from '../Setting/SecuritySettings.vue'
 import { fetchAppSettings, saveAppSettings, type AppSettings } from '../../services/appSettings'
+import { fetchTrafficSummary, type TrafficSummary } from '../../services/logs'
 import { logoutAdmin } from '../../services/adminAuth'
 import { extractErrorMessage } from '../../utils/error'
 import { showToast } from '../../utils/toast'
@@ -30,6 +31,12 @@ const proxyLatencyMaxConcurrency = ref(3)
 const settingsLoading = ref(true)
 const saveBusy = ref(false)
 const logoutBusy = ref(false)
+const trafficStats = ref<TrafficSummary | null>(null)
+const TRAFFIC_AUTO_REFRESH_INTERVAL_MS = 30_000
+let trafficAutoRefreshTimer: number | undefined
+let trafficStatsPromise: Promise<void> | null = null
+let isPageActive = false
+let isUnmounted = false
 
 const goBack = () => {
   router.push('/')
@@ -113,8 +120,129 @@ const persistAppSettings = async () => {
   }
 }
 
+const formatBytes = (value?: number) => {
+  const bytes = Math.max(Number(value) || 0, 0)
+  if (bytes < 1024) return `${Math.round(bytes)} B`
+  const units = ['KiB', 'MiB', 'GiB', 'TiB']
+  let amount = bytes / 1024
+  let unit = units[0]
+  for (let index = 1; index < units.length && amount >= 1024; index += 1) {
+    amount /= 1024
+    unit = units[index]
+  }
+  return `${amount >= 100 ? amount.toFixed(0) : amount >= 10 ? amount.toFixed(1) : amount.toFixed(2)} ${unit}`
+}
+
+const trafficBodyTotal = (value?: { ingress_bytes?: number; egress_bytes?: number } | null) =>
+  (value?.ingress_bytes ?? 0) + (value?.egress_bytes ?? 0)
+
+const trafficDirectionHint = (value?: { ingress_bytes?: number; egress_bytes?: number } | null) =>
+  t('components.general.traffic.inOut', {
+    ingress: formatBytes(value?.ingress_bytes),
+    egress: formatBytes(value?.egress_bytes),
+  })
+
+const trafficCards = computed(() => {
+  const data = trafficStats.value
+  return [
+    {
+      key: 'relay-client',
+      label: t('components.general.traffic.relayClient'),
+      value: data ? formatBytes(trafficBodyTotal(data.relay_client)) : '—',
+      hint: data ? trafficDirectionHint(data.relay_client) : '—',
+    },
+    {
+      key: 'upstream',
+      label: t('components.general.traffic.upstream'),
+      value: data ? formatBytes(trafficBodyTotal(data.upstream)) : '—',
+      hint: data ? trafficDirectionHint(data.upstream) : '—',
+    },
+    {
+      key: 'retry',
+      label: t('components.general.traffic.retry'),
+      value: data ? formatBytes(trafficBodyTotal(data.retry)) : '—',
+      hint: data ? trafficDirectionHint(data.retry) : '—',
+    },
+    {
+      key: 'admin',
+      label: t('components.general.traffic.admin'),
+      value: data ? formatBytes(trafficBodyTotal(data.admin)) : '—',
+      hint: data ? trafficDirectionHint(data.admin) : '—',
+    },
+  ]
+})
+
+const loadTrafficStats = (): Promise<void> => {
+  if (trafficStatsPromise) return trafficStatsPromise
+  trafficStatsPromise = fetchTrafficSummary()
+    .then((traffic) => {
+      if (!isUnmounted) trafficStats.value = traffic ?? null
+    })
+    .catch((error) => {
+      console.error('failed to load traffic stats', error)
+    })
+    .finally(() => {
+      trafficStatsPromise = null
+    })
+  return trafficStatsPromise
+}
+
+const canPollTraffic = () =>
+  isPageActive && !isUnmounted && document.visibilityState === 'visible'
+
+const stopTrafficAutoRefresh = () => {
+  if (trafficAutoRefreshTimer !== undefined) {
+    clearInterval(trafficAutoRefreshTimer)
+    trafficAutoRefreshTimer = undefined
+  }
+}
+
+const startTrafficAutoRefresh = () => {
+  stopTrafficAutoRefresh()
+  if (!canPollTraffic()) return
+  trafficAutoRefreshTimer = window.setInterval(() => {
+    if (canPollTraffic()) void loadTrafficStats()
+  }, TRAFFIC_AUTO_REFRESH_INTERVAL_MS)
+}
+
+const syncTrafficPollingState = () => {
+  if (canPollTraffic()) {
+    startTrafficAutoRefresh()
+  } else {
+    stopTrafficAutoRefresh()
+  }
+}
+
+const handleVisibilityChange = () => {
+  syncTrafficPollingState()
+  if (canPollTraffic()) void loadTrafficStats()
+}
+
 onMounted(async () => {
-  await loadAppSettings()
+  isUnmounted = false
+  isPageActive = true
+  document.addEventListener('visibilitychange', handleVisibilityChange)
+  await Promise.all([loadAppSettings(), loadTrafficStats()])
+  syncTrafficPollingState()
+})
+
+onActivated(() => {
+  const wasActive = isPageActive
+  isPageActive = true
+  syncTrafficPollingState()
+  if (!wasActive && canPollTraffic()) void loadTrafficStats()
+})
+
+onDeactivated(() => {
+  isPageActive = false
+  syncTrafficPollingState()
+})
+
+onUnmounted(() => {
+  isUnmounted = true
+  isPageActive = false
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+  stopTrafficAutoRefresh()
 })
 </script>
 
@@ -241,6 +369,25 @@ onMounted(async () => {
           </ListItem>
         </div>
       </section>
+
+      <section class="traffic-settings-section">
+        <div class="traffic-section-heading">
+          <h2 class="mac-section-title">{{ $t('components.general.traffic.title') }}</h2>
+          <span>{{ $t('components.general.traffic.window') }}</span>
+        </div>
+        <div class="mac-panel traffic-panel">
+          <p v-if="trafficStats?.dropped_events" class="traffic-warning">
+            {{ $t('components.general.traffic.dropped', { count: trafficStats.dropped_events }) }}
+          </p>
+          <div class="traffic-grid">
+            <article v-for="card in trafficCards" :key="card.key" class="traffic-metric">
+              <div class="traffic-metric__label">{{ card.label }}</div>
+              <div class="traffic-metric__value">{{ card.value }}</div>
+              <div class="traffic-metric__hint">{{ card.hint }}</div>
+            </article>
+          </div>
+        </div>
+      </section>
     </div>
   </div>
 </template>
@@ -275,6 +422,52 @@ onMounted(async () => {
 
 .mac-panel + .mac-panel {
   margin-top: 12px;
+}
+
+.traffic-section-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.traffic-section-heading span {
+  color: var(--mac-text-secondary);
+  font-size: 12px;
+}
+
+.traffic-panel {
+  padding: 18px;
+}
+
+.traffic-warning {
+  margin: 0 0 14px;
+  color: #dc2626;
+  font-size: 12px;
+}
+
+.traffic-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.traffic-metric {
+  min-width: 0;
+}
+
+.traffic-metric__label,
+.traffic-metric__hint {
+  color: var(--mac-text-secondary);
+  font-size: 12px;
+}
+
+.traffic-metric__value {
+  margin: 6px 0 4px;
+  color: var(--mac-text);
+  font-size: 18px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
 }
 
 .settings-logout-button {
@@ -331,6 +524,16 @@ onMounted(async () => {
 }
 
 @media (max-width: 760px) {
+  .traffic-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .traffic-section-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
+
   .mac-input {
     width: 100%;
     min-width: 0;

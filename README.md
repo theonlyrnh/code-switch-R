@@ -332,7 +332,7 @@ sudo systemctl status codeswitch.service --no-pager -l
 
 - 只改前端：上传 `frontend/dist`，通常不需要重启。
 - 改了 Go 后端、路由、数据结构、relay、服务逻辑：上传 `codeswitch-web` 和 `frontend/dist`，然后由操作员重启服务。
-- 只改 `scripts/manage-users` 或 `manage-users-bin`：只上传脚本和二进制，不需要重启服务。
+- 只改 `cmd/manage-users`：重新构建并上传用户管理脚本和二进制，不需要重启服务。
 
 ### 纯前端发布
 
@@ -448,6 +448,8 @@ df -h "$HOME/.code-switch"
 
 迁移命令采用 fail-closed 校验：它会先打印目标 `app.db` 的绝对路径和字节数，只以 `mode=rw` 打开既有数据库，并要求 `request_log` 已存在且至少有一条记录。目标数据库不存在、不是普通文件、缺少 `request_log` 或表为空时，命令会非零退出，不会创建配置目录、数据库、索引或统计汇总。执行前必须核对打印路径确实是生产数据库。新库或空库会在正常启动时只创建空汇总结构和 trigger，并自动标记可用，不会扫描 `request_log`。
 
+流量统计字段和 `traffic_daily`、`traffic_metadata` 两张小表由服务正常启动时自动创建，不需要执行 `migrate-request-log-indexes`。新增 `request_log` 字段使用 SQLite 的 `ALTER TABLE ... ADD COLUMN`，不会扫描历史请求行。API 客户端、每次上游尝试和管理端请求结束后，只有能够明确归类为公网且能够关联到用户的正文流量才会累加到北京时间当天的统计行；本地回环、无法判断网络范围或无法关联用户的事件不会进入日志页统计。日志页分别展示 API 客户端、上游供应商、重试额外和管理端正文的入站/出站累计值，查询只按主键读取当前用户当天的少量聚合行，不回扫 `request_log` 或流量明细。旧版本若已创建 `traffic_event`，升级后的首次启动只接续当天可归因的公网正文并写入迁移标记，之后启动不会再扫描或写入该明细表；旧的网卡统计表会保留但不再读写。正文统计位于反向代理压缩前，不包含 HTTP/TLS 开销，默认保留 30 天。
+
 确认满足迁移执行条件后，下面命令由服务器操作员手动执行。发布者只有在看到明确迁移提示时才需要通知操作员执行。迁移命令必须由 systemd 配置中的服务用户直接运行，不能加 `sudo`，否则会解析到错误的 HOME/数据库路径：
 
 ```bash
@@ -489,12 +491,11 @@ mkdir -p "$ARTIFACT_DIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 SSH_TARGET="<用户提供的 SSH 别名或 user@host>"
 REMOTE_DIR="~/apps/code-switch"
-MANAGE_USERS_BIN="$ARTIFACT_DIR/manage-users-bin.$STAMP"
+MANAGE_USERS_ARTIFACT="$ARTIFACT_DIR/manage-users.$STAMP"
 
-go build -o "$MANAGE_USERS_BIN" ./cmd/manage-users
+go build -o "$MANAGE_USERS_ARTIFACT" ./cmd/manage-users
 ssh "$SSH_TARGET" "mkdir -p $REMOTE_DIR/scripts"
-scp scripts/manage-users "$SSH_TARGET:$REMOTE_DIR/scripts/manage-users.new"
-scp "$MANAGE_USERS_BIN" "$SSH_TARGET:$REMOTE_DIR/scripts/manage-users-bin.new"
+scp "$MANAGE_USERS_ARTIFACT" "$SSH_TARGET:$REMOTE_DIR/scripts/manage-users.new"
 
 ssh "$SSH_TARGET" "
   set -e
@@ -503,13 +504,8 @@ ssh "$SSH_TARGET" "
   if [ -f scripts/manage-users ]; then
     cp scripts/manage-users scripts/manage-users.bak.$STAMP
   fi
-  if [ -f scripts/manage-users-bin ]; then
-    cp scripts/manage-users-bin scripts/manage-users-bin.bak.$STAMP
-  fi
-
   mv scripts/manage-users.new scripts/manage-users
-  mv scripts/manage-users-bin.new scripts/manage-users-bin
-  chmod +x scripts/manage-users scripts/manage-users-bin
+  chmod +x scripts/manage-users
 "
 ```
 

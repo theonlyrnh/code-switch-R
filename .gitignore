@@ -11,6 +11,7 @@ CLAUDE.md
 reference/
 codeswitch-web
 /codeswitch
+/scripts/
 /.claude/worktrees/
 /.test/
 /build.sh

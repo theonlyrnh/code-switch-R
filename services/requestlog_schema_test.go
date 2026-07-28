@@ -86,6 +86,41 @@ func TestRequestLogIndexesAreAutomaticOnlyForEmptyTables(t *testing.T) {
 	})
 }
 
+func TestTrafficColumnsUpgradePopulatedRequestLogWithoutMaintenanceMigration(t *testing.T) {
+	db := openRequestLogSchemaTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE request_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		t.Fatalf("create legacy request_log: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO request_log (user_id) VALUES ('legacy-user')`); err != nil {
+		t.Fatalf("insert legacy row: %v", err)
+	}
+	if err := ensureRequestLogTableWithDB(db); err != nil {
+		t.Fatalf("upgrade request_log: %v", err)
+	}
+	if err := ensureTrafficSchema(db); err != nil {
+		t.Fatalf("ensure traffic schema: %v", err)
+	}
+
+	var userID, traceID, scope string
+	var clientRequestBytes, upstreamAttempts int64
+	if err := db.QueryRow(`
+		SELECT user_id, COALESCE(traffic_trace_id, ''), COALESCE(client_network_scope, ''),
+			client_request_bytes, upstream_attempts
+		FROM request_log WHERE id = 1`).Scan(
+		&userID, &traceID, &scope, &clientRequestBytes, &upstreamAttempts,
+	); err != nil {
+		t.Fatalf("read upgraded legacy row: %v", err)
+	}
+	if userID != "legacy-user" || traceID != "" || scope != "" || clientRequestBytes != 0 || upstreamAttempts != 0 {
+		t.Fatalf("upgraded legacy row changed unexpectedly: user=%q trace=%q scope=%q client=%d attempts=%d",
+			userID, traceID, scope, clientRequestBytes, upstreamAttempts)
+	}
+}
+
 func TestExplicitRequestLogIndexMigrationIsIdempotentAndUsesExpectedPlans(t *testing.T) {
 	db := openRequestLogSchemaTestDB(t)
 	if err := ensureRequestLogTableWithDB(db); err != nil {

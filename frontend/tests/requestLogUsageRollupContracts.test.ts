@@ -60,3 +60,32 @@ test('Logs refreshes rollup stats only on initial load, new completions, and man
   assert.doesNotMatch(timer, /loadStats\(|fetchLogStats\(/)
   assert.doesNotMatch(source, /stats(?:Refresh|Polling|AutoRefresh)Timer/i)
 })
+
+test('Settings reads today traffic counters by point lookup and refreshes them every 30 seconds', async () => {
+  const logsPageSource = await readSource('../src/components/Logs/Index.vue')
+  const settingsPageSource = await readSource('../src/components/General/Index.vue')
+  const serviceSource = await readSource('../src/services/logs.ts')
+
+  assert.match(serviceSource, /TrafficService\.Today/)
+  assert.doesNotMatch(serviceSource, /TrafficService\.SummarySince/)
+  assert.match(serviceSource, /relay_client: TrafficBreakdown/)
+  assert.match(serviceSource, /ingress_bytes: number/)
+  assert.match(serviceSource, /egress_bytes: number/)
+  assert.doesNotMatch(serviceSource, /network_interface|relay_client_public|relay_client_local/)
+  assert.doesNotMatch(logsPageSource, /fetchTrafficSummary|trafficCards|traffic-band/)
+  assert.match(settingsPageSource, /TRAFFIC_AUTO_REFRESH_INTERVAL_MS = 30_000/)
+  assert.match(settingsPageSource, /trafficBodyTotal\(data\.relay_client\)/)
+  assert.match(settingsPageSource, /trafficBodyTotal\(data\.upstream\)/)
+  assert.match(settingsPageSource, /trafficBodyTotal\(data\.retry\)/)
+  assert.match(settingsPageSource, /trafficBodyTotal\(data\.admin\)/)
+  assert.doesNotMatch(settingsPageSource, /interface-public|key: 'local'/)
+
+  const timer = topLevelBlock(
+    settingsPageSource,
+    'const startTrafficAutoRefresh = () =>',
+    '\nconst syncTrafficPollingState =',
+  )
+  assert.match(timer, /setInterval\(/)
+  assert.match(timer, /loadTrafficStats\(\)/)
+  assert.doesNotMatch(timer, /fetchLogStats\(/)
+})

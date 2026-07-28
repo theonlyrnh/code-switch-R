@@ -118,6 +118,19 @@ func (ls *LogService) ListCompletedRequestLogsForUser(userID string, afterID int
 			FirstTextSec:            firstTextSec,
 			Status:                  requestLogStatusCompleted,
 			RetryRequested:          retryRequested,
+			TrafficTraceID:          record.GetString("traffic_trace_id"),
+			ClientNetworkScope:      record.GetString("client_network_scope"),
+			ClientRequestBytes:      record.GetInt64("client_request_bytes"),
+			ClientResponseBytes:     record.GetInt64("client_response_bytes"),
+			UpstreamRequestBytes:    record.GetInt64("upstream_request_bytes"),
+			UpstreamResponseBytes:   record.GetInt64("upstream_response_bytes"),
+			RetryRequestBytes:       record.GetInt64("retry_request_bytes"),
+			RetryResponseBytes:      record.GetInt64("retry_response_bytes"),
+			UpstreamAttempts:        record.GetInt("upstream_attempts"),
+			PublicIngressBytes:      record.GetInt64("public_ingress_bytes"),
+			PublicEgressBytes:       record.GetInt64("public_egress_bytes"),
+			LocalIngressBytes:       record.GetInt64("local_ingress_bytes"),
+			LocalEgressBytes:        record.GetInt64("local_egress_bytes"),
 		}
 		logs = append(logs, logEntry)
 	}
@@ -369,16 +382,18 @@ func (ls *LogService) ProviderDailyStatsForUser(userID string, platform string) 
 }
 
 func (ls *LogService) ListHTTPErrorConsoleLogsForUser(userID string, limit int, since time.Time) ([]ConsoleLog, error) {
+	logs, _, err := ls.ListHTTPErrorConsoleLogsForUserAfterID(userID, 0, limit, since)
+	return logs, err
+}
+
+// ListHTTPErrorConsoleLogsForUserAfterID uses request_log.id as its cursor so
+// multiple errors created in the same second cannot be skipped by polling.
+func (ls *LogService) ListHTTPErrorConsoleLogsForUserAfterID(userID string, afterID int64, limit int, since time.Time) ([]ConsoleLog, int64, error) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
-		return nil, errors.New("用户 ID 不能为空")
+		return nil, afterID, errors.New("用户 ID 不能为空")
 	}
-	if limit <= 0 {
-		limit = 200
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
+	limit = normalizeConsoleLogLimit(limit)
 
 	query := `
 		SELECT
@@ -393,8 +408,9 @@ func (ls *LogService) ListHTTPErrorConsoleLogsForUser(userID string, limit int, 
 			COALESCE(created_at, '')
 		FROM request_log
 		WHERE user_id = ?
-			AND http_code >= 400`
-	args := []any{userID}
+			AND http_code >= 400
+			AND id > ?`
+	args := []any{userID, afterID}
 	if !since.IsZero() {
 		query += " AND created_at >= ?"
 		args = append(args, since.UTC().Format(timeLayout))
@@ -404,14 +420,14 @@ func (ls *LogService) ListHTTPErrorConsoleLogsForUser(userID string, limit int, 
 
 	db, err := xdb.DB("default")
 	if err != nil {
-		return nil, err
+		return nil, afterID, err
 	}
 	rows, err := db.Query(query, args...)
 	if err != nil {
 		if isNoSuchTableErr(err) {
-			return []ConsoleLog{}, nil
+			return []ConsoleLog{}, afterID, nil
 		}
-		return nil, err
+		return nil, afterID, err
 	}
 	defer rows.Close()
 
@@ -440,18 +456,22 @@ func (ls *LogService) ListHTTPErrorConsoleLogsForUser(userID string, limit int, 
 			&record.durationSec,
 			&record.createdAt,
 		); err != nil {
-			return nil, err
+			return nil, afterID, err
 		}
 		records = append(records, record)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, afterID, err
 	}
 
 	keyNames := ls.relayKeyNameMapForUser(userID)
 	logs := make([]ConsoleLog, 0, len(records))
+	nextID := afterID
 	for i := len(records) - 1; i >= 0; i-- {
 		record := records[i]
+		if record.id > nextID {
+			nextID = record.id
+		}
 		createdAt, _ := parseLogTimestamp(record.createdAt)
 		if createdAt.IsZero() {
 			createdAt = time.Now().In(beijingLocation)
@@ -479,7 +499,7 @@ func (ls *LogService) ListHTTPErrorConsoleLogsForUser(userID string, limit int, 
 			Message:   message,
 		})
 	}
-	return logs, nil
+	return logs, nextID, nil
 }
 
 func emptyAsUnknown(value string) string {

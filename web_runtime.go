@@ -33,6 +33,7 @@ type appRuntime struct {
 	codexSettings      *services.CodexSettingsService
 	cliConfigService   *services.CliConfigService
 	logService         *services.LogService
+	trafficService     *services.TrafficService
 	costService        *services.CostService
 	appSettings        *services.AppSettingsService
 	adminAuth          *services.AdminAuthService
@@ -62,7 +63,6 @@ func newAppRuntime() (*appRuntime, error) {
 	if err := services.InitGlobalDBQueue(); err != nil {
 		return nil, fmt.Errorf("初始化数据库队列失败: %w", err)
 	}
-
 	providerService := services.NewProviderService()
 	settingsService := services.NewSettingsService()
 	appSettings := services.NewAppSettingsService(nil)
@@ -108,8 +108,14 @@ func newAppRuntime() (*appRuntime, error) {
 	}
 	versionService := NewVersionService()
 	consoleService := services.NewConsoleService()
+	trafficService, err := services.NewTrafficService()
+	if err != nil {
+		return nil, fmt.Errorf("初始化流量统计服务失败: %w", err)
+	}
+	providerRelay.SetTrafficService(trafficService)
 
 	if err := providerRelay.Start(); err != nil {
+		trafficService.Stop()
 		return nil, fmt.Errorf("启动代理服务失败: %w", err)
 	}
 
@@ -151,6 +157,7 @@ func newAppRuntime() (*appRuntime, error) {
 		codexSettings:      codexSettings,
 		cliConfigService:   cliConfigService,
 		logService:         logService,
+		trafficService:     trafficService,
 		costService:        costService,
 		appSettings:        appSettings,
 		adminAuth:          adminAuth,
@@ -190,6 +197,9 @@ func (rt *appRuntime) shutdown() {
 	if rt.proxyService != nil {
 		rt.proxyService.Stop()
 	}
+	if rt.trafficService != nil {
+		rt.trafficService.Stop()
+	}
 
 	if err := services.ShutdownGlobalDBQueue(10 * time.Second); err != nil {
 		log.Printf("数据库队列关闭超时: %v", err)
@@ -205,6 +215,7 @@ func (rt *appRuntime) registerServices(registry *rpcRegistry) {
 	registry.Register("codeswitch/services.CodexSettingsService", &userScopedCodexSettingsService{base: rt.codexSettings})
 	registry.Register("codeswitch/services.CliConfigService", &userScopedCliConfigService{})
 	registry.Register("codeswitch/services.LogService", &userScopedLogService{base: rt.logService})
+	registry.Register("codeswitch/services.TrafficService", &userScopedTrafficService{base: rt.trafficService})
 	registry.Register("codeswitch/services.CostService", &userScopedCostService{base: rt.costService, poolService: rt.poolService})
 	registry.Register("codeswitch/services.AppSettingsService", rt.appSettings)
 	registry.Register("codeswitch/services.MCPService", rt.mcpService)

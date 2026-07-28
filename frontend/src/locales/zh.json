@@ -668,6 +668,16 @@
       }
     },
     "general": {
+      "traffic": {
+        "title": "可归因公网正文流量",
+        "window": "今日累计（北京时间）",
+        "relayClient": "API 客户端正文",
+        "upstream": "上游供应商正文",
+        "retry": "重试额外正文",
+        "admin": "管理端正文",
+        "inOut": "入 {ingress} · 出 {egress}",
+        "dropped": "累计写入异常，当前进程已丢失 {count} 条事件"
+      },
       "title": {
         "power": "权限设置",
         "application": "应用设置",

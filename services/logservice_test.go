@@ -225,3 +225,40 @@ func TestListHTTPErrorConsoleLogsForUserFiltersAndOrders(t *testing.T) {
 		t.Fatalf("recent logs = %#v", recent)
 	}
 }
+
+func TestListHTTPErrorConsoleLogsForUserAfterIDDoesNotMissSameSecondRows(t *testing.T) {
+	setupCostServiceTestDB(t)
+	stamp := time.Now().UTC().Truncate(time.Second).Format(timeLayout)
+	insertCostLog(t, map[string]any{
+		"user_id":       "user-a",
+		"http_code":     500,
+		"error_message": "first error",
+		"created_at":    stamp,
+	})
+
+	service := NewLogService()
+	initial, cursor, err := service.ListHTTPErrorConsoleLogsForUserAfterID("user-a", 0, 200, time.Time{})
+	if err != nil {
+		t.Fatalf("initial incremental logs failed: %v", err)
+	}
+	if len(initial) != 1 || cursor <= 0 {
+		t.Fatalf("initial logs = %#v, cursor = %d", initial, cursor)
+	}
+
+	insertCostLog(t, map[string]any{
+		"user_id":       "user-a",
+		"http_code":     502,
+		"error_message": "second error",
+		"created_at":    stamp,
+	})
+	updates, next, err := service.ListHTTPErrorConsoleLogsForUserAfterID("user-a", cursor, 200, time.Time{})
+	if err != nil {
+		t.Fatalf("incremental logs failed: %v", err)
+	}
+	if len(updates) != 1 || !strings.Contains(updates[0].Message, "second error") {
+		t.Fatalf("updates = %#v, want same-second second error", updates)
+	}
+	if next <= cursor {
+		t.Fatalf("next cursor = %d, want greater than %d", next, cursor)
+	}
+}

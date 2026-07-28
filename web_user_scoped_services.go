@@ -356,6 +356,21 @@ type userScopedLogService struct {
 	base *services.LogService
 }
 
+type userScopedTrafficService struct {
+	base *services.TrafficService
+}
+
+func (s *userScopedTrafficService) Today(ctx context.Context) (services.TrafficSummary, error) {
+	if s == nil || s.base == nil {
+		return services.TrafficSummary{}, errors.New("流量统计服务不可用")
+	}
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return services.TrafficSummary{}, err
+	}
+	return s.base.SummaryTodayForUser(user.ID)
+}
+
 func (s *userScopedLogService) ListActiveRequestLogs(ctx context.Context) ([]services.ReqeustLog, error) {
 	user, err := authenticatedUserFromContext(ctx)
 	if err != nil {
@@ -820,6 +835,46 @@ func (s *userScopedConsoleService) GetRecentLogs(ctx context.Context, count int)
 		return nil, err
 	}
 	return s.listLogs(user.ID, count)
+}
+
+func (s *userScopedConsoleService) GetLogUpdates(ctx context.Context, cursor services.ConsoleLogCursor, limit int) (services.ConsoleLogBatch, error) {
+	user, err := authenticatedUserFromContext(ctx)
+	if err != nil {
+		return services.ConsoleLogBatch{}, err
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	since := s.clearTimeForUser(user.ID)
+	logs := make([]services.ConsoleLog, 0, limit)
+	if s.logService != nil {
+		var finalLogs []services.ConsoleLog
+		finalLogs, cursor.RequestLogID, err = s.logService.ListHTTPErrorConsoleLogsForUserAfterID(
+			user.ID,
+			cursor.RequestLogID,
+			limit,
+			since,
+		)
+		if err != nil {
+			return services.ConsoleLogBatch{}, err
+		}
+		logs = append(logs, finalLogs...)
+	}
+	if s.poolAttemptLogs != nil {
+		var attemptLogs []services.ConsoleLog
+		attemptLogs, cursor.PoolAttemptSequence = s.poolAttemptLogs.ListAfter(
+			user.ID,
+			cursor.PoolAttemptSequence,
+			limit,
+			since,
+		)
+		logs = append(logs, attemptLogs...)
+	}
+	sort.SliceStable(logs, func(i, j int) bool { return logs[i].Timestamp.Before(logs[j].Timestamp) })
+	if len(logs) > limit {
+		logs = logs[len(logs)-limit:]
+	}
+	return services.ConsoleLogBatch{Logs: logs, Cursor: cursor}, nil
 }
 
 func (s *userScopedConsoleService) listLogs(userID string, limit int) ([]services.ConsoleLog, error) {

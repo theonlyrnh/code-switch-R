@@ -195,6 +195,7 @@ func newAdminServer(rt *appRuntime) *http.Server {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
 	router.Use(adminSecurityMiddleware(rt.adminSecurity))
+	router.Use(adminTrafficMiddleware(rt))
 
 	registry := newRPCRegistry()
 	rt.registerServices(registry)
@@ -220,6 +221,7 @@ func newAdminServer(rt *appRuntime) *http.Server {
 			})
 			return
 		}
+		c.Set(adminTrafficRouteContextKey, request.Name)
 
 		result, err := registry.Call(c.Request.Context(), request.Name, request.Args)
 		if err != nil {

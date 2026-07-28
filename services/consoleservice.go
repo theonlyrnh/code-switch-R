@@ -15,11 +15,26 @@ type ConsoleLog struct {
 	Timestamp time.Time `json:"timestamp"`
 	Level     string    `json:"level"` // INFO, WARN, ERROR
 	Message   string    `json:"message"`
+	sequence  uint64
+}
+
+// ConsoleLogCursor tracks each console source independently so polling can be
+// incremental without relying on timestamps that may only have second precision.
+type ConsoleLogCursor struct {
+	RequestLogID        int64  `json:"request_log_id"`
+	PoolAttemptSequence uint64 `json:"pool_attempt_sequence"`
+	ConsoleSequence     uint64 `json:"console_sequence"`
+}
+
+type ConsoleLogBatch struct {
+	Logs   []ConsoleLog     `json:"logs"`
+	Cursor ConsoleLogCursor `json:"cursor"`
 }
 
 // ConsoleService 控制台日志服务
 type ConsoleService struct {
 	logs         []ConsoleLog
+	nextSequence uint64
 	mutex        sync.RWMutex
 	maxLogs      int
 	writer       *consoleWriter
@@ -114,10 +129,12 @@ func (cs *ConsoleService) addLog(level, message string) {
 	cs.mutex.Lock()
 	defer cs.mutex.Unlock()
 
+	cs.nextSequence++
 	log := ConsoleLog{
 		Timestamp: time.Now(),
 		Level:     level,
 		Message:   message,
+		sequence:  cs.nextSequence,
 	}
 
 	cs.logs = append(cs.logs, log)
@@ -188,6 +205,38 @@ func (cs *ConsoleService) GetRecentLogs(count int) []ConsoleLog {
 	result := make([]ConsoleLog, count)
 	copy(result, cs.logs[len(cs.logs)-count:])
 	return result
+}
+
+// GetLogUpdates returns only entries added after cursor. The first call uses a
+// zero cursor and therefore returns the current bounded console snapshot.
+func (cs *ConsoleService) GetLogUpdates(cursor ConsoleLogCursor, limit int) ConsoleLogBatch {
+	cs.pauseLogging = true
+	defer func() { cs.pauseLogging = false }()
+
+	limit = normalizeConsoleLogLimit(limit)
+	cs.mutex.RLock()
+	defer cs.mutex.RUnlock()
+
+	start := len(cs.logs)
+	for i, entry := range cs.logs {
+		if entry.sequence > cursor.ConsoleSequence {
+			start = i
+			break
+		}
+	}
+	if available := len(cs.logs) - start; available > limit {
+		start = len(cs.logs) - limit
+	}
+	result := append([]ConsoleLog(nil), cs.logs[start:]...)
+	cursor.ConsoleSequence = cs.nextSequence
+	return ConsoleLogBatch{Logs: result, Cursor: cursor}
+}
+
+func normalizeConsoleLogLimit(limit int) int {
+	if limit <= 0 || limit > 1000 {
+		return 200
+	}
+	return limit
 }
 
 // ClearLogs 清空日志

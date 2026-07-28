@@ -115,6 +115,9 @@ func initDatabase() error {
 	if err := ensureRequestLogTable(); err != nil {
 		return fmt.Errorf("初始化 request_log 表失败: %w", err)
 	}
+	if err := ensureTrafficSchema(db); err != nil {
+		return fmt.Errorf("初始化流量统计表失败: %w", err)
+	}
 	if err := ensureAppSettingsTable(); err != nil {
 		return fmt.Errorf("初始化 app_settings 表失败: %w", err)
 	}

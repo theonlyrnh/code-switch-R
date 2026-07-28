@@ -26,6 +26,19 @@ export type RequestLog = {
   created_at: string
   status?: 'queued' | 'processing' | 'retrying' | 'completed' | string
   retry_requested?: boolean
+  traffic_trace_id?: string
+  client_network_scope?: 'local' | 'public' | 'unknown' | string
+  client_request_bytes?: number
+  client_response_bytes?: number
+  upstream_request_bytes?: number
+  upstream_response_bytes?: number
+  retry_request_bytes?: number
+  retry_response_bytes?: number
+  upstream_attempts?: number
+  public_ingress_bytes?: number
+  public_egress_bytes?: number
+  local_ingress_bytes?: number
+  local_egress_bytes?: number
   queue_position?: number
   queue_started_at?: string
 }
@@ -81,6 +94,27 @@ export type LogStats = {
 
 export const fetchLogStats = async (platform: LogPlatform | '' = ''): Promise<LogStats> => {
   return Call.ByName('codeswitch/services.LogService.StatsSince', platform)
+}
+
+export type TrafficBreakdown = {
+  ingress_bytes: number
+  egress_bytes: number
+  events: number
+}
+
+export type TrafficSummary = {
+  since: string
+  generated_at: string
+  relay_client: TrafficBreakdown
+  upstream: TrafficBreakdown
+  retry: TrafficBreakdown
+  admin: TrafficBreakdown
+  accounting_description: string
+  dropped_events: number
+}
+
+export const fetchTrafficSummary = async (): Promise<TrafficSummary> => {
+  return Call.ByName('codeswitch/services.TrafficService.Today')
 }
 
 export type ProviderDailyStat = {

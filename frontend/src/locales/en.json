@@ -667,6 +667,16 @@
       }
     },
     "general": {
+      "traffic": {
+        "title": "Attributable public body traffic",
+        "window": "Today (Beijing time)",
+        "relayClient": "API client bodies",
+        "upstream": "Upstream bodies",
+        "retry": "Retry overhead",
+        "admin": "Admin bodies",
+        "inOut": "In {ingress} · out {egress}",
+        "dropped": "A counter update failed; {count} events were dropped by this process"
+      },
       "title": {
         "application": "Apply settings",
         "trayPanel": "Tray panel",

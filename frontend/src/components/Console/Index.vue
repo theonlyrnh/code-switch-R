@@ -16,6 +16,24 @@ interface ConsoleLog {
   message: string
 }
 
+interface ConsoleLogCursor {
+  request_log_id: number
+  pool_attempt_sequence: number
+  console_sequence: number
+}
+
+interface ConsoleLogBatch {
+  logs: ConsoleLog[]
+  cursor: ConsoleLogCursor
+}
+
+const MAX_CONSOLE_LOGS = 200
+const emptyCursor = (): ConsoleLogCursor => ({
+  request_log_id: 0,
+  pool_attempt_sequence: 0,
+  console_sequence: 0,
+})
+
 const router = useRouter()
 const logs = ref<ConsoleLog[]>([])
 const autoScroll = ref(true)
@@ -28,6 +46,7 @@ let isUnmounted = false
 let initialLoadDone = false
 let clearInProgress = false
 let logsViewGeneration = 0
+let logCursor = emptyCursor()
 
 const canPoll = () =>
   isPageActive
@@ -46,19 +65,25 @@ const goBack = () => {
 }
 
 const loadLogs = (): Promise<void> => {
-  if (clearInProgress) return Promise.resolve()
+  if (clearInProgress || hasSelectedConsoleText()) return Promise.resolve()
   if (!loadLogsPromise) {
     const requestGeneration = logsViewGeneration
     loadLogsPromise = (async () => {
       try {
-        const result = await Call.ByName('codeswitch/services.ConsoleService.GetLogs')
+        const result = await Call.ByName(
+          'codeswitch/services.ConsoleService.GetLogUpdates',
+          logCursor,
+          MAX_CONSOLE_LOGS,
+        ) as ConsoleLogBatch
         if (isUnmounted || requestGeneration !== logsViewGeneration) return
-        // Vue replaces the log rows when this value changes. Preserve a user's
-        // native text selection so Ctrl/Cmd+C can copy any individual entry.
+        // A selection may have started while this request was in flight. Keep
+        // the cursor unchanged so the update is fetched after copying.
         if (hasSelectedConsoleText()) return
-        logs.value = result as ConsoleLog[]
+        const incoming = result?.logs ?? []
+        logs.value = [...logs.value, ...incoming].slice(-MAX_CONSOLE_LOGS)
+        logCursor = result?.cursor ?? logCursor
 
-        if (autoScroll.value && isPageActive) {
+        if (incoming.length > 0 && autoScroll.value && isPageActive) {
           await nextTick()
           if (!isUnmounted && isPageActive) {
             scrollToBottom()
@@ -118,6 +143,7 @@ const clearLogs = async () => {
     await Call.ByName('codeswitch/services.ConsoleService.ClearLogs')
     logsViewGeneration += 1
     logs.value = []
+    logCursor = emptyCursor()
   } catch (error) {
     console.error('清空日志失败:', error)
     alert('清空失败：' + (error as Error).message)
