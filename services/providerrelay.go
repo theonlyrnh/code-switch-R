@@ -2481,6 +2481,7 @@ func (prs *ProviderRelayService) forwardRequestWithLog(
 ) (ok bool, err error) {
 	targetURL := joinURL(provider.APIURL, endpoint)
 	headers := cloneHeaders(clientHeaders)
+	stripClientAddressHeadersForLocalRelay(headers, targetURL)
 
 	// ========== count_tokens 本地估算（协议转换之前拦截）==========
 	if kind == "claude" && strings.HasSuffix(endpoint, "/count_tokens") {
@@ -3827,6 +3828,25 @@ func removeInboundAuthHeaders(headers any) {
 	deleteHeaderCaseInsensitive(headers, "authorization")
 	deleteHeaderCaseInsensitive(headers, "x-api-key")
 	deleteHeaderCaseInsensitive(headers, codexRelayKeyHeader)
+}
+
+func stripClientAddressHeadersForLocalRelay(headers http.Header, targetURL string) {
+	if ClassifyNetworkScope(targetURL) != TrafficScopeLocal {
+		return
+	}
+
+	// The outer request already records the real client address. Carrying proxy
+	// identity headers into a localhost provider makes the nested relay treat the
+	// loopback hop as a second public client request and double-count its body.
+	for _, key := range []string{
+		"Forwarded",
+		"X-Forwarded-For",
+		"X-Real-IP",
+		"CF-Connecting-IP",
+		"True-Client-IP",
+	} {
+		deleteHeaderCaseInsensitive(headers, key)
+	}
 }
 
 func flattenQuery(values url.Values) url.Values {

@@ -932,6 +932,78 @@ func TestLateClientCloseAfterFirstTextKeepsSuccessfulResponseLog(t *testing.T) {
 	}
 }
 
+func TestLocalRelayDoesNotForwardPublicClientAddressHeaders(t *testing.T) {
+	receivedHeaders := make(chan http.Header, 1)
+	localRelay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders <- r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n")
+	}))
+	defer localRelay.Close()
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5","stream":true}`))
+
+	clientHeaders := http.Header{
+		"Forwarded":          []string{"for=203.0.113.25"},
+		"X-Forwarded-For":    []string{"203.0.113.25"},
+		"X-Real-IP":          []string{"203.0.113.25"},
+		"CF-Connecting-IP":   []string{"203.0.113.25"},
+		"True-Client-IP":     []string{"203.0.113.25"},
+		"X-Forwarded-Proto":  []string{"https"},
+		"X-Unrelated-Header": []string{"keep-me"},
+	}
+	relay := NewProviderRelayService(NewProviderService(), NewProviderPoolService(), nil, nil, nil, DefaultRelayBindAddr)
+	requestLog := &ReqeustLog{startedAt: time.Now()}
+	ok, err := relay.forwardRequestWithLog(
+		context,
+		"openai-responses",
+		Provider{ID: 1, Name: "local-relay", APIURL: localRelay.URL, APIKey: "test-key"},
+		"/responses",
+		nil,
+		clientHeaders,
+		[]byte(`{"model":"gpt-5","stream":true}`),
+		true,
+		"gpt-5",
+		requestLog,
+	)
+	if !ok || err != nil {
+		t.Fatalf("local relay result = (%v, %v), want success", ok, err)
+	}
+
+	select {
+	case headers := <-receivedHeaders:
+		for _, key := range []string{"Forwarded", "X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP", "True-Client-IP"} {
+			if value := headers.Get(key); value != "" {
+				t.Fatalf("local relay forwarded %s = %q, want empty", key, value)
+			}
+		}
+		if got := headers.Get("X-Forwarded-Proto"); got != "https" {
+			t.Fatalf("X-Forwarded-Proto = %q, want preserved", got)
+		}
+		if got := headers.Get("X-Unrelated-Header"); got != "keep-me" {
+			t.Fatalf("X-Unrelated-Header = %q, want preserved", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("local relay did not receive request")
+	}
+}
+
+func TestPublicUpstreamKeepsClientAddressHeaders(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set("X-Forwarded-For", "203.0.113.25")
+	headers.Set("X-Real-IP", "203.0.113.25")
+	stripClientAddressHeadersForLocalRelay(headers, "https://203.0.113.10/responses")
+	if got := headers.Get("X-Forwarded-For"); got != "203.0.113.25" {
+		t.Fatalf("public X-Forwarded-For = %q, want preserved", got)
+	}
+	if got := headers.Get("X-Real-IP"); got != "203.0.113.25" {
+		t.Fatalf("public X-Real-IP = %q, want preserved", got)
+	}
+}
+
 func TestPoolFirstTextTimeoutCancelsBeforeDelayedHeaders(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
